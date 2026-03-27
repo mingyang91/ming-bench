@@ -26,9 +26,13 @@ type charValue rune
 type voidValue struct{}
 type emptyListValue struct{}
 
-type pairValue struct {
+type pairCell struct {
 	car value
 	cdr value
+}
+
+type pairValue struct {
+	cell *pairCell
 }
 
 type builtinProc struct {
@@ -76,6 +80,11 @@ var emptyList = emptyListValue{}
 var currentOutput *strings.Builder
 var currentLevelStringsMutable = detectStringMutability()
 
+type formatState struct {
+	activePairs   map[*pairCell]struct{}
+	activeVectors map[*vectorValue]struct{}
+}
+
 // String mutability changes at level 15. Earlier benchmark levels still expect
 // R5RS-style mutable strings, so honor BENCH_LEVEL when constructing them.
 func stringsMutableInCurrentLevel() bool {
@@ -109,6 +118,38 @@ func copyStringValue(s *stringValue, mutable bool) *stringValue {
 	return &stringValue{
 		chars:   chars,
 		mutable: mutable,
+	}
+}
+
+func newPair(car, cdr value) pairValue {
+	return pairValue{
+		cell: &pairCell{
+			car: car,
+			cdr: cdr,
+		},
+	}
+}
+
+func (p pairValue) carValue() value {
+	return p.cell.car
+}
+
+func (p pairValue) cdrValue() value {
+	return p.cell.cdr
+}
+
+func (p pairValue) setCar(v value) {
+	p.cell.car = v
+}
+
+func (p pairValue) setCdr(v value) {
+	p.cell.cdr = v
+}
+
+func newFormatState() *formatState {
+	return &formatState{
+		activePairs:   make(map[*pairCell]struct{}),
+		activeVectors: make(map[*vectorValue]struct{}),
 	}
 }
 
@@ -172,6 +213,10 @@ func (p pairValue) schemeString() string {
 }
 
 func formatValue(v value, mode outputMode) string {
+	return newFormatState().formatValue(v, mode)
+}
+
+func (s *formatState) formatValue(v value, mode outputMode) string {
 	switch value := v.(type) {
 	case *stringValue:
 		if mode == outputModeDisplay {
@@ -181,36 +226,49 @@ func formatValue(v value, mode outputMode) string {
 	case charValue:
 		return formatChar(rune(value), mode)
 	case pairValue:
-		return formatPair(value, mode)
+		return s.formatPair(value, mode)
 	case *vectorValue:
-		return formatVector(value, mode)
+		return s.formatVector(value, mode)
 	default:
 		return v.schemeString()
 	}
 }
 
 func formatPair(p pairValue, mode outputMode) string {
+	return newFormatState().formatPair(p, mode)
+}
+
+func (s *formatState) formatPair(p pairValue, mode outputMode) string {
+	if _, seen := s.activePairs[p.cell]; seen {
+		return "#<cycle>"
+	}
+
+	s.activePairs[p.cell] = struct{}{}
+	defer delete(s.activePairs, p.cell)
+
 	var builder strings.Builder
 	builder.WriteByte('(')
+	s.writePairContents(&builder, p, mode)
+	builder.WriteByte(')')
+	return builder.String()
+}
 
-	current := value(p)
-	for {
-		switch next := current.(type) {
-		case pairValue:
-			builder.WriteString(formatValue(next.car, mode))
-			current = next.cdr
-			if _, ok := current.(pairValue); ok {
-				builder.WriteByte(' ')
-			}
-		case emptyListValue:
-			builder.WriteByte(')')
-			return builder.String()
-		default:
-			builder.WriteString(" . ")
-			builder.WriteString(formatValue(next, mode))
-			builder.WriteByte(')')
-			return builder.String()
+func (s *formatState) writePairContents(builder *strings.Builder, p pairValue, mode outputMode) {
+	builder.WriteString(s.formatValue(p.carValue(), mode))
+
+	switch next := p.cdrValue().(type) {
+	case emptyListValue:
+		return
+	case pairValue:
+		if _, seen := s.activePairs[next.cell]; seen {
+			builder.WriteString(" . #<cycle>")
+			return
 		}
+		builder.WriteByte(' ')
+		s.writePairContents(builder, next, mode)
+	default:
+		builder.WriteString(" . ")
+		builder.WriteString(s.formatValue(next, mode))
 	}
 }
 
@@ -403,6 +461,9 @@ func newGlobalEnv() *env {
 	global.define("cons", builtinProc{name: "cons", fn: evalCons})
 	global.define("car", builtinProc{name: "car", fn: evalCar})
 	global.define("cdr", builtinProc{name: "cdr", fn: evalCdr})
+	global.define("set-car!", builtinProc{name: "set-car!", fn: evalSetCar})
+	global.define("set-cdr!", builtinProc{name: "set-cdr!", fn: evalSetCdr})
+	registerCxrBuiltins(global, 4)
 	global.define("append", builtinProc{name: "append", fn: evalAppend})
 	global.define("list", builtinProc{name: "list", fn: evalListBuiltin})
 	global.define("length", builtinProc{name: "length", fn: evalLength})
@@ -425,6 +486,8 @@ func newGlobalEnv() *env {
 	global.define("number->string", builtinProc{name: "number->string", fn: evalNumberToString})
 	global.define("symbol->string", builtinProc{name: "symbol->string", fn: evalSymbolToString})
 	global.define("string->symbol", builtinProc{name: "string->symbol", fn: evalStringToSymbol})
+	global.define("make-string", builtinProc{name: "make-string", fn: evalMakeString})
+	global.define("string", builtinProc{name: "string", fn: evalStringBuiltin})
 	global.define("string-ref", builtinProc{name: "string-ref", fn: evalStringRef})
 	global.define("string-copy", builtinProc{name: "string-copy", fn: evalStringCopy})
 	global.define("string-set!", builtinProc{name: "string-set!", fn: evalStringSet})
@@ -433,6 +496,33 @@ func newGlobalEnv() *env {
 	registerLevel14Builtins(global)
 	registerLevel15Builtins(global)
 	return global
+}
+
+func registerCxrBuiltins(global *env, maxDepth int) {
+	var register func(ops string, depth int)
+	register = func(ops string, depth int) {
+		if depth >= 2 {
+			name := "c" + ops + "r"
+			opsCopy := ops
+			nameCopy := name
+			global.define(nameCopy, builtinProc{
+				name: nameCopy,
+				fn: func(args []value) (value, error) {
+					return evalCxr(args, nameCopy, opsCopy)
+				},
+			})
+		}
+
+		if depth == maxDepth {
+			return
+		}
+
+		register(ops+"a", depth+1)
+		register(ops+"d", depth+1)
+	}
+
+	register("a", 1)
+	register("d", 1)
 }
 
 func evalInput(input string) (result string, output string, err error) {
@@ -571,6 +661,8 @@ func evalList(items listExpr, env *env) (value, error) {
 			return evalQuote(items[1:])
 		case "let":
 			return evalLet(items[1:], env)
+		case "let*":
+			return evalLetStar(items[1:], env)
 		case "letrec":
 			return evalLetrec(items[1:], env)
 		case "letrec*":
@@ -654,6 +746,8 @@ func evalListExprTail(items listExpr, env *env) (value, *tailCall, error) {
 			return v, nil, err
 		case "let":
 			return evalLetTail(items[1:], env)
+		case "let*":
+			return evalLetStarTail(items[1:], env)
 		case "letrec":
 			return evalLetrecTail(items[1:], env)
 		case "letrec*":
@@ -1161,6 +1255,66 @@ func evalLetTail(parts []locatedExpr, env *env) (value, *tailCall, error) {
 	return evalSequenceTail(parts[1:], letEnv)
 }
 
+func evalLetStar(parts []locatedExpr, env *env) (value, error) {
+	if len(parts) < 2 {
+		return nil, newCurrentEvalError("'let*' expects bindings and a body")
+	}
+
+	bindingExprs, ok := parts[0].form.(listExpr)
+	if !ok {
+		return nil, newEvalError(parts[0].pos, "'let*' bindings must be a list")
+	}
+
+	bindings, err := parseLetStarBindings(bindingExprs)
+	if err != nil {
+		return nil, err
+	}
+
+	scope := env
+	for _, binding := range bindings {
+		v, err := evalExpr(binding.init, scope)
+		if err != nil {
+			return nil, err
+		}
+
+		nextScope := newEnv(scope)
+		nextScope.define(binding.name, v)
+		scope = nextScope
+	}
+
+	return evalSequence(parts[1:], scope)
+}
+
+func evalLetStarTail(parts []locatedExpr, env *env) (value, *tailCall, error) {
+	if len(parts) < 2 {
+		return nil, nil, newCurrentEvalError("'let*' expects bindings and a body")
+	}
+
+	bindingExprs, ok := parts[0].form.(listExpr)
+	if !ok {
+		return nil, nil, newEvalError(parts[0].pos, "'let*' bindings must be a list")
+	}
+
+	bindings, err := parseLetStarBindings(bindingExprs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	scope := env
+	for _, binding := range bindings {
+		v, err := evalExpr(binding.init, scope)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		nextScope := newEnv(scope)
+		nextScope.define(binding.name, v)
+		scope = nextScope
+	}
+
+	return evalSequenceTail(parts[1:], scope)
+}
+
 type formalsSpec struct {
 	params    []string
 	restParam string
@@ -1257,6 +1411,29 @@ func parseLetBindings(items listExpr) ([]letBinding, error) {
 	return bindings, nil
 }
 
+func parseLetStarBindings(items listExpr) ([]letBinding, error) {
+	bindings := make([]letBinding, 0, len(items))
+
+	for _, item := range items {
+		binding, ok := item.form.(listExpr)
+		if !ok || len(binding) != 2 {
+			return nil, newEvalError(item.pos, "'let*' bindings must be (name value) pairs")
+		}
+
+		name, ok := binding[0].form.(symbolExpr)
+		if !ok {
+			return nil, newEvalError(binding[0].pos, "'let*' binding names must be symbols")
+		}
+
+		bindings = append(bindings, letBinding{
+			name: string(name),
+			init: binding[1],
+		})
+	}
+
+	return bindings, nil
+}
+
 func quoteExpr(e locatedExpr) (value, error) {
 	switch expr := e.form.(type) {
 	case numberExpr:
@@ -1283,10 +1460,7 @@ func quoteList(items listExpr) (value, error) {
 		if err != nil {
 			return nil, err
 		}
-		result = pairValue{
-			car: v,
-			cdr: result,
-		}
+		result = newPair(v, result)
 	}
 	return result, nil
 }
@@ -1398,7 +1572,7 @@ func evalCons(args []value) (value, error) {
 	if len(args) != 2 {
 		return nil, newCurrentEvalError("'cons' expects exactly 2 arguments")
 	}
-	return pairValue{car: args[0], cdr: args[1]}, nil
+	return newPair(args[0], args[1]), nil
 }
 
 func evalCar(args []value) (value, error) {
@@ -1406,12 +1580,12 @@ func evalCar(args []value) (value, error) {
 		return nil, newCurrentEvalError("'car' expects exactly 1 argument")
 	}
 
-	pair, ok := args[0].(pairValue)
-	if !ok {
-		return nil, newCurrentEvalError("'car' expects a pair, got %s", args[0].schemeString())
+	pair, err := expectPair(args[0], "car")
+	if err != nil {
+		return nil, err
 	}
 
-	return pair.car, nil
+	return pair.carValue(), nil
 }
 
 func evalCdr(args []value) (value, error) {
@@ -1419,12 +1593,65 @@ func evalCdr(args []value) (value, error) {
 		return nil, newCurrentEvalError("'cdr' expects exactly 1 argument")
 	}
 
-	pair, ok := args[0].(pairValue)
-	if !ok {
-		return nil, newCurrentEvalError("'cdr' expects a pair, got %s", args[0].schemeString())
+	pair, err := expectPair(args[0], "cdr")
+	if err != nil {
+		return nil, err
 	}
 
-	return pair.cdr, nil
+	return pair.cdrValue(), nil
+}
+
+func evalSetCar(args []value) (value, error) {
+	if len(args) != 2 {
+		return nil, newCurrentEvalError("'set-car!' expects exactly 2 arguments")
+	}
+
+	pair, err := expectPair(args[0], "set-car!")
+	if err != nil {
+		return nil, err
+	}
+
+	pair.setCar(args[1])
+	return voidValue{}, nil
+}
+
+func evalSetCdr(args []value) (value, error) {
+	if len(args) != 2 {
+		return nil, newCurrentEvalError("'set-cdr!' expects exactly 2 arguments")
+	}
+
+	pair, err := expectPair(args[0], "set-cdr!")
+	if err != nil {
+		return nil, err
+	}
+
+	pair.setCdr(args[1])
+	return voidValue{}, nil
+}
+
+func evalCxr(args []value, name string, ops string) (value, error) {
+	if len(args) != 1 {
+		return nil, newCurrentEvalError("'%s' expects exactly 1 argument", name)
+	}
+
+	current := args[0]
+	for i := len(ops) - 1; i >= 0; i-- {
+		pair, err := expectPair(current, name)
+		if err != nil {
+			return nil, err
+		}
+
+		switch ops[i] {
+		case 'a':
+			current = pair.carValue()
+		case 'd':
+			current = pair.cdrValue()
+		default:
+			return nil, newCurrentEvalError("invalid %s accessor", name)
+		}
+	}
+
+	return current, nil
 }
 
 func evalAppend(args []value) (value, error) {
@@ -1446,10 +1673,7 @@ func evalAppend(args []value) (value, error) {
 
 	result := args[len(args)-1]
 	for i := len(elems) - 1; i >= 0; i-- {
-		result = pairValue{
-			car: elems[i],
-			cdr: result,
-		}
+		result = newPair(elems[i], result)
 	}
 
 	return result, nil
@@ -1458,10 +1682,7 @@ func evalAppend(args []value) (value, error) {
 func evalListBuiltin(args []value) (value, error) {
 	result := value(emptyList)
 	for i := len(args) - 1; i >= 0; i-- {
-		result = pairValue{
-			car: args[i],
-			cdr: result,
-		}
+		result = newPair(args[i], result)
 	}
 	return result, nil
 }
@@ -1690,6 +1911,51 @@ func evalStringToSymbol(args []value) (value, error) {
 	return symbolValue(s), nil
 }
 
+func evalMakeString(args []value) (value, error) {
+	if len(args) != 1 && len(args) != 2 {
+		return nil, newCurrentEvalError("'make-string' expects 1 or 2 arguments")
+	}
+
+	length, err := expectNonNegativeIndex(args[0], "make-string")
+	if err != nil {
+		return nil, err
+	}
+
+	fill := ' '
+	if len(args) == 2 {
+		fill, err = expectChar(args[1])
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	chars := make([]rune, length)
+	for i := range chars {
+		chars[i] = fill
+	}
+
+	return &stringValue{
+		chars:   chars,
+		mutable: stringsMutableInCurrentLevel(),
+	}, nil
+}
+
+func evalStringBuiltin(args []value) (value, error) {
+	chars := make([]rune, len(args))
+	for i, arg := range args {
+		ch, err := expectChar(arg)
+		if err != nil {
+			return nil, err
+		}
+		chars[i] = ch
+	}
+
+	return &stringValue{
+		chars:   chars,
+		mutable: stringsMutableInCurrentLevel(),
+	}, nil
+}
+
 func evalStringRef(args []value) (value, error) {
 	if len(args) != 2 {
 		return nil, newCurrentEvalError("'string-ref' expects exactly 2 arguments")
@@ -1781,10 +2047,7 @@ func appendOutput(text string) {
 func listFromValues(items []value) value {
 	result := value(emptyList)
 	for i := len(items) - 1; i >= 0; i-- {
-		result = pairValue{
-			car: items[i],
-			cdr: result,
-		}
+		result = newPair(items[i], result)
 	}
 	return result
 }
@@ -1792,14 +2055,19 @@ func listFromValues(items []value) value {
 func properListElements(v value) ([]value, error) {
 	var elems []value
 	current := v
+	seen := make(map[*pairCell]struct{})
 
 	for {
 		switch list := current.(type) {
 		case emptyListValue:
 			return elems, nil
 		case pairValue:
-			elems = append(elems, list.car)
-			current = list.cdr
+			if _, exists := seen[list.cell]; exists {
+				return nil, newCurrentEvalError("expected list, got %s", v.schemeString())
+			}
+			seen[list.cell] = struct{}{}
+			elems = append(elems, list.carValue())
+			current = list.cdrValue()
 		default:
 			return nil, newCurrentEvalError("expected list, got %s", v.schemeString())
 		}
@@ -1812,6 +2080,14 @@ func properListLength(v value) (int, error) {
 		return 0, err
 	}
 	return len(elems), nil
+}
+
+func expectPair(v value, name string) (pairValue, error) {
+	pair, ok := v.(pairValue)
+	if !ok {
+		return pairValue{}, newCurrentEvalError("'%s' expects a pair, got %s", name, v.schemeString())
+	}
+	return pair, nil
 }
 
 func expectNumber(v value) (numberValue, error) {

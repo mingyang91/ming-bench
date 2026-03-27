@@ -1,6 +1,7 @@
 package ming
 
 import (
+	"math"
 	"strings"
 	"unicode"
 )
@@ -8,6 +9,7 @@ import (
 func registerLevel09Builtins(global *env) {
 	global.define("abs", builtinProc{name: "abs", fn: evalAbs})
 	global.define("assoc", builtinProc{name: "assoc", fn: evalAssoc})
+	global.define("assv", builtinProc{name: "assv", fn: evalAssv})
 	global.define("char-alphabetic?", builtinProc{name: "char-alphabetic?", fn: evalCharAlphabeticPred})
 	global.define("char-numeric?", builtinProc{name: "char-numeric?", fn: evalCharNumericPred})
 	global.define("char-upcase", builtinProc{name: "char-upcase", fn: evalCharUpcase})
@@ -17,11 +19,15 @@ func registerLevel09Builtins(global *env) {
 	global.define("eq?", builtinProc{name: "eq?", fn: evalEqPred})
 	global.define("equal?", builtinProc{name: "equal?", fn: evalEqualPred})
 	global.define("expt", builtinProc{name: "expt", fn: evalExpt})
+	global.define("for-each", builtinProc{name: "for-each", fn: evalForEach})
+	global.define("gcd", builtinProc{name: "gcd", fn: evalGCD})
+	global.define("lcm", builtinProc{name: "lcm", fn: evalLCM})
 	global.define("list?", builtinProc{name: "list?", fn: evalListPred})
 	global.define("list-ref", builtinProc{name: "list-ref", fn: evalListRef})
 	global.define("list-tail", builtinProc{name: "list-tail", fn: evalListTail})
 	global.define("map", builtinProc{name: "map", fn: evalMapBuiltin})
 	global.define("max", builtinProc{name: "max", fn: evalMax})
+	global.define("member", builtinProc{name: "member", fn: evalMember})
 	global.define("min", builtinProc{name: "min", fn: evalMin})
 	global.define("modulo", builtinProc{name: "modulo", fn: evalModulo})
 	global.define("odd?", builtinProc{name: "odd?", fn: evalOddPred})
@@ -30,11 +36,17 @@ func registerLevel09Builtins(global *env) {
 	global.define("negative?", builtinProc{name: "negative?", fn: evalNegativePred})
 	global.define("quotient", builtinProc{name: "quotient", fn: evalQuotient})
 	global.define("remainder", builtinProc{name: "remainder", fn: evalRemainder})
+	global.define("reverse", builtinProc{name: "reverse", fn: evalReverse})
 	global.define("string=?", builtinProc{name: "string=?", fn: evalStringEq})
 	global.define("string<?", builtinProc{name: "string<?", fn: evalStringLess})
+	global.define("string>?", builtinProc{name: "string>?", fn: evalStringGreater})
+	global.define("string<=?", builtinProc{name: "string<=?", fn: evalStringLessEqual})
+	global.define("string>=?", builtinProc{name: "string>=?", fn: evalStringGreaterEqual})
 	global.define("string-ci=?", builtinProc{name: "string-ci=?", fn: evalStringCiEq})
 	global.define("string-upcase", builtinProc{name: "string-upcase", fn: evalStringUpcase})
 	global.define("string-downcase", builtinProc{name: "string-downcase", fn: evalStringDowncase})
+	global.define("truncate", builtinProc{name: "truncate", fn: evalTruncate})
+	global.define("round", builtinProc{name: "round", fn: evalRound})
 	global.define("zero?", builtinProc{name: "zero?", fn: evalZeroPred})
 }
 
@@ -65,7 +77,30 @@ func evalAssoc(args []value) (value, error) {
 		if !ok {
 			return nil, newCurrentEvalError("'assoc' expects a list of pairs, got %s", item.schemeString())
 		}
-		if schemeEqual(args[0], pair.car) {
+		if schemeEqual(args[0], pair.carValue()) {
+			return pair, nil
+		}
+	}
+
+	return boolValue(false), nil
+}
+
+func evalAssv(args []value) (value, error) {
+	if len(args) != 2 {
+		return nil, newCurrentEvalError("'assv' expects exactly 2 arguments")
+	}
+
+	items, err := properListElements(args[1])
+	if err != nil {
+		return nil, err
+	}
+
+	for _, item := range items {
+		pair, ok := item.(pairValue)
+		if !ok {
+			return nil, newCurrentEvalError("'assv' expects a list of pairs, got %s", item.schemeString())
+		}
+		if schemeEqv(args[0], pair.carValue()) {
 			return pair, nil
 		}
 	}
@@ -141,6 +176,41 @@ func evalExpt(args []value) (value, error) {
 	return newExactInteger(result), nil
 }
 
+func evalGCD(args []value) (value, error) {
+	result := 0
+	for _, arg := range args {
+		n, err := expectInteger(arg)
+		if err != nil {
+			return nil, err
+		}
+		result = gcd(result, n)
+	}
+	return newExactInteger(absInt(result)), nil
+}
+
+func evalLCM(args []value) (value, error) {
+	if len(args) == 0 {
+		return newExactInteger(1), nil
+	}
+
+	result := 1
+	for _, arg := range args {
+		n, err := expectInteger(arg)
+		if err != nil {
+			return nil, err
+		}
+
+		if result == 0 || n == 0 {
+			result = 0
+			continue
+		}
+
+		result = absInt(result/gcd(result, n) * n)
+	}
+
+	return newExactInteger(result), nil
+}
+
 func evalListPred(args []value) (value, error) {
 	if len(args) != 1 {
 		return nil, newCurrentEvalError("'list?' expects exactly 1 argument")
@@ -167,14 +237,14 @@ func evalListRef(args []value) (value, error) {
 		if !ok {
 			return nil, newCurrentEvalError("'list-ref' index out of range")
 		}
-		current = pair.cdr
+		current = pair.cdrValue()
 	}
 
 	pair, ok := current.(pairValue)
 	if !ok {
 		return nil, newCurrentEvalError("'list-ref' index out of range")
 	}
-	return pair.car, nil
+	return pair.carValue(), nil
 }
 
 func evalListTail(args []value) (value, error) {
@@ -196,7 +266,7 @@ func evalListTail(args []value) (value, error) {
 		if !ok {
 			return nil, newCurrentEvalError("'list-tail' index out of range")
 		}
-		current = pair.cdr
+		current = pair.cdrValue()
 	}
 
 	switch current.(type) {
@@ -246,6 +316,89 @@ func evalMapBuiltin(args []value) (value, error) {
 	}
 
 	return listFromValues(results), nil
+}
+
+func evalForEach(args []value) (value, error) {
+	if len(args) < 2 {
+		return nil, newCurrentEvalError("'for-each' expects a procedure and at least 1 list")
+	}
+
+	proc, ok := args[0].(procedure)
+	if !ok {
+		return nil, newCurrentEvalError("'for-each' expects a procedure, got %s", args[0].schemeString())
+	}
+
+	lists := make([][]value, len(args)-1)
+	expectedLen := -1
+	for i, arg := range args[1:] {
+		elems, err := properListElements(arg)
+		if err != nil {
+			return nil, err
+		}
+		if expectedLen == -1 {
+			expectedLen = len(elems)
+		} else if len(elems) != expectedLen {
+			return nil, newCurrentEvalError("'for-each' expects lists of equal length")
+		}
+		lists[i] = elems
+	}
+
+	callArgs := make([]value, len(lists))
+	for i := 0; i < expectedLen; i++ {
+		for j := range lists {
+			callArgs[j] = lists[j][i]
+		}
+		if _, err := proc.call(callArgs); err != nil {
+			return nil, err
+		}
+	}
+
+	return voidValue{}, nil
+}
+
+func evalMember(args []value) (value, error) {
+	if len(args) != 2 {
+		return nil, newCurrentEvalError("'member' expects exactly 2 arguments")
+	}
+
+	current := args[1]
+	seen := make(map[*pairCell]struct{})
+
+	for {
+		switch list := current.(type) {
+		case emptyListValue:
+			return boolValue(false), nil
+		case pairValue:
+			if _, exists := seen[list.cell]; exists {
+				return nil, newCurrentEvalError("'member' expects a proper list, got %s", args[1].schemeString())
+			}
+			seen[list.cell] = struct{}{}
+			if schemeEqual(args[0], list.carValue()) {
+				return current, nil
+			}
+			current = list.cdrValue()
+		default:
+			return nil, newCurrentEvalError("'member' expects a proper list, got %s", args[1].schemeString())
+		}
+	}
+}
+
+func evalReverse(args []value) (value, error) {
+	if len(args) != 1 {
+		return nil, newCurrentEvalError("'reverse' expects exactly 1 argument")
+	}
+
+	elems, err := properListElements(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	result := value(emptyList)
+	for _, elem := range elems {
+		result = newPair(elem, result)
+	}
+
+	return result, nil
 }
 
 func evalMax(args []value) (value, error) {
@@ -325,6 +478,18 @@ func evalStringLess(args []value) (value, error) {
 	return evalStringCompare(args, "string<?", stringLess)
 }
 
+func evalStringGreater(args []value) (value, error) {
+	return evalStringCompare(args, "string>?", func(a, b string) bool { return stringLess(b, a) })
+}
+
+func evalStringLessEqual(args []value) (value, error) {
+	return evalStringCompare(args, "string<=?", func(a, b string) bool { return !stringLess(b, a) })
+}
+
+func evalStringGreaterEqual(args []value) (value, error) {
+	return evalStringCompare(args, "string>=?", func(a, b string) bool { return !stringLess(a, b) })
+}
+
 func evalStringCiEq(args []value) (value, error) {
 	return evalStringCompare(args, "string-ci=?", strings.EqualFold)
 }
@@ -337,8 +502,66 @@ func evalStringDowncase(args []value) (value, error) {
 	return evalUnaryStringTransform(args, "string-downcase", strings.ToLower)
 }
 
+func evalTruncate(args []value) (value, error) {
+	if len(args) != 1 {
+		return nil, newCurrentEvalError("'truncate' expects exactly 1 argument")
+	}
+
+	n, err := expectNumber(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	if n.exact {
+		return newExactInteger(n.numer / n.denom), nil
+	}
+
+	return newNumberValue(int(math.Trunc(n.float64())), 1, false), nil
+}
+
+func evalRound(args []value) (value, error) {
+	if len(args) != 1 {
+		return nil, newCurrentEvalError("'round' expects exactly 1 argument")
+	}
+
+	n, err := expectNumber(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	if n.exact {
+		return newExactInteger(roundExactToEven(n.numer, n.denom)), nil
+	}
+
+	return newNumberValue(int(math.RoundToEven(n.float64())), 1, false), nil
+}
+
 func evalZeroPred(args []value) (value, error) {
 	return evalUnaryNumberPredicate(args, "zero?", func(n numberValue) bool { return n.numer == 0 })
+}
+
+func roundExactToEven(numer, denom int) int {
+	quot := numer / denom
+	rem := absInt(numer % denom)
+	twice := rem * 2
+
+	switch {
+	case twice < denom:
+		return quot
+	case twice > denom:
+		if numer < 0 {
+			return quot - 1
+		}
+		return quot + 1
+	default:
+		if quot%2 == 0 {
+			return quot
+		}
+		if numer < 0 {
+			return quot - 1
+		}
+		return quot + 1
+	}
 }
 
 func evalUnaryNumberPredicate(args []value, name string, pred func(numberValue) bool) (value, error) {
@@ -491,16 +714,32 @@ func expectNonNegativeIndex(v value, name string) (int, error) {
 }
 
 func isProperList(v value) bool {
+	seen := make(map[*pairCell]struct{})
+
 	for {
 		switch list := v.(type) {
 		case emptyListValue:
 			return true
 		case pairValue:
-			v = list.cdr
+			if _, exists := seen[list.cell]; exists {
+				return false
+			}
+			seen[list.cell] = struct{}{}
+			v = list.cdrValue()
 		default:
 			return false
 		}
 	}
+}
+
+type pairEqualKey struct {
+	left  *pairCell
+	right *pairCell
+}
+
+type vectorEqualKey struct {
+	left  *vectorValue
+	right *vectorValue
 }
 
 func schemeEq(a, b value) bool {
@@ -523,6 +762,9 @@ func schemeEq(a, b value) bool {
 	case *stringValue:
 		bv, ok := b.(*stringValue)
 		return ok && av == bv
+	case pairValue:
+		bv, ok := b.(pairValue)
+		return ok && av.cell == bv.cell
 	case *vectorValue:
 		bv, ok := b.(*vectorValue)
 		return ok && av == bv
@@ -550,6 +792,15 @@ func schemeEq(a, b value) bool {
 }
 
 func schemeEqual(a, b value) bool {
+	return schemeEqualWithSeen(
+		a,
+		b,
+		make(map[pairEqualKey]struct{}),
+		make(map[vectorEqualKey]struct{}),
+	)
+}
+
+func schemeEqualWithSeen(a, b value, seenPairs map[pairEqualKey]struct{}, seenVectors map[vectorEqualKey]struct{}) bool {
 	switch av := a.(type) {
 	case numberValue:
 		bv, ok := b.(numberValue)
@@ -571,14 +822,32 @@ func schemeEqual(a, b value) bool {
 		return ok && av.text() == bv.text()
 	case pairValue:
 		bv, ok := b.(pairValue)
-		return ok && schemeEqual(av.car, bv.car) && schemeEqual(av.cdr, bv.cdr)
+		if !ok {
+			return false
+		}
+
+		key := pairEqualKey{left: av.cell, right: bv.cell}
+		if _, seen := seenPairs[key]; seen {
+			return true
+		}
+		seenPairs[key] = struct{}{}
+
+		return schemeEqualWithSeen(av.carValue(), bv.carValue(), seenPairs, seenVectors) &&
+			schemeEqualWithSeen(av.cdrValue(), bv.cdrValue(), seenPairs, seenVectors)
 	case *vectorValue:
 		bv, ok := b.(*vectorValue)
 		if !ok || len(av.elems) != len(bv.elems) {
 			return false
 		}
+
+		key := vectorEqualKey{left: av, right: bv}
+		if _, seen := seenVectors[key]; seen {
+			return true
+		}
+		seenVectors[key] = struct{}{}
+
 		for i := range av.elems {
-			if !schemeEqual(av.elems[i], bv.elems[i]) {
+			if !schemeEqualWithSeen(av.elems[i], bv.elems[i], seenPairs, seenVectors) {
 				return false
 			}
 		}

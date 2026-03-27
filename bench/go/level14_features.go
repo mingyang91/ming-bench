@@ -34,13 +34,24 @@ func (*vectorValue) isTruthy() bool {
 }
 
 func formatVector(v *vectorValue, mode outputMode) string {
+	return newFormatState().formatVector(v, mode)
+}
+
+func (s *formatState) formatVector(v *vectorValue, mode outputMode) string {
+	if _, seen := s.activeVectors[v]; seen {
+		return "#<cycle>"
+	}
+
+	s.activeVectors[v] = struct{}{}
+	defer delete(s.activeVectors, v)
+
 	var builder strings.Builder
 	builder.WriteString("#(")
 	for i, elem := range v.elems {
 		if i > 0 {
 			builder.WriteByte(' ')
 		}
-		builder.WriteString(formatValue(elem, mode))
+		builder.WriteString(s.formatValue(elem, mode))
 	}
 	builder.WriteByte(')')
 	return builder.String()
