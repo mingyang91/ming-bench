@@ -4,7 +4,8 @@ use std::rc::Rc;
 use super::continuation::{
     define_continuation, invoke_continuation, make_dynamic_wind_frame, pop_wind_frame,
     push_wind_frame, sequence_continuation, set_captured_continuation, set_symbol_continuation,
-    Continuation, ContinuationRef, EvalResult, EvalSignal, RaisedException,
+    snapshot_continuation_handle, Continuation, ContinuationRef, EvalResult, EvalSignal,
+    RaisedException,
 };
 use super::macros::{expand_syntax_template, match_syntax_pattern, MacroEnvRef, MacroEnvironment};
 use super::value_ops::{list_from_vec, values_eqv};
@@ -974,6 +975,14 @@ pub(super) fn apply_callable_result<'a>(
             continuation,
             Value::from_values(args.to_vec()),
         )),
+        Value::ContinuationHandle(handle) => match snapshot_continuation_handle(&handle) {
+            Some(continuation) => Err(invoke_continuation(
+                continuation,
+                Value::from_values(args.to_vec()),
+            )),
+            None => Ok(EvalStep::Value(Value::from_values(args.to_vec()))),
+        },
+        Value::ExpiredContinuation => Ok(EvalStep::Value(Value::from_values(args.to_vec()))),
         other => Err(EvalError::NotCallable {
             found: other.type_name().into(),
         }

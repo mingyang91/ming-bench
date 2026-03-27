@@ -3,8 +3,8 @@ use std::cmp::Ordering;
 use std::rc::Rc;
 
 use super::continuation::{
-    current_continuation_value, Continuation, ContinuationRef, EvalResult, EvalSignal,
-    RaisedException,
+    current_continuation_handle, expire_continuation_handle, Continuation, ContinuationRef,
+    EvalResult, EvalSignal, RaisedException,
 };
 use super::macros::{datum_from_syntax_value, datum_to_syntax_value};
 use super::number::{parse_number_string, Number};
@@ -273,6 +273,8 @@ fn apply_builtin_without_context(
                     | Value::NativeProcedure(_)
                     | Value::Builtin(_)
                     | Value::Continuation(_)
+                    | Value::ContinuationHandle(_)
+                    | Value::ExpiredContinuation
             )
         }),
         BuiltinKind::Display => eval_display(args, output),
@@ -713,11 +715,18 @@ fn eval_call_cc(args: &[Value], continuation: &ContinuationRef) -> EvalResult<Va
         .into());
     };
 
-    super::apply_callable(
+    let handle = current_continuation_handle(continuation);
+    let result = super::apply_callable(
         callable.clone(),
-        &[current_continuation_value(continuation)],
+        &[Value::ContinuationHandle(handle.clone())],
         continuation,
-    )
+    );
+
+    if result.is_ok() {
+        expire_continuation_handle(&handle);
+    }
+
+    result
 }
 
 fn eval_raise(args: &[Value]) -> EvalResult<Value> {

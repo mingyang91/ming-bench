@@ -54,6 +54,8 @@ pub(super) fn pair_parts(value: &Value) -> Option<(Value, Value)> {
         | Value::NativeProcedure(_)
         | Value::Builtin(_)
         | Value::Continuation(_)
+        | Value::ContinuationHandle(_)
+        | Value::ExpiredContinuation
         | Value::Values(_)
         | Value::Record(_)
         | Value::Uninitialized
@@ -116,6 +118,8 @@ pub(super) fn is_proper_list(value: &Value) -> bool {
             | Value::NativeProcedure(_)
             | Value::Builtin(_)
             | Value::Continuation(_)
+            | Value::ContinuationHandle(_)
+            | Value::ExpiredContinuation
             | Value::Values(_)
             | Value::Record(_)
             | Value::Uninitialized
@@ -140,6 +144,8 @@ pub(super) fn values_eq(lhs: &Value, rhs: &Value) -> bool {
         (Value::Pair(lhs), Value::Pair(rhs)) => Rc::ptr_eq(lhs, rhs),
         (Value::Vector(lhs), Value::Vector(rhs)) => Rc::ptr_eq(lhs, rhs),
         (Value::Continuation(lhs), Value::Continuation(rhs)) => Rc::ptr_eq(lhs, rhs),
+        (Value::ContinuationHandle(lhs), Value::ContinuationHandle(rhs)) => Rc::ptr_eq(lhs, rhs),
+        (Value::ExpiredContinuation, Value::ExpiredContinuation) => true,
         (Value::Values(lhs), Value::Values(rhs)) => {
             lhs.len() == rhs.len()
                 && lhs
@@ -187,6 +193,8 @@ pub(super) fn values_equal(lhs: &Value, rhs: &Value) -> bool {
             (Value::Char(lhs), Value::Char(rhs)) => lhs == rhs,
             (Value::Syntax(lhs), Value::Syntax(rhs)) => super::macros::match_values_equal(lhs, rhs),
             (Value::Continuation(lhs), Value::Continuation(rhs)) => Rc::ptr_eq(lhs, rhs),
+            (Value::ContinuationHandle(lhs), Value::ContinuationHandle(rhs)) => Rc::ptr_eq(lhs, rhs),
+            (Value::ExpiredContinuation, Value::ExpiredContinuation) => true,
             (Value::Values(lhs), Value::Values(rhs)) => {
                 lhs.len() == rhs.len()
                     && lhs

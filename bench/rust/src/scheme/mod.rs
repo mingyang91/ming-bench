@@ -11,8 +11,9 @@ mod value_ops;
 
 use continuation::{
     final_continuation, pop_wind_frame, push_wind_frame, reset_wind_stack,
-    resume_continuation_jump, sequence_continuation, CapturedContinuation, Continuation,
-    ContinuationRef, EvalResult, EvalSignal, RaisedException,
+    resume_continuation_jump, sequence_continuation, snapshot_continuation_handle,
+    CapturedContinuation, Continuation, ContinuationHandleRef, ContinuationRef, EvalResult,
+    EvalSignal, RaisedException,
 };
 pub use error::{EvalError, SourcePos};
 use macros::{MacroEnvRef, MacroEnvironment, MatchValue};
@@ -71,6 +72,8 @@ enum Value {
     NativeProcedure(Rc<NativeProcedure>),
     Builtin(Builtin),
     Continuation(Rc<CapturedContinuation>),
+    ContinuationHandle(ContinuationHandleRef),
+    ExpiredContinuation,
     Values(Vec<Value>),
     Record(RecordRef),
     Uninitialized,
@@ -262,7 +265,9 @@ impl Value {
             Self::Procedure(_)
             | Self::NativeProcedure(_)
             | Self::Builtin(_)
-            | Self::Continuation(_) => "procedure",
+            | Self::Continuation(_)
+            | Self::ContinuationHandle(_)
+            | Self::ExpiredContinuation => "procedure",
             Self::Values(_) => "values",
             Self::Record(_) => "record",
             Self::Uninitialized => "uninitialized",
@@ -846,6 +851,16 @@ fn env_define(env: &EnvRef, name: String, value: Value) {
         .insert(name, Rc::new(RefCell::new(value)));
 }
 
+fn materialize_runtime_value(value: Value) -> Value {
+    match value {
+        Value::ContinuationHandle(handle) => match snapshot_continuation_handle(&handle) {
+            Some(continuation) => Value::Continuation(continuation),
+            None => Value::ExpiredContinuation,
+        },
+        other => other,
+    }
+}
+
 fn env_lookup_binding(env: &EnvRef, name: &str) -> Option<BindingRef> {
     let (binding, parent) = {
         let borrowed = env.borrow();
@@ -859,7 +874,7 @@ fn env_lookup_binding(env: &EnvRef, name: &str) -> Option<BindingRef> {
 }
 
 fn env_lookup(env: &EnvRef, name: &str) -> Option<Value> {
-    env_lookup_binding(env, name).map(|binding| binding.borrow().clone())
+    env_lookup_binding(env, name).map(|binding| materialize_runtime_value(binding.borrow().clone()))
 }
 
 fn env_set(env: &EnvRef, name: &str, value: Value) -> bool {
@@ -1046,15 +1061,17 @@ fn eval_expr_step<'a>(
         Expr::String(value, _) => Ok(EvalStep::Value(Value::String(value.clone()))),
         Expr::Char(value, _) => Ok(EvalStep::Value(Value::Char(*value))),
         Expr::Symbol(name, position) => {
-            let value = env_lookup(env, name).ok_or_else(|| {
-                EvalError::UnboundVariable { name: name.clone() }.with_position(*position)
-            })?;
+            let value = env_lookup_binding(env, name)
+                .map(|binding| binding.borrow().clone())
+                .ok_or_else(|| {
+                    EvalError::UnboundVariable { name: name.clone() }.with_position(*position)
+                })?;
             if matches!(value, Value::Uninitialized) {
                 Err(EvalError::UninitializedBinding { name: name.clone() }
                     .with_position(*position)
                     .into())
             } else {
-                Ok(EvalStep::Value(value))
+                Ok(EvalStep::Value(materialize_runtime_value(value)))
             }
         }
         Expr::CapturedSymbol(name, binding, position) => {
@@ -1064,7 +1081,7 @@ fn eval_expr_step<'a>(
                     .with_position(*position)
                     .into())
             } else {
-                Ok(EvalStep::Value(value))
+                Ok(EvalStep::Value(materialize_runtime_value(value)))
             }
         }
         Expr::List(items, position) => {

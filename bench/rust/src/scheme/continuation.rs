@@ -6,6 +6,7 @@ use super::{BindingRef, EnvRef, EvalError, Expr, SourcePos, Value};
 
 pub(super) type ContinuationRef = Rc<Continuation>;
 pub(super) type DynamicWindFrameRef = Rc<DynamicWindFrame>;
+pub(super) type ContinuationHandleRef = Rc<RefCell<ContinuationHandleState>>;
 pub(super) type EvalResult<T> = Result<T, EvalSignal>;
 
 #[derive(Clone)]
@@ -18,6 +19,12 @@ pub(super) struct RaisedException {
 pub(super) struct CapturedContinuation {
     pub(super) continuation: ContinuationRef,
     pub(super) wind_stack: Vec<DynamicWindFrameRef>,
+}
+
+#[derive(Clone)]
+pub(super) enum ContinuationHandleState {
+    Active(Rc<CapturedContinuation>),
+    Expired,
 }
 
 #[derive(Clone)]
@@ -213,11 +220,32 @@ pub(super) fn invoke_continuation(
     }
 }
 
-pub(super) fn current_continuation_value(continuation: &ContinuationRef) -> Value {
-    Value::Continuation(Rc::new(CapturedContinuation {
+fn capture_current_continuation(continuation: &ContinuationRef) -> Rc<CapturedContinuation> {
+    Rc::new(CapturedContinuation {
         continuation: Rc::clone(continuation),
         wind_stack: current_wind_stack(),
-    }))
+    })
+}
+
+pub(super) fn current_continuation_handle(
+    continuation: &ContinuationRef,
+) -> ContinuationHandleRef {
+    Rc::new(RefCell::new(ContinuationHandleState::Active(
+        capture_current_continuation(continuation),
+    )))
+}
+
+pub(super) fn snapshot_continuation_handle(
+    handle: &ContinuationHandleRef,
+) -> Option<Rc<CapturedContinuation>> {
+    match &*handle.borrow() {
+        ContinuationHandleState::Active(continuation) => Some(Rc::clone(continuation)),
+        ContinuationHandleState::Expired => None,
+    }
+}
+
+pub(super) fn expire_continuation_handle(handle: &ContinuationHandleRef) {
+    *handle.borrow_mut() = ContinuationHandleState::Expired;
 }
 
 pub(super) fn sequence_continuation(
