@@ -60,7 +60,7 @@ pub(crate) enum Value {
     },
     CaseLambda(Vec<CaseClause>),
     Vector(Rc<RefCell<Vec<Value>>>),
-    Continuation(Rc<Kont>),
+    Continuation(Rc<Kont>, Vec<Rc<(Value, Value)>>),
 }
 
 
@@ -186,7 +186,7 @@ impl fmt::Display for Value {
             Value::Macro { .. } => write!(f, "#<macro>"),
             Value::Record { type_tag, .. } => write!(f, "#<record:{type_tag}>"),
             Value::CaseLambda(..) => write!(f, "#<procedure>"),
-            Value::Continuation(_) => write!(f, "#<continuation>"),
+            Value::Continuation(..) => write!(f, "#<continuation>"),
             Value::Vector(v) => {
                 write!(f, "#(")?;
                 let items = v.borrow();
@@ -865,7 +865,7 @@ fn apply_proc(func: &Value, args: &[Value], output: &mut String) -> Result<Value
                 }
             }
             Value::Builtin(ref name) => return eval_builtin(name, &cur_args, output),
-            Value::Continuation(_) => return Err(EvalError::Generic("cannot invoke continuation from recursive eval".into())),
+            Value::Continuation(..) => return Err(EvalError::Generic("cannot invoke continuation from recursive eval".into())),
             _ => return Err(EvalError::Type("not a procedure".into())),
         }
     }
@@ -1057,7 +1057,8 @@ pub(crate) fn is_builtin(op: &str) -> bool {
         | "eqv?"
         | "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length"
         | "vector?" | "vector->list" | "list->vector"
-        | "error")
+        | "error"
+        | "dynamic-wind")
     || (op.len() > 2 && op.starts_with('c') && op.ends_with('r')
         && op[1..op.len()-1].bytes().all(|b| b == b'a' || b == b'd'))
 }
@@ -1407,6 +1408,10 @@ pub(crate) enum Kont {
     LetInit { var: String, rem: Vec<(String, Expr)>, frame: Frame, body: Vec<Expr>, eval_env: Env, next: Rc<Kont> },
     SeqBind { var: String, rem: Vec<(String, Expr)>, body: Vec<Expr>, env: Env, next: Rc<Kont>, use_set: bool },
     CondK { body: Vec<Expr>, rest: Vec<Expr>, env: Env, next: Rc<Kont> },
+    DynWindAfterIn { body_thunk: Value, entry: Rc<(Value, Value)>, next: Rc<Kont> },
+    DynWindAfterBody { entry: Rc<(Value, Value)>, next: Rc<Kont> },
+    DynWindAfterOut { result: Value, next: Rc<Kont> },
+    WindShift { ops: Vec<(bool, Rc<(Value, Value)>)>, val: Value, saved_k: Rc<Kont> },
 }
 
 impl fmt::Debug for Kont {

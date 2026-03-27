@@ -285,7 +285,7 @@ fn try_eval_simple(expr: &Expr, env: &Env, output: &mut String) -> Option<Result
                 if op == "quote" && items.len() == 2 {
                     return Some(Ok(expr_to_value(&items[1])));
                 }
-                if is_builtin(op) {
+                if is_builtin(op) && op != "dynamic-wind" {
                     let mut args = Vec::with_capacity(items.len() - 1);
                     for item in &items[1..] {
                         match try_eval_simple(item, env, output)? {
@@ -446,7 +446,7 @@ fn cek_step_eval_inner(expr: &Expr, env: Env, k: Rc<Kont>, output: &mut String) 
     }
 }
 
-fn cek_step_val(val: Value, k: Rc<Kont>, _output: &mut String) -> Result<(Ctrl, Rc<Kont>), EvalError> {
+fn cek_step_val(val: Value, k: Rc<Kont>, _output: &mut String, winders: &mut Vec<Rc<(Value, Value)>>) -> Result<(Ctrl, Rc<Kont>), EvalError> {
     match &*k {
         Kont::Halt => unreachable!(),
         Kont::Seq { rest, env, next } => {
@@ -503,7 +503,7 @@ fn cek_step_val(val: Value, k: Rc<Kont>, _output: &mut String) -> Result<(Ctrl, 
             }
         }
         Kont::CallCC { next } => {
-            let cont_val = Value::Continuation(next.clone());
+            let cont_val = Value::Continuation(next.clone(), winders.clone());
             Ok((Ctrl::Apply(val, vec![cont_val]), next.clone()))
         }
         Kont::And { rest, env, next } => {
@@ -577,10 +577,50 @@ fn cek_step_val(val: Value, k: Rc<Kont>, _output: &mut String) -> Result<(Ctrl, 
                 cek_cond(rest, env.clone(), next.clone())
             }
         }
+        Kont::DynWindAfterIn { body_thunk, entry, next } => {
+            winders.push(entry.clone());
+            Ok((Ctrl::Apply(body_thunk.clone(), vec![]),
+                Rc::new(Kont::DynWindAfterBody {
+                    entry: entry.clone(),
+                    next: next.clone(),
+                })))
+        }
+        Kont::DynWindAfterBody { entry, next } => {
+            winders.pop();
+            Ok((Ctrl::Apply(entry.1.clone(), vec![]),
+                Rc::new(Kont::DynWindAfterOut {
+                    result: val,
+                    next: next.clone(),
+                })))
+        }
+        Kont::DynWindAfterOut { result, next } => {
+            Ok((Ctrl::Val(result.clone()), next.clone()))
+        }
+        Kont::WindShift { ops, val: wind_val, saved_k } => {
+            // Ignore thunk return value; process next wind operation
+            if ops.is_empty() {
+                Ok((Ctrl::Val(wind_val.clone()), saved_k.clone()))
+            } else {
+                let (is_rewind, entry) = ops[0].clone();
+                let remaining = ops[1..].to_vec();
+                let next_k = Rc::new(Kont::WindShift {
+                    ops: remaining,
+                    val: wind_val.clone(),
+                    saved_k: saved_k.clone(),
+                });
+                if is_rewind {
+                    winders.push(entry.clone());
+                    Ok((Ctrl::Apply(entry.0.clone(), vec![]), next_k))
+                } else {
+                    winders.pop();
+                    Ok((Ctrl::Apply(entry.1.clone(), vec![]), next_k))
+                }
+            }
+        }
     }
 }
 
-fn cek_step_apply(func: Value, args: Vec<Value>, k: Rc<Kont>, output: &mut String) -> Result<(Ctrl, Rc<Kont>), EvalError> {
+fn cek_step_apply(func: Value, args: Vec<Value>, k: Rc<Kont>, output: &mut String, winders: &mut Vec<Rc<(Value, Value)>>) -> Result<(Ctrl, Rc<Kont>), EvalError> {
     match func {
         Value::Procedure(ref params, ref rest, ref body, ref closure_env) => {
             if rest.is_some() {
@@ -631,8 +671,22 @@ fn cek_step_apply(func: Value, args: Vec<Value>, k: Rc<Kont>, output: &mut Strin
                 if args.len() != 1 {
                     return Err(EvalError::Arity("call/cc requires 1 argument".into()));
                 }
-                let cont_val = Value::Continuation(k.clone());
+                let cont_val = Value::Continuation(k.clone(), winders.clone());
                 Ok((Ctrl::Apply(args[0].clone(), vec![cont_val]), k))
+            } else if name == "dynamic-wind" {
+                if args.len() != 3 {
+                    return Err(EvalError::Arity("dynamic-wind requires 3 arguments".into()));
+                }
+                let in_thunk = args[0].clone();
+                let body_thunk = args[1].clone();
+                let out_thunk = args[2].clone();
+                let entry = Rc::new((in_thunk.clone(), out_thunk));
+                Ok((Ctrl::Apply(in_thunk, vec![]),
+                    Rc::new(Kont::DynWindAfterIn {
+                        body_thunk,
+                        entry,
+                        next: k,
+                    })))
             } else if name == "apply" {
                 if args.len() < 2 {
                     return Err(EvalError::Arity("apply requires at least 2 arguments".into()));
@@ -648,11 +702,43 @@ fn cek_step_apply(func: Value, args: Vec<Value>, k: Rc<Kont>, output: &mut Strin
                 Ok((Ctrl::Val(result), k))
             }
         }
-        Value::Continuation(saved_k) => {
+        Value::Continuation(saved_k, saved_winders) => {
             if args.len() != 1 {
                 return Err(EvalError::Arity("continuation expects 1 argument".into()));
             }
-            Ok((Ctrl::Val(args[0].clone()), saved_k))
+            let val = args[0].clone();
+            // Find common prefix of current and saved winders
+            let common_len = winders.iter().zip(saved_winders.iter())
+                .take_while(|(a, b)| Rc::ptr_eq(a, b))
+                .count();
+            // Build wind shift operations
+            let mut ops: Vec<(bool, Rc<(Value, Value)>)> = Vec::new();
+            // Unwind: from top of current down to common prefix
+            for i in (common_len..winders.len()).rev() {
+                ops.push((false, winders[i].clone()));
+            }
+            // Rewind: from common prefix up to top of target
+            for winder in saved_winders.iter().skip(common_len) {
+                ops.push((true, winder.clone()));
+            }
+            if ops.is_empty() {
+                Ok((Ctrl::Val(val), saved_k))
+            } else {
+                let (is_rewind, entry) = ops[0].clone();
+                let remaining = ops[1..].to_vec();
+                let next_k = Rc::new(Kont::WindShift {
+                    ops: remaining,
+                    val,
+                    saved_k,
+                });
+                if is_rewind {
+                    winders.push(entry.clone());
+                    Ok((Ctrl::Apply(entry.0.clone(), vec![]), next_k))
+                } else {
+                    winders.pop();
+                    Ok((Ctrl::Apply(entry.1.clone(), vec![]), next_k))
+                }
+            }
         }
         _ => Err(EvalError::Type(format!("not a procedure: {func}"))),
     }
@@ -673,6 +759,7 @@ pub(crate) fn cek_run(exprs: Vec<Expr>, env: Env, output: &mut String) -> Result
         (Ctrl::Eval(first, env), k)
     };
     let mut last_span = Span::default();
+    let mut winders: Vec<Rc<(Value, Value)>> = Vec::new();
 
     loop {
         if let Ctrl::Val(ref v) = ctrl {
@@ -686,8 +773,8 @@ pub(crate) fn cek_run(exprs: Vec<Expr>, env: Env, output: &mut String) -> Result
                 let Ctrl::Eval(expr, env) = ctrl else { unreachable!() };
                 cek_step_eval(expr, env, k, output)?
             }
-            Ctrl::Val(val) => cek_step_val(val, k, output)?,
-            Ctrl::Apply(func, args) => cek_step_apply(func, args, k, output)
+            Ctrl::Val(val) => cek_step_val(val, k, output, &mut winders)?,
+            Ctrl::Apply(func, args) => cek_step_apply(func, args, k, output, &mut winders)
                 .map_err(|e| with_span(last_span, e))?,
         };
         ctrl = new_ctrl;
