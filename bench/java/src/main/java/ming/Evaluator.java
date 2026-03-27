@@ -3,6 +3,7 @@ package ming;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -47,11 +48,23 @@ public class Evaluator {
         env.define("-", new BuiltinProcedure("-", this::builtinSub));
         env.define("*", new BuiltinProcedure("*", this::builtinMul));
         env.define("/", new BuiltinProcedure("/", this::builtinDiv));
+        env.define("abs", new BuiltinProcedure("abs", this::builtinAbs));
+        env.define("modulo", new BuiltinProcedure("modulo", this::builtinModulo));
+        env.define("remainder", new BuiltinProcedure("remainder", this::builtinRemainder));
+        env.define("quotient", new BuiltinProcedure("quotient", this::builtinQuotient));
+        env.define("min", new BuiltinProcedure("min", this::builtinMin));
+        env.define("max", new BuiltinProcedure("max", this::builtinMax));
+        env.define("expt", new BuiltinProcedure("expt", this::builtinExpt));
         env.define("<", new BuiltinProcedure("<", args -> builtinComparison(args, Comparison.LT, "<")));
         env.define(">", new BuiltinProcedure(">", args -> builtinComparison(args, Comparison.GT, ">")));
         env.define("=", new BuiltinProcedure("=", args -> builtinComparison(args, Comparison.EQ, "=")));
         env.define("<=", new BuiltinProcedure("<=", args -> builtinComparison(args, Comparison.LE, "<=")));
         env.define("not", new BuiltinProcedure("not", this::builtinNot));
+        env.define("zero?", new BuiltinProcedure("zero?", this::builtinZeroPredicate));
+        env.define("positive?", new BuiltinProcedure("positive?", this::builtinPositivePredicate));
+        env.define("negative?", new BuiltinProcedure("negative?", this::builtinNegativePredicate));
+        env.define("odd?", new BuiltinProcedure("odd?", this::builtinOddPredicate));
+        env.define("even?", new BuiltinProcedure("even?", this::builtinEvenPredicate));
         env.define("cons", new BuiltinProcedure("cons", this::builtinCons));
         env.define("car", new BuiltinProcedure("car", this::builtinCar));
         env.define("cdr", new BuiltinProcedure("cdr", this::builtinCdr));
@@ -60,16 +73,28 @@ public class Evaluator {
         env.define("length", new BuiltinProcedure("length", this::builtinLength));
         env.define("append", new BuiltinProcedure("append", this::builtinAppend));
         env.define("apply", new BuiltinProcedure("apply", this::builtinApply));
+        env.define("list-ref", new BuiltinProcedure("list-ref", this::builtinListRef));
+        env.define("list-tail", new BuiltinProcedure("list-tail", this::builtinListTail));
+        env.define("list?", new BuiltinProcedure("list?", this::builtinListPredicate));
+        env.define("assoc", new BuiltinProcedure("assoc", this::builtinAssoc));
+        env.define("map", new BuiltinProcedure("map", this::builtinMap));
         env.define("string?", new BuiltinProcedure("string?", this::builtinStringPredicate));
         env.define("number?", new BuiltinProcedure("number?", this::builtinNumberPredicate));
         env.define("boolean?", new BuiltinProcedure("boolean?", this::builtinBooleanPredicate));
         env.define("pair?", new BuiltinProcedure("pair?", this::builtinPairPredicate));
         env.define("symbol?", new BuiltinProcedure("symbol?", this::builtinSymbolPredicate));
+        env.define("eq?", new BuiltinProcedure("eq?", this::builtinEq));
+        env.define("equal?", new BuiltinProcedure("equal?", this::builtinEqual));
         env.define("display", new BuiltinProcedure("display", this::builtinDisplay));
         env.define("write", new BuiltinProcedure("write", this::builtinWrite));
         env.define("newline", new BuiltinProcedure("newline", this::builtinNewline));
         env.define("string-append", new BuiltinProcedure("string-append", this::builtinStringAppend));
         env.define("string-length", new BuiltinProcedure("string-length", this::builtinStringLength));
+        env.define("string=?", new BuiltinProcedure("string=?", this::builtinStringEquals));
+        env.define("string<?", new BuiltinProcedure("string<?", this::builtinStringLessThan));
+        env.define("string-ci=?", new BuiltinProcedure("string-ci=?", this::builtinStringCaseInsensitiveEquals));
+        env.define("string-upcase", new BuiltinProcedure("string-upcase", this::builtinStringUpcase));
+        env.define("string-downcase", new BuiltinProcedure("string-downcase", this::builtinStringDowncase));
         env.define("substring", new BuiltinProcedure("substring", this::builtinSubstring));
         env.define("string->number", new BuiltinProcedure("string->number", this::builtinStringToNumber));
         env.define("number->string", new BuiltinProcedure("number->string", this::builtinNumberToString));
@@ -79,6 +104,12 @@ public class Evaluator {
         env.define("string-ref", new BuiltinProcedure("string-ref", this::builtinStringRef));
         env.define("string-set!", new BuiltinProcedure("string-set!", this::builtinStringSet));
         env.define("char?", new BuiltinProcedure("char?", this::builtinCharPredicate));
+        env.define("char-alphabetic?", new BuiltinProcedure("char-alphabetic?", this::builtinCharAlphabeticPredicate));
+        env.define("char-numeric?", new BuiltinProcedure("char-numeric?", this::builtinCharNumericPredicate));
+        env.define("char-upcase", new BuiltinProcedure("char-upcase", this::builtinCharUpcase));
+        env.define("char-downcase", new BuiltinProcedure("char-downcase", this::builtinCharDowncase));
+        env.define("char=?", new BuiltinProcedure("char=?", args -> builtinCharComparison(args, Comparison.EQ, "char=?")));
+        env.define("char<?", new BuiltinProcedure("char<?", args -> builtinCharComparison(args, Comparison.LT, "char<?")));
         return env;
     }
 
@@ -486,6 +517,86 @@ public class Evaluator {
         return new IntValue(result);
     }
 
+    private Value builtinAbs(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "abs");
+        return new IntValue(Math.abs(requireInt(args.getFirst())));
+    }
+
+    private Value builtinModulo(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 2, "modulo");
+        long dividend = requireInt(args.getFirst());
+        long divisor = requireInt(args.get(1));
+        if (divisor == 0) {
+            throw new EvalError("division by zero");
+        }
+
+        long remainder = dividend % divisor;
+        if (remainder != 0 && ((remainder < 0 && divisor > 0)
+                || (remainder > 0 && divisor < 0))) {
+            remainder += divisor;
+        }
+        return new IntValue(remainder);
+    }
+
+    private Value builtinRemainder(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 2, "remainder");
+        long dividend = requireInt(args.getFirst());
+        long divisor = requireInt(args.get(1));
+        if (divisor == 0) {
+            throw new EvalError("division by zero");
+        }
+        return new IntValue(dividend % divisor);
+    }
+
+    private Value builtinQuotient(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 2, "quotient");
+        long dividend = requireInt(args.getFirst());
+        long divisor = requireInt(args.get(1));
+        if (divisor == 0) {
+            throw new EvalError("division by zero");
+        }
+        return new IntValue(dividend / divisor);
+    }
+
+    private Value builtinMin(List<Value> args) throws EvalError {
+        requireAtLeastArgCount(args.size(), 1, "min");
+        long result = requireInt(args.getFirst());
+        for (int i = 1; i < args.size(); i++) {
+            result = Math.min(result, requireInt(args.get(i)));
+        }
+        return new IntValue(result);
+    }
+
+    private Value builtinMax(List<Value> args) throws EvalError {
+        requireAtLeastArgCount(args.size(), 1, "max");
+        long result = requireInt(args.getFirst());
+        for (int i = 1; i < args.size(); i++) {
+            result = Math.max(result, requireInt(args.get(i)));
+        }
+        return new IntValue(result);
+    }
+
+    private Value builtinExpt(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 2, "expt");
+        long base = requireInt(args.getFirst());
+        long exponent = requireInt(args.get(1));
+        if (exponent < 0) {
+            throw new EvalError("'expt' expects a non-negative exponent");
+        }
+
+        long result = 1;
+        long factor = base;
+        long remaining = exponent;
+        while (remaining > 0) {
+            if ((remaining & 1L) != 0) {
+                result *= factor;
+            }
+            factor *= factor;
+            remaining >>= 1;
+        }
+        return new IntValue(result);
+    }
+
     private Value builtinComparison(List<Value> args, Comparison comparison, String name)
             throws EvalError {
         if (args.size() < 2) {
@@ -508,22 +619,56 @@ public class Evaluator {
         return BoolValue.of(!isTruthy(args.getFirst()));
     }
 
+    private Value builtinZeroPredicate(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "zero?");
+        return BoolValue.of(requireInt(args.getFirst()) == 0);
+    }
+
+    private Value builtinPositivePredicate(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "positive?");
+        return BoolValue.of(requireInt(args.getFirst()) > 0);
+    }
+
+    private Value builtinNegativePredicate(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "negative?");
+        return BoolValue.of(requireInt(args.getFirst()) < 0);
+    }
+
+    private Value builtinOddPredicate(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "odd?");
+        return BoolValue.of((requireInt(args.getFirst()) & 1L) != 0);
+    }
+
+    private Value builtinEvenPredicate(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "even?");
+        return BoolValue.of((requireInt(args.getFirst()) & 1L) == 0);
+    }
+
     private Value builtinCons(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 2, "cons");
-        List<Value> tail = requireList(args.get(1), "cons");
-        List<Value> result = new ArrayList<>(tail.size() + 1);
-        result.add(args.getFirst());
-        result.addAll(tail);
-        return new ListValue(List.copyOf(result));
+        Value tail = args.get(1);
+        if (tail instanceof ListValue listValue) {
+            List<Value> result = new ArrayList<>(listValue.elements().size() + 1);
+            result.add(args.getFirst());
+            result.addAll(listValue.elements());
+            return new ListValue(List.copyOf(result));
+        }
+        return new PairValue(args.getFirst(), tail);
     }
 
     private Value builtinCar(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 1, "car");
+        if (args.getFirst() instanceof PairValue pairValue) {
+            return pairValue.car();
+        }
         return requireNonEmptyList(args.getFirst(), "car").getFirst();
     }
 
     private Value builtinCdr(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 1, "cdr");
+        if (args.getFirst() instanceof PairValue pairValue) {
+            return pairValue.cdr();
+        }
         List<Value> elements = requireNonEmptyList(args.getFirst(), "cdr");
         return new ListValue(List.copyOf(elements.subList(1, elements.size())));
     }
@@ -552,9 +697,7 @@ public class Evaluator {
     }
 
     private Value builtinApply(List<Value> args) throws EvalError {
-        if (args.size() < 2) {
-            throw new EvalError("'apply' expects at least 2 arguments");
-        }
+        requireAtLeastArgCount(args.size(), 2, "apply");
 
         List<Value> appliedArgs = new ArrayList<>();
         for (int i = 1; i < args.size() - 1; i++) {
@@ -562,6 +705,70 @@ public class Evaluator {
         }
         appliedArgs.addAll(requireList(args.getLast(), "apply"));
         return apply(args.getFirst(), appliedArgs);
+    }
+
+    private Value builtinListRef(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 2, "list-ref");
+        List<Value> list = requireList(args.getFirst(), "list-ref");
+        int index = requireElementIndex(args.get(1), list.size(), "list-ref");
+        return list.get(index);
+    }
+
+    private Value builtinListTail(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 2, "list-tail");
+        List<Value> list = requireList(args.getFirst(), "list-tail");
+        int index = requireListTailIndex(args.get(1), list.size(), "list-tail");
+        return new ListValue(List.copyOf(list.subList(index, list.size())));
+    }
+
+    private Value builtinListPredicate(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "list?");
+        return BoolValue.of(args.getFirst() instanceof ListValue);
+    }
+
+    private Value builtinAssoc(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 2, "assoc");
+        Value key = args.getFirst();
+        List<Value> alist = requireList(args.get(1), "assoc");
+        for (Value entry : alist) {
+            Value entryKey = switch (entry) {
+                case PairValue pairValue -> pairValue.car();
+                case ListValue listValue -> {
+                    if (listValue.elements().isEmpty()) {
+                        throw new EvalError("'assoc' expects pairs");
+                    }
+                    yield listValue.elements().getFirst();
+                }
+                default -> throw new EvalError("'assoc' expects pairs");
+            };
+
+            if (valuesEqual(key, entryKey)) {
+                return entry;
+            }
+        }
+        return BoolValue.FALSE;
+    }
+
+    private Value builtinMap(List<Value> args) throws EvalError {
+        requireAtLeastArgCount(args.size(), 2, "map");
+        Value procedure = args.getFirst();
+        List<List<Value>> lists = new ArrayList<>(args.size() - 1);
+        int limit = Integer.MAX_VALUE;
+        for (int i = 1; i < args.size(); i++) {
+            List<Value> list = requireList(args.get(i), "map");
+            lists.add(list);
+            limit = Math.min(limit, list.size());
+        }
+
+        List<Value> result = new ArrayList<>(limit);
+        for (int i = 0; i < limit; i++) {
+            List<Value> callArgs = new ArrayList<>(lists.size());
+            for (List<Value> list : lists) {
+                callArgs.add(list.get(i));
+            }
+            result.add(apply(procedure, callArgs));
+        }
+        return new ListValue(List.copyOf(result));
     }
 
     private Value builtinStringPredicate(List<Value> args) throws EvalError {
@@ -581,13 +788,23 @@ public class Evaluator {
 
     private Value builtinPairPredicate(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 1, "pair?");
-        return BoolValue.of(args.getFirst() instanceof ListValue listValue
-                && !listValue.elements().isEmpty());
+        return BoolValue.of(args.getFirst() instanceof PairValue
+                || args.getFirst() instanceof ListValue listValue && !listValue.elements().isEmpty());
     }
 
     private Value builtinSymbolPredicate(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 1, "symbol?");
         return BoolValue.of(args.getFirst() instanceof SymbolValue);
+    }
+
+    private Value builtinEq(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 2, "eq?");
+        return BoolValue.of(isEq(args.getFirst(), args.get(1)));
+    }
+
+    private Value builtinEqual(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 2, "equal?");
+        return BoolValue.of(valuesEqual(args.getFirst(), args.get(1)));
     }
 
     private Value builtinDisplay(List<Value> args) throws EvalError {
@@ -619,6 +836,31 @@ public class Evaluator {
     private Value builtinStringLength(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 1, "string-length");
         return new IntValue(requireString(args.getFirst(), "string-length").length());
+    }
+
+    private Value builtinStringEquals(List<Value> args) throws EvalError {
+        return builtinStringComparison(args, "string=?", (left, right) -> left.equals(right));
+    }
+
+    private Value builtinStringLessThan(List<Value> args) throws EvalError {
+        return builtinStringComparison(args, "string<?", (left, right) -> left.compareTo(right) < 0);
+    }
+
+    private Value builtinStringCaseInsensitiveEquals(List<Value> args) throws EvalError {
+        return builtinStringComparison(args, "string-ci=?",
+                (left, right) -> left.equalsIgnoreCase(right));
+    }
+
+    private Value builtinStringUpcase(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "string-upcase");
+        return new StringValue(requireString(args.getFirst(), "string-upcase")
+                .toUpperCase(Locale.ROOT));
+    }
+
+    private Value builtinStringDowncase(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "string-downcase");
+        return new StringValue(requireString(args.getFirst(), "string-downcase")
+                .toLowerCase(Locale.ROOT));
     }
 
     private Value builtinSubstring(List<Value> args) throws EvalError {
@@ -684,6 +926,40 @@ public class Evaluator {
         return BoolValue.of(args.getFirst() instanceof CharValue);
     }
 
+    private Value builtinCharAlphabeticPredicate(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "char-alphabetic?");
+        return BoolValue.of(Character.isLetter(requireChar(args.getFirst(), "char-alphabetic?")));
+    }
+
+    private Value builtinCharNumericPredicate(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "char-numeric?");
+        return BoolValue.of(Character.isDigit(requireChar(args.getFirst(), "char-numeric?")));
+    }
+
+    private Value builtinCharUpcase(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "char-upcase");
+        return new CharValue(Character.toUpperCase(requireChar(args.getFirst(), "char-upcase")));
+    }
+
+    private Value builtinCharDowncase(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "char-downcase");
+        return new CharValue(Character.toLowerCase(requireChar(args.getFirst(), "char-downcase")));
+    }
+
+    private Value builtinCharComparison(List<Value> args, Comparison comparison, String name)
+            throws EvalError {
+        requireAtLeastArgCount(args.size(), 2, name);
+        long previous = requireChar(args.getFirst(), name);
+        for (int i = 1; i < args.size(); i++) {
+            long current = requireChar(args.get(i), name);
+            if (!comparison.test(previous, current)) {
+                return BoolValue.FALSE;
+            }
+            previous = current;
+        }
+        return BoolValue.TRUE;
+    }
+
     private EvalError attachPosition(EvalError err, Expr expr) {
         if (err.hasPosition()) {
             return err;
@@ -694,6 +970,14 @@ public class Evaluator {
     private void requireArgCount(int actual, int expected, String procedure) throws EvalError {
         if (actual != expected) {
             throw new EvalError("'" + procedure + "' expects exactly "
+                    + expected + " argument" + (expected == 1 ? "" : "s"));
+        }
+    }
+
+    private void requireAtLeastArgCount(int actual, int expected, String procedure)
+            throws EvalError {
+        if (actual < expected) {
+            throw new EvalError("'" + procedure + "' expects at least "
                     + expected + " argument" + (expected == 1 ? "" : "s"));
         }
     }
@@ -754,6 +1038,14 @@ public class Evaluator {
         return Math.toIntExact(index);
     }
 
+    private int requireListTailIndex(Value value, int size, String procedure) throws EvalError {
+        long index = requireInt(value);
+        if (index < 0 || index > size) {
+            throw new EvalError("'" + procedure + "' index out of range");
+        }
+        return Math.toIntExact(index);
+    }
+
     private List<Value> requireNonEmptyList(Value value, String procedure) throws EvalError {
         List<Value> elements = requireList(value, procedure);
         if (!elements.isEmpty()) {
@@ -764,6 +1056,69 @@ public class Evaluator {
 
     private boolean isTruthy(Value value) {
         return !(value instanceof BoolValue boolValue) || boolValue.value();
+    }
+
+    private boolean isEq(Value left, Value right) {
+        if (left == right) {
+            return true;
+        }
+        return switch (left) {
+            case IntValue intValue when right instanceof IntValue other ->
+                    intValue.value() == other.value();
+            case BoolValue boolValue when right instanceof BoolValue other ->
+                    boolValue.value() == other.value();
+            case CharValue charValue when right instanceof CharValue other ->
+                    charValue.value() == other.value();
+            case SymbolValue symbolValue when right instanceof SymbolValue other ->
+                    symbolValue.name().equals(other.name());
+            case VoidValue ignored when right instanceof VoidValue -> true;
+            default -> false;
+        };
+    }
+
+    private boolean valuesEqual(Value left, Value right) {
+        if (isEq(left, right)) {
+            return true;
+        }
+
+        return switch (left) {
+            case StringValue stringValue when right instanceof StringValue other ->
+                    stringValue.value().equals(other.value());
+            case ListValue listValue when right instanceof ListValue other ->
+                    listElementsEqual(listValue.elements(), other.elements());
+            case PairValue pairValue when right instanceof PairValue other ->
+                    valuesEqual(pairValue.car(), other.car())
+                            && valuesEqual(pairValue.cdr(), other.cdr());
+            default -> false;
+        };
+    }
+
+    private boolean listElementsEqual(List<Value> left, List<Value> right) {
+        if (left.size() != right.size()) {
+            return false;
+        }
+        for (int i = 0; i < left.size(); i++) {
+            if (!valuesEqual(left.get(i), right.get(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private Value builtinStringComparison(
+            List<Value> args,
+            String procedure,
+            StringRelation relation) throws EvalError {
+        requireAtLeastArgCount(args.size(), 2, procedure);
+        String previous = requireString(args.getFirst(), procedure);
+        for (int i = 1; i < args.size(); i++) {
+            String current = requireString(args.get(i), procedure);
+            if (!relation.test(previous, current)) {
+                return BoolValue.FALSE;
+            }
+            previous = current;
+        }
+        return BoolValue.TRUE;
     }
 
     private void appendOutput(String text) {
@@ -839,7 +1194,7 @@ public class Evaluator {
     }
 
     private sealed interface Value permits IntValue, BoolValue, StringValue, SymbolValue,
-            CharValue, ListValue, ProcedureValue, VoidValue {
+            CharValue, ListValue, PairValue, ProcedureValue, VoidValue {
         String toSchemeString();
 
         default String toDisplayString() {
@@ -954,6 +1309,17 @@ public class Evaluator {
         }
     }
 
+    private record PairValue(Value car, Value cdr) implements Value {
+        @Override
+        public String toSchemeString() {
+            StringBuilder builder = new StringBuilder();
+            builder.append('(');
+            appendPairContents(builder, this);
+            builder.append(')');
+            return builder.toString();
+        }
+    }
+
     private record BuiltinProcedure(String name, BuiltinFn fn) implements ProcedureValue {
         @Override
         public String toSchemeString() {
@@ -984,6 +1350,11 @@ public class Evaluator {
     @FunctionalInterface
     private interface BuiltinFn {
         Value apply(List<Value> args) throws EvalError;
+    }
+
+    @FunctionalInterface
+    private interface StringRelation {
+        boolean test(String left, String right);
     }
 
     private static final class Environment {
@@ -1037,6 +1408,25 @@ public class Evaluator {
         }
         builder.append('"');
         return builder.toString();
+    }
+
+    private static void appendPairContents(StringBuilder builder, PairValue pair) {
+        builder.append(pair.car().toSchemeString());
+        Value tail = pair.cdr();
+        if (tail instanceof PairValue nextPair) {
+            builder.append(' ');
+            appendPairContents(builder, nextPair);
+            return;
+        }
+        if (tail instanceof ListValue listValue) {
+            for (Value element : listValue.elements()) {
+                builder.append(' ');
+                builder.append(element.toSchemeString());
+            }
+            return;
+        }
+        builder.append(" . ");
+        builder.append(tail.toSchemeString());
     }
 
     private static String charToSchemeString(char value) {
