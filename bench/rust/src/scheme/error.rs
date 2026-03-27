@@ -57,6 +57,8 @@ pub enum EvalError {
         end: i64,
         len: usize,
     },
+    #[error("{name} invalid argument: {message}")]
+    InvalidArgument { name: String, message: String },
     #[error("division by zero")]
     DivisionByZero,
     #[error("{pos}: {source}")]
