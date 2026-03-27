@@ -1,4 +1,4 @@
-import { EvalError } from './evalError.js';
+import { EvalError, attachPosition } from './evalError.js';
 const EMPTY_LIST = { kind: 'empty-list' };
 const VOID = { kind: 'void' };
 class Env {
@@ -23,6 +23,8 @@ class Env {
 class Parser {
     input;
     index = 0;
+    line = 1;
+    column = 1;
     constructor(input) {
         this.input = input;
     }
@@ -38,21 +40,23 @@ class Parser {
     parseExpr() {
         this.skipIgnored();
         if (this.isAtEnd()) {
-            throw new EvalError('unexpected end of input');
+            this.error('unexpected end of input');
         }
+        const position = this.currentPosition();
         const ch = this.peek();
         if (ch === '\'') {
             this.advance();
             return {
                 kind: 'list',
-                items: [{ kind: 'symbol', name: 'quote' }, this.parseExpr()],
+                position,
+                items: [{ kind: 'symbol', name: 'quote', position }, this.parseExpr()],
             };
         }
         if (ch === '(') {
             return this.parseList();
         }
         if (ch === ')') {
-            throw new EvalError('unexpected )');
+            this.error('unexpected )', position);
         }
         if (ch === '"') {
             return this.parseString();
@@ -60,6 +64,7 @@ class Parser {
         return this.parseAtom();
     }
     parseList() {
+        const position = this.currentPosition();
         this.advance();
         const items = [];
         this.skipIgnored();
@@ -68,22 +73,23 @@ class Parser {
             this.skipIgnored();
         }
         if (this.isAtEnd()) {
-            throw new EvalError('unterminated list');
+            this.error('unterminated list', position);
         }
         this.advance();
-        return { kind: 'list', items };
+        return { kind: 'list', items, position };
     }
     parseString() {
+        const position = this.currentPosition();
         this.advance();
         let value = '';
         while (!this.isAtEnd()) {
             const ch = this.advance();
             if (ch === '"') {
-                return { kind: 'string', value };
+                return { kind: 'string', value, position };
             }
             if (ch === '\\') {
                 if (this.isAtEnd()) {
-                    throw new EvalError('unterminated string');
+                    this.error('unterminated string', position);
                 }
                 const escaped = this.advance();
                 switch (escaped) {
@@ -108,27 +114,28 @@ class Parser {
                 value += ch;
             }
         }
-        throw new EvalError('unterminated string');
+        this.error('unterminated string', position);
     }
     parseAtom() {
+        const position = this.currentPosition();
         const start = this.index;
         while (!this.isAtEnd() && !isDelimiter(this.peek())) {
             this.advance();
         }
         const token = this.input.slice(start, this.index);
         if (token.length === 0) {
-            throw new EvalError('expected expression');
+            this.error('expected expression', position);
         }
         if (token === '#t') {
-            return { kind: 'boolean', value: true };
+            return { kind: 'boolean', value: true, position };
         }
         if (token === '#f') {
-            return { kind: 'boolean', value: false };
+            return { kind: 'boolean', value: false, position };
         }
         if (/^[+-]?\d+$/.test(token) && token !== '+' && token !== '-') {
-            return { kind: 'number', value: Number.parseInt(token, 10) };
+            return { kind: 'number', value: Number.parseInt(token, 10), position };
         }
-        return { kind: 'symbol', name: token };
+        return { kind: 'symbol', name: token, position };
     }
     skipIgnored() {
         while (!this.isAtEnd()) {
@@ -155,7 +162,20 @@ class Parser {
     advance() {
         const ch = this.input[this.index];
         this.index += 1;
+        if (ch === '\n') {
+            this.line += 1;
+            this.column = 1;
+        }
+        else {
+            this.column += 1;
+        }
         return ch;
+    }
+    currentPosition() {
+        return { line: this.line, column: this.column };
+    }
+    error(message, position = this.currentPosition()) {
+        throw new EvalError(message, position);
     }
 }
 const BUILTINS = new Map([
@@ -210,7 +230,7 @@ export function evalStr(input) {
 export function evalStrWithOutput(input) {
     const program = new Parser(input).parseProgram();
     if (program.length === 0) {
-        throw new EvalError('empty input');
+        throw new EvalError('empty input', { line: 1, column: 1 });
     }
     const env = createGlobalEnv();
     const lastValue = evalSequence(program, env);
@@ -234,15 +254,20 @@ function evalSequence(exprs, env) {
     return result;
 }
 function evalExpr(expr, env) {
-    switch (expr.kind) {
-        case 'number':
-        case 'boolean':
-        case 'string':
-            return expr.value;
-        case 'symbol':
-            return env.lookup(expr.name);
-        case 'list':
-            return evalList(expr.items, env);
+    try {
+        switch (expr.kind) {
+            case 'number':
+            case 'boolean':
+            case 'string':
+                return expr.value;
+            case 'symbol':
+                return env.lookup(expr.name);
+            case 'list':
+                return evalList(expr.items, env);
+        }
+    }
+    catch (error) {
+        throw attachPosition(error, expr.position);
     }
 }
 function evalList(items, env) {
@@ -277,7 +302,7 @@ function evalList(items, env) {
         throw new EvalError('attempted to call a non-procedure');
     }
     const args = items.slice(1).map((item) => evalExpr(item, env));
-    return applyProcedure(proc, args);
+    return applyProcedure(proc, args, first.position);
 }
 function evalAnd(args, env) {
     let result = true;
@@ -392,7 +417,7 @@ function evalNamedLet(name, bindingsExpr, body, env) {
         env: letEnv,
     };
     letEnv.define(name, proc);
-    return applyProcedure(proc, values);
+    return applyProcedure(proc, values, bindingsExpr.position);
 }
 function evalQuote(args) {
     assertExactArity('quote', args, 1);
@@ -436,16 +461,21 @@ function quoteExpr(expr) {
             return makeList(expr.items.map((item) => quoteExpr(item)));
     }
 }
-function applyProcedure(proc, args) {
-    if (proc.kind === 'builtin') {
-        return proc.apply(args);
+function applyProcedure(proc, args, position) {
+    try {
+        if (proc.kind === 'builtin') {
+            return proc.apply(args);
+        }
+        assertExactArity(proc.name ?? 'lambda', args, proc.params.length);
+        const callEnv = new Env(proc.env);
+        proc.params.forEach((param, index) => {
+            callEnv.define(param, args[index]);
+        });
+        return evalSequence(proc.body, callEnv);
     }
-    assertExactArity(proc.name ?? 'lambda', args, proc.params.length);
-    const callEnv = new Env(proc.env);
-    proc.params.forEach((param, index) => {
-        callEnv.define(param, args[index]);
-    });
-    return evalSequence(proc.body, callEnv);
+    catch (error) {
+        throw attachPosition(error, position);
+    }
 }
 function builtin(name, apply) {
     return [name, { kind: 'builtin', name, apply }];
