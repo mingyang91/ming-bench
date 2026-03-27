@@ -97,6 +97,25 @@ public class Evaluator {
     // Lambda (closure) — restParam is non-null for variadic (dot notation)
     record Lambda(List<String> params, String restParam, List<Object> body, Env env) {}
 
+    // Record types
+    static class RecordType {
+        final String name;
+        final List<String> fieldNames;
+        RecordType(String name, List<String> fieldNames) {
+            this.name = name;
+            this.fieldNames = fieldNames;
+        }
+    }
+
+    static class SchemeRecord {
+        final RecordType type;
+        final Object[] fields;
+        SchemeRecord(RecordType type, Object[] fields) {
+            this.type = type;
+            this.fields = fields;
+        }
+    }
+
     // Macro transformer from syntax-rules
     @SuppressWarnings("unchecked")
     record SyntaxRules(List<String> literals, List<List<Object>> patterns, List<Object> templates, Env defEnv) {}
@@ -158,6 +177,8 @@ public class Evaluator {
         if (val instanceof Pair p) return pairToString(p, true);
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof SyntaxRules) return "#<syntax>";
+        if (val instanceof SchemeRecord) return "#<record>";
+        if (val instanceof java.util.function.Function) return "#<procedure>";
         return val.toString();
     }
 
@@ -173,6 +194,8 @@ public class Evaluator {
         if (val == Empty.NIL) return "()";
         if (val instanceof Pair p) return pairToString(p, false);
         if (val instanceof Lambda) return "#<procedure>";
+        if (val instanceof SchemeRecord) return "#<record>";
+        if (val instanceof java.util.function.Function) return "#<procedure>";
         return val.toString();
     }
 
@@ -575,6 +598,61 @@ public class Evaluator {
                         }
                         return result;
                     }
+                    case "define-record-type" -> {
+                        // (define-record-type <name> (constructor field...) predicate (field accessor)...)
+                        if (list.size() < 4) throw errAt(eline, ecol, "define-record-type: bad syntax");
+                        String typeName = symName(list.get(1));
+                        if (typeName == null) throw errAt(eline, ecol, "define-record-type: expected type name");
+                        if (!(list.get(2) instanceof List<?> ctorSpec) || ctorSpec.size() < 1)
+                            throw errAt(eline, ecol, "define-record-type: bad constructor");
+                        String ctorName = symName(ctorSpec.get(0));
+                        if (ctorName == null) throw errAt(eline, ecol, "define-record-type: bad constructor name");
+                        List<String> ctorFields = new ArrayList<>();
+                        for (int i = 1; i < ctorSpec.size(); i++) {
+                            String fn = symName(ctorSpec.get(i));
+                            if (fn == null) throw errAt(eline, ecol, "define-record-type: bad field name");
+                            ctorFields.add(fn);
+                        }
+                        String predName = symName(list.get(3));
+                        if (predName == null) throw errAt(eline, ecol, "define-record-type: bad predicate name");
+
+                        RecordType rt = new RecordType(typeName, ctorFields);
+
+                        // Define constructor
+                        final RecordType rtFinal = rt;
+                        env.define(ctorName, (java.util.function.Function<List<Object>, Object>) args2 -> {
+                            if (args2.size() != rtFinal.fieldNames.size())
+                                throw new RuntimeException("wrong number of arguments");
+                            return new SchemeRecord(rtFinal, args2.toArray());
+                        });
+
+                        // Define predicate
+                        env.define(predName, (java.util.function.Function<List<Object>, Object>) args2 -> {
+                            if (args2.size() != 1) throw new RuntimeException("wrong number of arguments");
+                            return args2.get(0) instanceof SchemeRecord sr && sr.type == rtFinal;
+                        });
+
+                        // Define accessors
+                        for (int i = 4; i < list.size(); i++) {
+                            if (!(list.get(i) instanceof List<?> fieldSpec) || fieldSpec.size() < 2)
+                                throw errAt(eline, ecol, "define-record-type: bad field spec");
+                            String fieldName = symName(fieldSpec.get(0));
+                            String accessorName = symName(fieldSpec.get(1));
+                            if (fieldName == null || accessorName == null)
+                                throw errAt(eline, ecol, "define-record-type: bad field spec");
+                            int fieldIdx = ctorFields.indexOf(fieldName);
+                            if (fieldIdx < 0)
+                                throw errAt(eline, ecol, "define-record-type: unknown field " + fieldName);
+                            final int idx = fieldIdx;
+                            env.define(accessorName, (java.util.function.Function<List<Object>, Object>) args2 -> {
+                                if (args2.size() != 1) throw new RuntimeException("wrong number of arguments");
+                                if (!(args2.get(0) instanceof SchemeRecord sr) || sr.type != rtFinal)
+                                    throw new RuntimeException(accessorName + ": not a " + typeName);
+                                return sr.fields[idx];
+                            });
+                        }
+                        return VOID;
+                    }
                     case "define-syntax" -> {
                         if (list.size() != 3) throw errAt(eline, ecol, "define-syntax: bad syntax");
                         String macroName = symName(list.get(1));
@@ -675,6 +753,15 @@ public class Evaluator {
     private Object apply(Object proc, List<Object> args) throws EvalError {
         if (proc instanceof String sym && sym.startsWith("builtin:")) {
             return applyBuiltin(sym.substring(8), args);
+        }
+        if (proc instanceof java.util.function.Function) {
+            @SuppressWarnings("unchecked")
+            java.util.function.Function<List<Object>, Object> fn = (java.util.function.Function<List<Object>, Object>) proc;
+            try {
+                return fn.apply(args);
+            } catch (RuntimeException e) {
+                throw new EvalError(e.getMessage());
+            }
         }
         if (proc instanceof Lambda lam) {
             if (lam.restParam() != null) {
