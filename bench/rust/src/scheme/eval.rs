@@ -12,7 +12,8 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
         Value::Integer(_) | Value::Rational(_, _) | Value::Float(_)
         | Value::Boolean(_) | Value::String(_)
         | Value::Char(_) | Value::Lambda { .. } | Value::Pair(_, _)
-        | Value::SyntaxRules { .. } | Value::Record { .. } | Value::RecordProc { .. } => {
+        | Value::SyntaxRules { .. } | Value::Record { .. } | Value::RecordProc { .. }
+        | Value::CaseLambda { .. } => {
             Ok(expr.clone())
         }
         Value::Symbol(name) => env.borrow().get(name),
@@ -31,6 +32,7 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
                         return Ok(elems[1].clone());
                     }
                     "lambda" => return eval_lambda(&elems[1..], env),
+                    "case-lambda" => return eval_case_lambda(&elems[1..], env),
                     "and" => return eval_and(&elems[1..], env, out),
                     "or" => return eval_or(&elems[1..], env, out),
                     "let" => return eval_let(&elems[1..], env, out),
@@ -170,6 +172,27 @@ fn parse_params(sig: &[Value]) -> Result<(Vec<String>, Option<String>), EvalErro
     Ok((params, rest_param))
 }
 
+fn eval_case_lambda(clauses: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    let mut parsed = Vec::new();
+    for clause in clauses {
+        let elems = match clause {
+            Value::List(e) => e,
+            _ => return Err(EvalError::Type("case-lambda: expected clause list".into())),
+        };
+        if elems.len() < 2 {
+            return Err(EvalError::Arity("case-lambda: clause needs params and body".into()));
+        }
+        let (params, rest_param) = match &elems[0] {
+            Value::List(p) => parse_params(p)?,
+            Value::Symbol(s) => (vec![], Some(s.clone())),
+            _ => return Err(EvalError::Type("case-lambda: expected parameter list".into())),
+        };
+        let body = elems[1..].to_vec();
+        parsed.push((params, rest_param, body, Rc::clone(env)));
+    }
+    Ok(Value::CaseLambda { clauses: parsed })
+}
+
 fn apply(func: &Value, args: &[Value], out: &Output) -> Result<Value, EvalError> {
     match func {
         Value::Lambda { params, rest_param, body, env } => {
@@ -201,6 +224,33 @@ fn apply(func: &Value, args: &[Value], out: &Output) -> Result<Value, EvalError>
                 result = eval(expr, &local_env, out)?;
             }
             Ok(result)
+        }
+        Value::CaseLambda { clauses } => {
+            for (params, rest_param, body, env) in clauses {
+                let matches = if rest_param.is_some() {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if matches {
+                    let local_env = Env::with_parent(env);
+                    for (param, arg) in params.iter().zip(args.iter()) {
+                        local_env.borrow_mut().set(param.clone(), arg.clone());
+                    }
+                    if let Some(ref rest) = rest_param {
+                        let rest_args = args[params.len()..].to_vec();
+                        local_env.borrow_mut().set(rest.clone(), Value::List(rest_args));
+                    }
+                    let mut result = Value::Void;
+                    for expr in body {
+                        result = eval(expr, &local_env, out)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            Err(EvalError::Arity(format!(
+                "case-lambda: no matching clause for {} arguments", args.len()
+            )))
         }
         Value::RecordProc { type_id, kind } => {
             use crate::scheme::value::RecordProcKind;
@@ -454,6 +504,10 @@ fn apply_builtin(op: &str, vals: &[Value], out: &Output) -> Result<Value, EvalEr
         "char?" => {
             if vals.len() != 1 { return Err(EvalError::Arity("char? requires 1 argument".into())); }
             Ok(Value::Boolean(matches!(&vals[0], Value::Char(_))))
+        }
+        "procedure?" => {
+            if vals.len() != 1 { return Err(EvalError::Arity("procedure? requires 1 argument".into())); }
+            Ok(Value::Boolean(matches!(&vals[0], Value::Lambda { .. } | Value::CaseLambda { .. } | Value::RecordProc { .. })))
         }
         // L05: display, write, newline
         "display" => {

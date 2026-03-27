@@ -32,6 +32,8 @@ const BUILTINS: &[&str] = &[
     // L11
     "exact?", "inexact?", "exact->inexact", "inexact->exact",
     "numerator", "denominator", "integer?", "rational?",
+    // L13
+    "procedure?",
 ];
 
 fn make_env() -> Rc<RefCell<Env>> {

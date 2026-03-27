@@ -49,6 +49,9 @@ pub enum Value {
         type_id: usize,
         kind: RecordProcKind,
     },
+    CaseLambda {
+        clauses: Vec<(Vec<std::string::String>, Option<std::string::String>, Vec<Value>, Rc<RefCell<Env>>)>,
+    },
 }
 
 impl PartialEq for Value {
@@ -68,6 +71,7 @@ impl PartialEq for Value {
             (Value::SyntaxRules { .. }, Value::SyntaxRules { .. }) => false,
             (Value::Record { type_id: a, fields: af }, Value::Record { type_id: b, fields: bf }) => a == b && af == bf,
             (Value::RecordProc { .. }, Value::RecordProc { .. }) => false,
+            (Value::CaseLambda { .. }, Value::CaseLambda { .. }) => false,
             _ => false,
         }
     }
@@ -122,6 +126,7 @@ impl Value {
             Value::SyntaxRules { .. } => "#<syntax>".into(),
             Value::Record { .. } => "#<record>".into(),
             Value::RecordProc { .. } => "#<procedure>".into(),
+            Value::CaseLambda { .. } => "#<procedure>".into(),
             Value::Void => "".into(),
         }
     }
@@ -147,6 +152,7 @@ impl Value {
                 format!("({})", inner.join(" "))
             }
             Value::Pair(a, b) => format!("({} . {})", a.to_display_repr(), b.to_display_repr()),
+            Value::CaseLambda { .. } => "#<procedure>".into(),
             _ => self.to_display(),
         }
     }
