@@ -97,6 +97,7 @@ public class Evaluator {
         env.define("boolean?", new BuiltinProcedure("boolean?", this::builtinBooleanPredicate));
         env.define("pair?", new BuiltinProcedure("pair?", this::builtinPairPredicate));
         env.define("symbol?", new BuiltinProcedure("symbol?", this::builtinSymbolPredicate));
+        env.define("procedure?", new BuiltinProcedure("procedure?", this::builtinProcedurePredicate));
         env.define("eq?", new BuiltinProcedure("eq?", this::builtinEq));
         env.define("equal?", new BuiltinProcedure("equal?", this::builtinEqual));
         env.define("display", new BuiltinProcedure("display", this::builtinDisplay));
@@ -164,6 +165,7 @@ public class Evaluator {
                 case "if" -> evalIf(args, env);
                 case "quote" -> evalQuote(args);
                 case "lambda" -> evalLambda(args, env);
+                case "case-lambda" -> evalCaseLambda(args, env);
                 case "begin" -> evalBegin(args, env);
                 case "let" -> evalLet(args, env);
                 case "cond" -> evalCond(args, env);
@@ -381,6 +383,30 @@ public class Evaluator {
         ParameterSpec params = parseLambdaParameterSpec(args.getFirst());
         List<Expr> body = List.copyOf(args.subList(1, args.size()));
         return new ClosureValue(null, params, body, env);
+    }
+
+    private Value evalCaseLambda(List<Expr> args, Environment env) throws EvalError {
+        if (args.isEmpty()) {
+            throw new EvalError("'case-lambda' expects at least one clause");
+        }
+
+        List<CaseLambdaClause> clauses = new ArrayList<>(args.size());
+        for (Expr clauseExpr : args) {
+            if (!(clauseExpr instanceof ListExpr clauseList)) {
+                throw new EvalError("'case-lambda' clauses must be lists");
+            }
+
+            List<Expr> clauseElements = clauseList.elements();
+            if (clauseElements.size() < 2) {
+                throw new EvalError("'case-lambda' clauses require parameters and a body");
+            }
+
+            ParameterSpec params = parseLambdaParameterSpec(clauseElements.getFirst());
+            List<Expr> body = List.copyOf(clauseElements.subList(1, clauseElements.size()));
+            clauses.add(new CaseLambdaClause(params, body));
+        }
+
+        return new CaseLambdaValue(List.copyOf(clauses), env);
     }
 
     private Value evalBegin(List<Expr> args, Environment env) throws EvalError {
@@ -1084,7 +1110,7 @@ public class Evaluator {
     private boolean isSyntaxKeyword(String name) {
         return switch (name) {
             case "define", "define-syntax", "define-record-type", "set!", "if", "quote",
-                    "lambda", "begin", "let", "cond", "and", "or", "else", "." -> true;
+                    "lambda", "case-lambda", "begin", "let", "cond", "and", "or", "else", "." -> true;
             default -> false;
         };
     }
@@ -1127,16 +1153,41 @@ public class Evaluator {
         return switch (procedure) {
             case BuiltinProcedure builtin -> builtin.fn().apply(args);
             case ClosureValue closure -> applyClosure(closure, args);
+            case CaseLambdaValue caseLambda -> applyCaseLambda(caseLambda, args);
         };
     }
 
     private Value applyClosure(ClosureValue closure, List<Value> args) throws EvalError {
-        ParameterSpec params = closure.params();
-        if (!params.accepts(args.size())) {
-            throw new EvalError("wrong number of arguments");
+        return applyProcedureClause(closure.params(), closure.body(), closure.env(), args, "wrong number of arguments");
+    }
+
+    private Value applyCaseLambda(CaseLambdaValue caseLambda, List<Value> args) throws EvalError {
+        for (CaseLambdaClause clause : caseLambda.clauses()) {
+            if (clause.params().accepts(args.size())) {
+                return applyProcedureClause(
+                        clause.params(),
+                        clause.body(),
+                        caseLambda.env(),
+                        args,
+                        "wrong number of arguments");
+            }
         }
 
-        Environment callEnv = new Environment(closure.env());
+        throw new EvalError("wrong number of arguments");
+    }
+
+    private Value applyProcedureClause(
+            ParameterSpec params,
+            List<Expr> body,
+            Environment lexicalEnv,
+            List<Value> args,
+            String arityMessage)
+            throws EvalError {
+        if (!params.accepts(args.size())) {
+            throw new EvalError(arityMessage);
+        }
+
+        Environment callEnv = new Environment(lexicalEnv);
         for (int i = 0; i < params.fixedParams().size(); i++) {
             callEnv.define(params.fixedParams().get(i), args.get(i));
         }
@@ -1147,7 +1198,7 @@ public class Evaluator {
         }
 
         Value result = VoidValue.INSTANCE;
-        for (Expr bodyExpr : closure.body()) {
+        for (Expr bodyExpr : body) {
             result = eval(bodyExpr, callEnv);
         }
         return result;
@@ -1580,6 +1631,11 @@ public class Evaluator {
     private Value builtinSymbolPredicate(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 1, "symbol?");
         return BoolValue.of(args.getFirst() instanceof SymbolValue);
+    }
+
+    private Value builtinProcedurePredicate(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "procedure?");
+        return BoolValue.of(args.getFirst() instanceof ProcedureValue);
     }
 
     private Value builtinEq(List<Value> args) throws EvalError {
@@ -2355,6 +2411,9 @@ public class Evaluator {
         }
     }
 
+    private record CaseLambdaClause(ParameterSpec params, List<Expr> body) {
+    }
+
     private sealed interface Value permits NumericValue, BoolValue, StringValue, SymbolValue,
             CharValue, ListValue, PairValue, RecordValue, ProcedureValue, VoidValue {
         String toSchemeString();
@@ -2367,7 +2426,8 @@ public class Evaluator {
     private sealed interface NumericValue extends Value permits IntValue, RationalValue, InexactValue {
     }
 
-    private sealed interface ProcedureValue extends Value permits BuiltinProcedure, ClosureValue {
+    private sealed interface ProcedureValue extends Value
+            permits BuiltinProcedure, ClosureValue, CaseLambdaValue {
     }
 
     private record IntValue(long value) implements NumericValue {
@@ -2542,6 +2602,14 @@ public class Evaluator {
                 return "#<procedure>";
             }
             return "#<procedure:" + name + ">";
+        }
+    }
+
+    private record CaseLambdaValue(List<CaseLambdaClause> clauses, Environment env)
+            implements ProcedureValue {
+        @Override
+        public String toSchemeString() {
+            return "#<procedure>";
         }
     }
 
