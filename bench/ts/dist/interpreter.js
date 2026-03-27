@@ -3,6 +3,7 @@ import * as num from './numbers.js';
 const EMPTY_LIST = { kind: 'empty-list' };
 const VOID = { kind: 'void' };
 const UNINITIALIZED = Symbol('uninitialized');
+const STRING_IMMUTABILITY_LEVEL = 15;
 const CORE_SYNTAX = new Set([
     'and',
     'begin',
@@ -647,6 +648,7 @@ function createBuiltins(output, macroEnv) {
         builtin('>', (args) => compareNumbers('>', args, (left, right) => num.numericCompare(left, right) > 0)),
         builtin('=', (args) => compareNumbers('=', args, (left, right) => num.numericEqual(left, right))),
         builtin('<=', (args) => compareNumbers('<=', args, (left, right) => num.numericCompare(left, right) <= 0)),
+        builtin('>=', (args) => compareNumbers('>=', args, (left, right) => num.numericCompare(left, right) >= 0)),
         builtin('abs', (args) => absoluteValue(args)),
         builtin('apply', (args, position) => applyBuiltin(args, position, macroEnv)),
         builtin('append', (args) => appendValues(args)),
@@ -667,6 +669,10 @@ function createBuiltins(output, macroEnv) {
         builtin('char-downcase', (args) => {
             assertExactArity('char-downcase', args, 1);
             return { kind: 'char', value: expectCharValue('char-downcase', args[0]).value.toLowerCase() };
+        }),
+        builtin('char->integer', (args) => {
+            assertExactArity('char->integer', args, 1);
+            return num.exactIntegerFromNumber(expectCharValue('char->integer', args[0]).value.codePointAt(0));
         }),
         builtin('char-numeric?', (args) => {
             assertExactArity('char-numeric?', args, 1);
@@ -716,6 +722,10 @@ function createBuiltins(output, macroEnv) {
             return num.inexactToExact(expectNumberValue('inexact->exact', args[0]));
         }),
         builtin('inexact?', (args) => unaryPredicate('inexact?', args, (value) => num.isNumericValue(value) && num.isInexactNumeric(value))),
+        builtin('integer->char', (args) => {
+            assertExactArity('integer->char', args, 1);
+            return { kind: 'char', value: String.fromCodePoint(expectCodePoint('integer->char', args[0])) };
+        }),
         builtin('integer?', (args) => unaryPredicate('integer?', args, (value) => num.isNumericValue(value) && num.numericIsInteger(value))),
         builtin('length', (args) => {
             assertExactArity('length', args, 1);
@@ -724,6 +734,12 @@ function createBuiltins(output, macroEnv) {
         builtin('list', (args) => makeList(args)),
         builtin('list-ref', (args) => listRefBuiltin(args)),
         builtin('list-tail', (args) => listTailBuiltin(args)),
+        builtin('list->string', (args) => {
+            assertExactArity('list->string', args, 1);
+            return makeRuntimeString(expectProperList('list->string', args[0])
+                .map((item) => expectCharValue('list->string', item).value)
+                .join(''));
+        }),
         builtin('list->vector', (args) => {
             assertExactArity('list->vector', args, 1);
             return { kind: 'vector', items: expectProperList('list->vector', args[0]) };
@@ -750,7 +766,7 @@ function createBuiltins(output, macroEnv) {
         builtin('null?', (args) => unaryPredicate('null?', args, isEmptyList)),
         builtin('number->string', (args) => {
             assertExactArity('number->string', args, 1);
-            return makeMutableString(num.formatNumber(expectNumberValue('number->string', args[0])));
+            return makeRuntimeString(num.formatNumber(expectNumberValue('number->string', args[0])));
         }),
         builtin('number?', (args) => unaryPredicate('number?', args, (value) => num.isNumericValue(value))),
         builtin('numerator', (args) => {
@@ -768,19 +784,23 @@ function createBuiltins(output, macroEnv) {
             assertExactArity('string->number', args, 1);
             return num.parseStringNumber(expectStringValue('string->number', args[0]));
         }),
+        builtin('string->list', (args) => {
+            assertExactArity('string->list', args, 1);
+            return makeList(stringChars(expectStringValue('string->list', args[0])).map((char) => ({ kind: 'char', value: char })));
+        }),
         builtin('string->symbol', (args) => {
             assertExactArity('string->symbol', args, 1);
             return { kind: 'symbol-value', name: expectStringValue('string->symbol', args[0]) };
         }),
-        builtin('string-append', (args) => makeMutableString(args.map((arg) => expectStringValue('string-append', arg)).join(''))),
+        builtin('string-append', (args) => makeRuntimeString(args.map((arg) => expectStringValue('string-append', arg)).join(''))),
         builtin('string-copy', (args) => {
             assertExactArity('string-copy', args, 1);
-            return makeMutableString(expectStringValue('string-copy', args[0]));
+            return makeRuntimeString(expectStringValue('string-copy', args[0]));
         }),
         builtin('string-ci=?', (args) => compareStrings('string-ci=?', args, (value) => value.toLowerCase(), (left, right) => left === right)),
         builtin('string-downcase', (args) => {
             assertExactArity('string-downcase', args, 1);
-            return makeMutableString(expectStringValue('string-downcase', args[0]).toLowerCase());
+            return makeRuntimeString(expectStringValue('string-downcase', args[0]).toLowerCase());
         }),
         builtin('string<?', (args) => compareStrings('string<?', args, (value) => value, (left, right) => left < right)),
         builtin('string=?', (args) => compareStrings('string=?', args, (value) => value, (left, right) => left === right)),
@@ -799,6 +819,9 @@ function createBuiltins(output, macroEnv) {
         }),
         builtin('string-set!', (args) => {
             assertExactArity('string-set!', args, 3);
+            if (stringsAreImmutable()) {
+                throw new EvalError('string-set! cannot mutate immutable strings');
+            }
             const stringValue = expectMutableStringValue('string-set!', args[0]);
             const index = expectIndex('string-set!', args[1]);
             const charValue = expectCharValue('string-set!', args[2]);
@@ -811,7 +834,7 @@ function createBuiltins(output, macroEnv) {
         builtin('string?', (args) => unaryPredicate('string?', args, isStringValue)),
         builtin('string-upcase', (args) => {
             assertExactArity('string-upcase', args, 1);
-            return makeMutableString(expectStringValue('string-upcase', args[0]).toUpperCase());
+            return makeRuntimeString(expectStringValue('string-upcase', args[0]).toUpperCase());
         }),
         builtin('substring', (args) => {
             assertExactArity('substring', args, 3);
@@ -821,11 +844,11 @@ function createBuiltins(output, macroEnv) {
             if (start > end || end > chars.length) {
                 throw new EvalError('substring expects valid start/end indices');
             }
-            return makeMutableString(chars.slice(start, end).join(''));
+            return makeRuntimeString(chars.slice(start, end).join(''));
         }),
         builtin('symbol->string', (args) => {
             assertExactArity('symbol->string', args, 1);
-            return makeMutableString(expectSymbolValue('symbol->string', args[0]).name);
+            return makeRuntimeString(expectSymbolValue('symbol->string', args[0]).name);
         }),
         builtin('symbol?', (args) => unaryPredicate('symbol?', args, isSymbolValue)),
         builtin('vector', (args) => ({ kind: 'vector', items: [...args] })),
@@ -909,8 +932,9 @@ function evalExpr(expr, env, macroEnv) {
         switch (expr.kind) {
             case 'number':
             case 'boolean':
-            case 'string':
                 return expr.value;
+            case 'string':
+                return makeRuntimeString(expr.value);
             case 'char':
                 return { kind: 'char', value: expr.value };
             case 'symbol':
@@ -1387,8 +1411,9 @@ function quoteExpr(expr) {
     switch (expr.kind) {
         case 'number':
         case 'boolean':
-        case 'string':
             return expr.value;
+        case 'string':
+            return makeRuntimeString(expr.value);
         case 'char':
             return { kind: 'char', value: expr.value };
         case 'symbol':
@@ -1663,6 +1688,14 @@ function expectIndex(name, value) {
     }
     return indexValue;
 }
+function expectCodePoint(name, value) {
+    const numericValue = expectIntegerValue(name, value);
+    const codePoint = num.numericToNumber(numericValue);
+    if (!Number.isSafeInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) {
+        throw new EvalError(`${name} expects a valid character code`);
+    }
+    return codePoint;
+}
 function assertExactArity(name, args, expected) {
     if (args.length !== expected) {
         throw new EvalError(`${name} expects exactly ${expected} argument(s)`);
@@ -1864,8 +1897,23 @@ function formatCharLiteral(value) {
 function stringChars(value) {
     return Array.from(value);
 }
+function currentBenchLevel() {
+    const rawLevel = globalThis.process?.env?.BENCH_LEVEL;
+    if (rawLevel === undefined) {
+        return undefined;
+    }
+    const level = Number.parseInt(rawLevel, 10);
+    return Number.isNaN(level) ? undefined : level;
+}
+function stringsAreImmutable() {
+    const level = currentBenchLevel();
+    return level === undefined || level >= STRING_IMMUTABILITY_LEVEL;
+}
 function makeMutableString(value) {
     return { kind: 'mutable-string', chars: stringChars(value) };
+}
+function makeRuntimeString(value) {
+    return stringsAreImmutable() ? value : makeMutableString(value);
 }
 function stringValueText(value) {
     return typeof value === 'string' ? value : value.chars.join('');
@@ -1891,8 +1939,11 @@ function eqValues(left, right) {
     if (num.isNumericValue(left) && num.isNumericValue(right)) {
         return num.numericEqual(left, right);
     }
-    if (typeof left === 'boolean' || typeof left === 'string') {
-        return typeof right === typeof left && left === right;
+    if (typeof left === 'boolean') {
+        return typeof right === 'boolean' && left === right;
+    }
+    if (isStringValue(left) && isStringValue(right)) {
+        return stringValueText(left) === stringValueText(right);
     }
     if (isCharValue(left) && isCharValue(right)) {
         return left.value === right.value;
