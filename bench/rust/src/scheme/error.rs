@@ -1,3 +1,17 @@
+use std::fmt;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SourcePos {
+    pub(crate) line: usize,
+    pub(crate) col: usize,
+}
+
+impl fmt::Display for SourcePos {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.line, self.col)
+    }
+}
+
 /// Evaluation error type for the Scheme interpreter.
 ///
 /// Agents must add domain-specific variants here. Using `String` as the
@@ -26,4 +40,22 @@ pub enum EvalError {
     ExpectedPair { name: String },
     #[error("division by zero")]
     DivisionByZero,
+    #[error("{pos}: {source}")]
+    Positioned {
+        pos: SourcePos,
+        #[source]
+        source: Box<EvalError>,
+    },
+}
+
+impl EvalError {
+    pub(crate) fn with_position(self, pos: SourcePos) -> Self {
+        match self {
+            Self::Positioned { .. } => self,
+            _ => Self::Positioned {
+                pos,
+                source: Box::new(self),
+            },
+        }
+    }
 }
