@@ -3063,11 +3063,13 @@ fn eval_case(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
                 // Check for else clause
                 if let ExprKind::Symbol(s) = &parts[0].kind {
                     if s == "else" {
-                        let mut result = Value::Void;
-                        for expr in &parts[1..] {
-                            result = eval(expr, env)?;
+                        if parts.len() <= 1 {
+                            return Ok(Value::Void);
                         }
-                        return Ok(result);
+                        for expr in &parts[1..parts.len()-1] {
+                            eval(expr, env)?;
+                        }
+                        return Ok(Value::TailCall(Box::new((parts.last().unwrap().clone(), env.clone()))));
                     }
                 }
                 // Check datums
@@ -3077,11 +3079,13 @@ fn eval_case(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
                 };
                 let matched = datums.iter().any(|d| eqv_match(&key, &expr_to_value(d)));
                 if matched {
-                    let mut result = Value::Void;
-                    for expr in &parts[1..] {
-                        result = eval(expr, env)?;
+                    if parts.len() <= 1 {
+                        return Ok(Value::Void);
                     }
-                    return Ok(result);
+                    for expr in &parts[1..parts.len()-1] {
+                        eval(expr, env)?;
+                    }
+                    return Ok(Value::TailCall(Box::new((parts.last().unwrap().clone(), env.clone()))));
                 }
             }
             _ => return Err(EvalError::Parse("case: invalid clause".into())),
@@ -4300,7 +4304,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     init_callcc_state();
     let last = eval_top_level_loop(&exprs, &env)?;
     let output = OUTPUT_BUFFER.with(|buf| buf.borrow().clone());
-    Ok((last.to_string(), output))
+    Ok((display_value(&last), output))
 }
 
 pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
