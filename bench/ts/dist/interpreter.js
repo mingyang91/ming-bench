@@ -1075,20 +1075,24 @@ function createBuiltins(output, macroEnv) {
  * representation of the last result.
  */
 export function evalStr(input) {
-    return evaluateInput(input).result;
+    return formatEvaluationResult(evaluateInput(input).value);
 }
 /**
  * Evaluate Scheme expressions with a maximum number of eval dispatches.
  */
 export function evalStrWithLimit(input, maxSteps) {
-    return evaluateInput(input, maxSteps).result;
+    return formatEvaluationResult(evaluateInput(input, maxSteps).value);
 }
 /**
  * Evaluate Scheme expressions and return both the result string
  * and any captured output from display/write/newline.
  */
 export function evalStrWithOutput(input) {
-    return evaluateInput(input);
+    const evaluation = evaluateInput(input);
+    return {
+        result: formatEvalStrWithOutputResult(evaluation.value),
+        output: evaluation.output,
+    };
 }
 function evaluateInput(input, maxSteps) {
     const program = new Parser(input).parseProgram();
@@ -1101,11 +1105,17 @@ function evaluateInput(input, maxSteps) {
     const previousWindFrames = currentWindFrames;
     const previousExceptionHandlers = currentExceptionHandlers;
     const previousProcedureBoundaries = currentProcedureBoundaries;
+    const previousProceduralMacroContexts = currentProceduralMacroContexts;
+    const previousSyntaxFrames = currentSyntaxFrames;
     const previousStepBudget = currentStepBudget;
+    const previousMacroIdentifierCounter = macroIdentifierCounter;
     currentWindFrames = [];
     currentExceptionHandlers = [];
     currentProcedureBoundaries = [];
+    currentProceduralMacroContexts = [];
+    currentSyntaxFrames = [];
     currentStepBudget = maxSteps === undefined ? undefined : createStepBudget(maxSteps);
+    macroIdentifierCounter = 0;
     let lastValue;
     try {
         lastValue = evalSequence(program, env, macroEnv);
@@ -1114,10 +1124,13 @@ function evaluateInput(input, maxSteps) {
         currentWindFrames = previousWindFrames;
         currentExceptionHandlers = previousExceptionHandlers;
         currentProcedureBoundaries = previousProcedureBoundaries;
+        currentProceduralMacroContexts = previousProceduralMacroContexts;
+        currentSyntaxFrames = previousSyntaxFrames;
         currentStepBudget = previousStepBudget;
+        macroIdentifierCounter = previousMacroIdentifierCounter;
     }
     return {
-        result: formatEvaluationResult(lastValue),
+        value: lastValue,
         output: output.toString(),
     };
 }
@@ -3209,6 +3222,20 @@ function formatEvaluationResult(result) {
     }
     if (values.length === 1) {
         return formatValue(values[0]);
+    }
+    throw new EvalError(`top-level expression produced ${values.length} values`);
+}
+function formatEvalStrWithOutputResult(result) {
+    const values = expandEvaluationResult(result);
+    if (values.length === 0) {
+        return '';
+    }
+    if (values.length === 1) {
+        const value = values[0];
+        if (typeof value === 'string' || isMutableStringValue(value)) {
+            return formatDisplayValue(value);
+        }
+        return formatValue(value);
     }
     throw new EvalError(`top-level expression produced ${values.length} values`);
 }

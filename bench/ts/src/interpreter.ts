@@ -1435,14 +1435,14 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
  * representation of the last result.
  */
 export function evalStr(input: string): string {
-  return evaluateInput(input).result;
+  return formatEvaluationResult(evaluateInput(input).value);
 }
 
 /**
  * Evaluate Scheme expressions with a maximum number of eval dispatches.
  */
 export function evalStrWithLimit(input: string, maxSteps: number): string {
-  return evaluateInput(input, maxSteps).result;
+  return formatEvaluationResult(evaluateInput(input, maxSteps).value);
 }
 
 /**
@@ -1450,10 +1450,14 @@ export function evalStrWithLimit(input: string, maxSteps: number): string {
  * and any captured output from display/write/newline.
  */
 export function evalStrWithOutput(input: string): { result: string; output: string } {
-  return evaluateInput(input);
+  const evaluation = evaluateInput(input);
+  return {
+    result: formatEvalStrWithOutputResult(evaluation.value),
+    output: evaluation.output,
+  };
 }
 
-function evaluateInput(input: string, maxSteps?: number): { result: string; output: string } {
+function evaluateInput(input: string, maxSteps?: number): { value: EvaluationResult; output: string } {
   const program = new Parser(input).parseProgram();
   if (program.length === 0) {
     throw new EvalError('empty input', { line: 1, column: 1 });
@@ -1465,11 +1469,17 @@ function evaluateInput(input: string, maxSteps?: number): { result: string; outp
   const previousWindFrames = currentWindFrames;
   const previousExceptionHandlers = currentExceptionHandlers;
   const previousProcedureBoundaries = currentProcedureBoundaries;
+  const previousProceduralMacroContexts = currentProceduralMacroContexts;
+  const previousSyntaxFrames = currentSyntaxFrames;
   const previousStepBudget = currentStepBudget;
+  const previousMacroIdentifierCounter = macroIdentifierCounter;
   currentWindFrames = [];
   currentExceptionHandlers = [];
   currentProcedureBoundaries = [];
+  currentProceduralMacroContexts = [];
+  currentSyntaxFrames = [];
   currentStepBudget = maxSteps === undefined ? undefined : createStepBudget(maxSteps);
+  macroIdentifierCounter = 0;
 
   let lastValue: EvaluationResult;
   try {
@@ -1478,11 +1488,14 @@ function evaluateInput(input: string, maxSteps?: number): { result: string; outp
     currentWindFrames = previousWindFrames;
     currentExceptionHandlers = previousExceptionHandlers;
     currentProcedureBoundaries = previousProcedureBoundaries;
+    currentProceduralMacroContexts = previousProceduralMacroContexts;
+    currentSyntaxFrames = previousSyntaxFrames;
     currentStepBudget = previousStepBudget;
+    macroIdentifierCounter = previousMacroIdentifierCounter;
   }
 
   return {
-    result: formatEvaluationResult(lastValue),
+    value: lastValue,
     output: output.toString(),
   };
 }
@@ -4280,6 +4293,23 @@ function formatEvaluationResult(result: EvaluationResult): string {
 
   if (values.length === 1) {
     return formatValue(values[0]!);
+  }
+
+  throw new EvalError(`top-level expression produced ${values.length} values`);
+}
+
+function formatEvalStrWithOutputResult(result: EvaluationResult): string {
+  const values = expandEvaluationResult(result);
+  if (values.length === 0) {
+    return '';
+  }
+
+  if (values.length === 1) {
+    const value = values[0]!;
+    if (typeof value === 'string' || isMutableStringValue(value)) {
+      return formatDisplayValue(value);
+    }
+    return formatValue(value);
   }
 
   throw new EvalError(`top-level expression produced ${values.length} values`);
