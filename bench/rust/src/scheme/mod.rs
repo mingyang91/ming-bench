@@ -21,10 +21,14 @@ enum Value {
     Integer(i64),
     Boolean(bool),
     Char(char),
-    Str(String),
+    Str(Rc<RefCell<String>>),
     Symbol(String),
     List(Vec<Value>),
     Procedure(Vec<String>, Vec<Expr>, Env),
+}
+
+fn make_str(s: String) -> Value {
+    Value::Str(Rc::new(RefCell::new(s)))
 }
 
 impl fmt::Display for Value {
@@ -34,7 +38,7 @@ impl fmt::Display for Value {
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
             Value::Char(c) => write!(f, "#\\{c}"),
-            Value::Str(s) => write!(f, "\"{s}\""),
+            Value::Str(s) => write!(f, "\"{}\"", s.borrow()),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(items) => {
                 write!(f, "(")?;
@@ -59,6 +63,7 @@ struct Expr {
 enum ExprKind {
     Integer(i64),
     Boolean(bool),
+    Char(char),
     Str(String),
     Symbol(String),
     List(Vec<Expr>),
@@ -175,8 +180,34 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Some(b't') => { self.pos += 1; Ok(Expr { kind: ExprKind::Boolean(true), span }) }
             Some(b'f') => { self.pos += 1; Ok(Expr { kind: ExprKind::Boolean(false), span }) }
+            Some(b'\\') => self.parse_char(span),
             _ => Err(EvalError::Parse("unexpected # literal".into())),
         }
+    }
+
+    fn parse_char(&mut self, span: Span) -> Result<Expr, EvalError> {
+        self.pos += 1; // skip '\'
+        if self.pos >= self.input.len() {
+            return Err(EvalError::Parse("unexpected end of character literal".into()));
+        }
+        // Check for named characters like #\space, #\newline
+        let start = self.pos;
+        while self.pos < self.input.len() {
+            let b = self.input[self.pos];
+            if b.is_ascii_whitespace() || b == b'(' || b == b')' || b == b'"' || b == b';' {
+                break;
+            }
+            self.pos += 1;
+        }
+        let token = std::str::from_utf8(&self.input[start..self.pos]).expect("valid UTF-8");
+        let c = match token {
+            "space" => ' ',
+            "newline" => '\n',
+            "tab" => '\t',
+            s if s.len() == 1 => s.chars().next().expect("single-char string has a first char"),
+            _ => return Err(EvalError::Parse(format!("unknown character name: {token}"))),
+        };
+        Ok(Expr { kind: ExprKind::Char(c), span })
     }
 
     fn parse_atom(&mut self, span: Span) -> Result<Expr, EvalError> {
@@ -248,7 +279,8 @@ fn eval_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, 
     match &expr.kind {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
-        ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
+        ExprKind::Str(s) => Ok(make_str(s.clone())),
         ExprKind::Symbol(name) => env_lookup(env, name),
         ExprKind::List(items) => {
             if items.is_empty() {
@@ -373,7 +405,8 @@ fn expr_to_value(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Integer(n) => Value::Integer(*n),
         ExprKind::Boolean(b) => Value::Boolean(*b),
-        ExprKind::Str(s) => Value::Str(s.clone()),
+        ExprKind::Char(c) => Value::Char(*c),
+        ExprKind::Str(s) => make_str(s.clone()),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
         ExprKind::List(items) => Value::List(items.iter().map(expr_to_value).collect()),
     }
@@ -426,12 +459,12 @@ fn is_builtin(op: &str) -> bool {
         | "string-append" | "string-length" | "substring"
         | "string->number" | "number->string"
         | "symbol->string" | "string->symbol"
-        | "string-ref")
+        | "string-ref" | "string-copy" | "string-set!")
 }
 
 fn display_value(v: &Value) -> String {
     match v {
-        Value::Str(s) => s.clone(),
+        Value::Str(s) => s.borrow().clone(),
         Value::Char(c) => c.to_string(),
         Value::List(items) => {
             let mut s = String::from("(");
@@ -626,33 +659,33 @@ fn eval_builtin(op: &str, args: &[Value], output: &mut String) -> Result<Value, 
             let mut result = String::new();
             for a in args {
                 match a {
-                    Value::Str(s) => result.push_str(s),
+                    Value::Str(s) => result.push_str(&s.borrow()),
                     _ => return Err(EvalError::Type("string-append: expected string".into())),
                 }
             }
-            Ok(Value::Str(result))
+            Ok(make_str(result))
         }
         "string-length" => {
             if args.len() != 1 { return Err(EvalError::Arity("string-length requires 1 argument".into())); }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Integer(s.len() as i64)),
+                Value::Str(s) => Ok(Value::Integer(s.borrow().len() as i64)),
                 _ => Err(EvalError::Type("string-length: expected string".into())),
             }
         }
         "substring" => {
             if args.len() != 3 { return Err(EvalError::Arity("substring requires 3 arguments".into())); }
             let s = match &args[0] {
-                Value::Str(s) => s,
+                Value::Str(s) => s.borrow().clone(),
                 _ => return Err(EvalError::Type("substring: expected string".into())),
             };
             let start = expect_integer(&args[1], "substring")? as usize;
             let end = expect_integer(&args[2], "substring")? as usize;
-            Ok(Value::Str(s[start..end].to_string()))
+            Ok(make_str(s[start..end].to_string()))
         }
         "string->number" => {
             if args.len() != 1 { return Err(EvalError::Arity("string->number requires 1 argument".into())); }
             match &args[0] {
-                Value::Str(s) => match s.parse::<i64>() {
+                Value::Str(s) => match s.borrow().parse::<i64>() {
                     Ok(n) => Ok(Value::Integer(n)),
                     Err(_) => Ok(Value::Boolean(false)),
                 },
@@ -662,26 +695,26 @@ fn eval_builtin(op: &str, args: &[Value], output: &mut String) -> Result<Value, 
         "number->string" => {
             if args.len() != 1 { return Err(EvalError::Arity("number->string requires 1 argument".into())); }
             let n = expect_integer(&args[0], "number->string")?;
-            Ok(Value::Str(n.to_string()))
+            Ok(make_str(n.to_string()))
         }
         "symbol->string" => {
             if args.len() != 1 { return Err(EvalError::Arity("symbol->string requires 1 argument".into())); }
             match &args[0] {
-                Value::Symbol(s) => Ok(Value::Str(s.clone())),
+                Value::Symbol(s) => Ok(make_str(s.clone())),
                 _ => Err(EvalError::Type("symbol->string: expected symbol".into())),
             }
         }
         "string->symbol" => {
             if args.len() != 1 { return Err(EvalError::Arity("string->symbol requires 1 argument".into())); }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Symbol(s.clone())),
+                Value::Str(s) => Ok(Value::Symbol(s.borrow().clone())),
                 _ => Err(EvalError::Type("string->symbol: expected string".into())),
             }
         }
         "string-ref" => {
             if args.len() != 2 { return Err(EvalError::Arity("string-ref requires 2 arguments".into())); }
             let s = match &args[0] {
-                Value::Str(s) => s,
+                Value::Str(s) => s.borrow().clone(),
                 _ => return Err(EvalError::Type("string-ref: expected string".into())),
             };
             let idx = expect_integer(&args[1], "string-ref")? as usize;
@@ -689,6 +722,33 @@ fn eval_builtin(op: &str, args: &[Value], output: &mut String) -> Result<Value, 
                 Some(c) => Ok(Value::Char(c)),
                 None => Err(EvalError::Generic("string-ref: index out of range".into())),
             }
+        }
+        "string-copy" => {
+            if args.len() != 1 { return Err(EvalError::Arity("string-copy requires 1 argument".into())); }
+            match &args[0] {
+                Value::Str(s) => Ok(make_str(s.borrow().clone())),
+                _ => Err(EvalError::Type("string-copy: expected string".into())),
+            }
+        }
+        "string-set!" => {
+            if args.len() != 3 { return Err(EvalError::Arity("string-set! requires 3 arguments".into())); }
+            let s = match &args[0] {
+                Value::Str(s) => s.clone(),
+                _ => return Err(EvalError::Type("string-set!: expected string".into())),
+            };
+            let idx = expect_integer(&args[1], "string-set!")? as usize;
+            let c = match &args[2] {
+                Value::Char(c) => *c,
+                _ => return Err(EvalError::Type("string-set!: expected char".into())),
+            };
+            let mut borrowed = s.borrow_mut();
+            let mut chars: Vec<char> = borrowed.chars().collect();
+            if idx >= chars.len() {
+                return Err(EvalError::Generic("string-set!: index out of range".into()));
+            }
+            chars[idx] = c;
+            *borrowed = chars.into_iter().collect();
+            Ok(Value::Boolean(false))
         }
         _ => Err(EvalError::UnboundVariable(op.to_string())),
     }
