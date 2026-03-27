@@ -27,8 +27,16 @@ private[ming] object SpecialFormEvaluator:
         ExpressionEvaluator.evalSequence(args, env, context)
       case Expr.Symbol("let", formPos) :: args =>
         evalLet(args, env, formPos, context)
+      case Expr.Symbol("letrec", formPos) :: args =>
+        evalLetrec(args, env, formPos, context, sequential = false)
+      case Expr.Symbol("letrec*", formPos) :: args =>
+        evalLetrec(args, env, formPos, context, sequential = true)
       case Expr.Symbol("cond", formPos) :: args =>
         evalCond(args, env, formPos, context)
+      case Expr.Symbol("case", formPos) :: args =>
+        evalCase(args, env, formPos, context)
+      case Expr.Symbol("do", formPos) :: args =>
+        evalDo(args, env, formPos, context)
       case Expr.Symbol("and", _) :: args =>
         ExpressionEvaluator.evalAnd(args, env, Value.BoolVal(true), context)
       case Expr.Symbol("or", _) :: args =>
@@ -72,12 +80,16 @@ private[ming] object SpecialFormEvaluator:
 
   private def evalIf(args: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
     args match
+      case conditionExpr :: thenExpr :: Nil =>
+        if ValueSemantics.isTruthy(ExpressionEvaluator.eval(conditionExpr, env, context)) then
+          ExpressionEvaluator.eval(thenExpr, env, context)
+        else Value.Void
       case conditionExpr :: thenExpr :: elseExpr :: Nil =>
         if ValueSemantics.isTruthy(ExpressionEvaluator.eval(conditionExpr, env, context)) then
           ExpressionEvaluator.eval(thenExpr, env, context)
         else ExpressionEvaluator.eval(elseExpr, env, context)
       case _ =>
-        throw EvalError.at(pos, "if expects exactly 3 arguments")
+        throw EvalError.at(pos, "if expects 2 or 3 arguments")
 
   private def evalQuote(args: List[Expr], pos: SourcePos): Value =
     args match
@@ -134,6 +146,38 @@ private[ming] object SpecialFormEvaluator:
       targetEnv.define(binding.name, ExpressionEvaluator.eval(binding.valueExpr, evalEnv, context))
     }
 
+  private def evalLetrec(
+    args: List[Expr],
+    env: Env,
+    pos: SourcePos,
+    context: EvalContext,
+    sequential: Boolean
+  ): Value =
+    args match
+      case Expr.ListExpr(bindings, _) :: body if body.nonEmpty =>
+        val recursiveEnv = env.child()
+        val preparedBindings = parseLetBindings(bindings).map { binding =>
+          val cell = BindingCell(Value.Void)
+          recursiveEnv.defineAlias(binding.name, cell)
+          (binding, cell)
+        }
+
+        if sequential then
+          preparedBindings.foreach { case (binding, cell) =>
+            cell.value = ExpressionEvaluator.eval(binding.valueExpr, recursiveEnv, context)
+          }
+        else
+          val values = preparedBindings.map { case (binding, _) =>
+            ExpressionEvaluator.eval(binding.valueExpr, recursiveEnv, context)
+          }
+          preparedBindings.zip(values).foreach { case ((_, cell), value) =>
+            cell.value = value
+          }
+
+        ExpressionEvaluator.evalSequence(body, recursiveEnv, context)
+      case _ =>
+        throw EvalError.at(pos, s"invalid ${if sequential then "letrec*" else "letrec"}")
+
   private def evalCond(clauses: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
     clauses match
       case Nil =>
@@ -152,3 +196,64 @@ private[ming] object SpecialFormEvaluator:
         else evalCond(remaining, env, pos, context)
       case invalid :: _ =>
         throw EvalError.at(invalid.pos, "invalid cond clause")
+
+  private def evalCase(args: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
+    args match
+      case keyExpr :: clauses =>
+        evalCaseClauses(ExpressionEvaluator.eval(keyExpr, env, context), clauses, env, pos, context)
+      case _ =>
+        throw EvalError.at(pos, "case expects a key expression")
+
+  @annotation.tailrec
+  private def evalCaseClauses(
+    key: Value,
+    clauses: List[Expr],
+    env: Env,
+    pos: SourcePos,
+    context: EvalContext
+  ): Value =
+    clauses match
+      case Nil =>
+        Value.Void
+      case Expr.ListExpr(Expr.Symbol("else", _) :: body, clausePos) :: remaining =>
+        if remaining.nonEmpty then throw EvalError.at(clausePos, "else clause must be last")
+        ExpressionEvaluator.evalSequence(body, env, context)
+      case Expr.ListExpr(Expr.ListExpr(datums, _) :: body, _) :: remaining =>
+        if datums.exists(datum => ValueSemantics.isEqv(key, ValueSemantics.quote(datum))) then
+          ExpressionEvaluator.evalSequence(body, env, context)
+        else evalCaseClauses(key, remaining, env, pos, context)
+      case invalid :: _ =>
+        throw EvalError.at(invalid.pos, "invalid case clause")
+
+  private def evalDo(args: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
+    args match
+      case Expr.ListExpr(bindings, _) :: Expr.ListExpr(testExpr :: resultExprs, _) :: body =>
+        val loopEnv = env.child()
+        val loopBindings = parseDoBindings(bindings).map { binding =>
+          val cell = BindingCell(ExpressionEvaluator.eval(binding.initExpr, env, context))
+          loopEnv.defineAlias(binding.name, cell)
+          (binding, cell)
+        }
+
+        var result: Value = Value.Void
+        var done          = false
+        while !done do
+          if ValueSemantics.isTruthy(ExpressionEvaluator.eval(testExpr, loopEnv, context)) then
+            result = ExpressionEvaluator.evalSequence(resultExprs, loopEnv, context)
+            done = true
+          else
+            ExpressionEvaluator.evalSequence(body, loopEnv, context)
+            val nextValues = loopBindings.map { case (binding, cell) =>
+              binding.stepExpr match
+                case Some(stepExpr) =>
+                  ExpressionEvaluator.eval(stepExpr, loopEnv, context)
+                case None =>
+                  cell.value
+            }
+            loopBindings.zip(nextValues).foreach { case ((_, cell), value) =>
+              cell.value = value
+            }
+
+        result
+      case _ =>
+        throw EvalError.at(pos, "invalid do")

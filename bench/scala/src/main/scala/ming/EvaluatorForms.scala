@@ -1,6 +1,7 @@
 package ming
 
 final private[ming] case class LetBinding(name: String, valueExpr: Expr)
+final private[ming] case class DoBinding(name: String, initExpr: Expr, stepExpr: Option[Expr])
 
 final private[ming] case class ParameterSpec(params: List[String], restParam: Option[String])
 
@@ -36,3 +37,13 @@ private[ming] object EvaluatorForms:
           throw EvalError.at(other.pos, "parameter names must be symbols")
 
     loop(params, Nil)
+
+  def parseDoBindings(bindings: List[Expr]): List[DoBinding] =
+    bindings.map {
+      case Expr.ListExpr(Expr.Symbol(name, _) :: initExpr :: Nil, _) =>
+        DoBinding(name, initExpr, None)
+      case Expr.ListExpr(Expr.Symbol(name, _) :: initExpr :: stepExpr :: Nil, _) =>
+        DoBinding(name, initExpr, Some(stepExpr))
+      case invalid =>
+        throw EvalError.at(invalid.pos, "invalid do binding")
+    }

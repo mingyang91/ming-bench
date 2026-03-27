@@ -25,6 +25,8 @@ private[ming] object SchemeRenderer:
       case Value.EmptyList       => "()"
       case pair @ Value.PairVal(_, _) =>
         renderPair(pair, displayStrings, displayChars)
+      case Value.VectorVal(instance) =>
+        renderVector(instance, displayStrings, displayChars)
       case Value.BuiltinProc(_) | Value.RecordConstructor(_) | Value.RecordPredicate(_) |
           Value.RecordAccessor(_, _, _) | Value.CaseClosure(_, _, _) | Value.Closure(_, _, _, _, _) =>
         "#<procedure>"
@@ -53,6 +55,11 @@ private[ming] object SchemeRenderer:
     appendList(value, first = true)
     builder.append(')')
     builder.toString
+
+  private def renderVector(instance: VectorInstance, displayStrings: Boolean, displayChars: Boolean): String =
+    instance.elements
+      .map(renderWithMode(_, displayStrings, displayChars))
+      .mkString("#(", " ", ")")
 
   private def renderChar(ch: Char): String =
     ch match

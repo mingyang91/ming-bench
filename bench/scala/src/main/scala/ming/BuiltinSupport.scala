@@ -54,6 +54,12 @@ private[ming] object BuiltinSupport:
       case other =>
         throw EvalError.at(pos, s"$name expected a pair, got ${ValueSemantics.typeName(other)}")
 
+  def requireVector(name: String, value: Value, pos: SourcePos): VectorInstance =
+    value match
+      case Value.VectorVal(instance) => instance
+      case other =>
+        throw EvalError.at(pos, s"$name expected a vector, got ${ValueSemantics.typeName(other)}")
+
   def requireBinaryNumbers(name: String, args: List[Value], pos: SourcePos): (SchemeNumber, SchemeNumber) =
     val values = requireArgCount(name, args, expected = 2, pos)
     (requireNumber(name, values.head, pos), requireNumber(name, values(1), pos))

@@ -27,6 +27,7 @@ private[ming] object Builtins:
     "char?",
     "procedure?",
     "eq?",
+    "eqv?",
     "equal?",
     "abs",
     "modulo",
@@ -52,7 +53,7 @@ private[ming] object Builtins:
     "char=?",
     "char<?",
     "apply"
-  ) ++ ListBuiltins.names ++ OutputBuiltins.names ++ StringBuiltins.names
+  ) ++ ListBuiltins.names ++ OutputBuiltins.names ++ StringBuiltins.names ++ VectorBuiltins.names
 
   def resolve(name: String): Option[Value] =
     if builtinNames.contains(name) then Some(Value.BuiltinProc(name))
@@ -66,7 +67,7 @@ private[ming] object Builtins:
         invokeComparison(name, args, pos)
       case "not" =>
         Value.BoolVal(!ValueSemantics.isTruthy(requireSingleArg(name, args, pos)))
-      case "eq?" | "equal?" =>
+      case "eq?" | "eqv?" | "equal?" =>
         invokeEqualityBuiltin(name, args, pos)
       case "abs" | "modulo" | "remainder" | "quotient" | "numerator" | "denominator" | "min" | "max" | "expt" |
           "exact->inexact" | "inexact->exact" =>
@@ -86,6 +87,8 @@ private[ming] object Builtins:
         OutputBuiltins.invoke(builtin, args, pos, context)
       case builtin if StringBuiltins.handles(builtin) =>
         StringBuiltins.invoke(builtin, args, pos)
+      case builtin if VectorBuiltins.handles(builtin) =>
+        VectorBuiltins.invoke(builtin, args, pos)
       case _ =>
         unknownProcedure(name, pos)
 
@@ -128,6 +131,8 @@ private[ming] object Builtins:
     name match
       case "eq?" =>
         Value.BoolVal(ValueSemantics.isEq(values.head, values(1)))
+      case "eqv?" =>
+        Value.BoolVal(ValueSemantics.isEqv(values.head, values(1)))
       case "equal?" =>
         Value.BoolVal(ValueSemantics.isEqual(values.head, values(1)))
       case _ =>

@@ -22,6 +22,7 @@ private[ming] enum Value:
   case SymbolVal(name: String)
   case EmptyList
   case PairVal(car: Value, cdr: Value)
+  case VectorVal(instance: VectorInstance)
   case BuiltinProc(name: String)
   case RecordConstructor(recordType: RecordType)
   case RecordPredicate(recordType: RecordType)
@@ -59,6 +60,22 @@ object MutableString:
 
   def from(text: String): MutableString =
     new MutableString(new java.lang.StringBuilder(text))
+
+final private[ming] class VectorInstance(
+  private val storage: Array[Value]
+):
+
+  def length: Int =
+    storage.length
+
+  def elementAt(index: Int): Value =
+    storage(index)
+
+  def setElementAt(index: Int, value: Value): Unit =
+    storage(index) = value
+
+  def elements: List[Value] =
+    storage.toList
 
 final private[ming] case class RecordFieldSpec(
   fieldName: String,

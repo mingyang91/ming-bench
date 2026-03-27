@@ -25,6 +25,7 @@ private[ming] object ValueSemantics:
       case Value.SymbolVal(_)  => "symbol"
       case Value.EmptyList     => "null"
       case Value.PairVal(_, _) => "pair"
+      case Value.VectorVal(_)  => "vector"
       case Value.BuiltinProc(_) | Value.RecordConstructor(_) | Value.RecordPredicate(_) |
           Value.RecordAccessor(_, _, _) | Value.CaseClosure(_, _, _) | Value.Closure(_, _, _, _, _) =>
         "procedure"
@@ -55,6 +56,8 @@ private[ming] object ValueSemantics:
             left == right
           case (Value.Void, Value.Void) => true
           case (Value.StringVal(left), Value.StringVal(right)) =>
+            left eq right
+          case (Value.VectorVal(left), Value.VectorVal(right)) =>
             left eq right
           case (
                 leftProc @ Value.RecordConstructor(_),
@@ -88,12 +91,20 @@ private[ming] object ValueSemantics:
           case _ =>
             false
 
+  def isEqv(value1: Value, value2: Value): Boolean =
+    isEq(value1, value2)
+
   def isEqual(value1: Value, value2: Value): Boolean =
     (value1, value2) match
       case (Value.StringVal(left), Value.StringVal(right)) =>
         left.text == right.text
       case (Value.PairVal(leftCar, leftCdr), Value.PairVal(rightCar, rightCdr)) =>
         isEqual(leftCar, rightCar) && isEqual(leftCdr, rightCdr)
+      case (Value.VectorVal(left), Value.VectorVal(right)) =>
+        left.length == right.length &&
+        left.elements.zip(right.elements).forall { case (leftValue, rightValue) =>
+          isEqual(leftValue, rightValue)
+        }
       case _ =>
         isEq(value1, value2)
 
