@@ -5,6 +5,7 @@ type Expr =
   | { kind: 'boolean'; value: boolean; pos: SourcePosition }
   | { kind: 'string'; value: string; pos: SourcePosition }
   | { kind: 'char'; value: string; pos: SourcePosition }
+  | { kind: 'vector'; elements: Expr[]; pos: SourcePosition }
   | { kind: 'symbol'; name: string; pos: SourcePosition }
   | { kind: 'resolved-symbol'; name: string; pos: SourcePosition; binding: SymbolBinding }
   | { kind: 'list'; elements: Expr[]; pos: SourcePosition };
@@ -174,7 +175,11 @@ type Token =
   | { kind: 'lparen'; pos: SourcePosition }
   | { kind: 'rparen'; pos: SourcePosition }
   | { kind: 'quote'; pos: SourcePosition }
+  | { kind: 'quasiquote'; pos: SourcePosition }
+  | { kind: 'unquote'; pos: SourcePosition }
+  | { kind: 'unquote-splicing'; pos: SourcePosition }
   | { kind: 'syntax'; pos: SourcePosition }
+  | { kind: 'vector-start'; pos: SourcePosition }
   | { kind: 'number'; value: NumberValue; pos: SourcePosition }
   | { kind: 'boolean'; value: boolean; pos: SourcePosition }
   | { kind: 'string'; value: string; pos: SourcePosition }
@@ -1292,6 +1297,8 @@ function evaluateCps(expression: Expr, env: Environment, continuation: Continuat
           return continueWith(continuation, makeString(expression.value));
         case 'char':
           return continueWith(continuation, { kind: 'char', value: expression.value });
+        case 'vector':
+          return continueWith(continuation, quoteExpr(expression));
         case 'symbol':
           return continueWith(continuation, env.lookup(expression.name, expression.pos));
         case 'resolved-symbol':
@@ -1351,6 +1358,15 @@ function evaluateListCps(
   const operatorName = symbolName(operatorExpr);
 
   if (operatorName !== undefined) {
+    if (operatorName === 'quasiquote') {
+      const transformer = lookupSyntax(operatorExpr, env);
+      if (transformer !== undefined) {
+        return expandMacroCps(transformer, { kind: 'list', elements, pos }, env, continuation);
+      }
+
+      return evaluateQuasiquote(argumentExprs, env, operatorExpr.pos, continuation);
+    }
+
     switch (operatorName) {
       case 'and':
         return evaluateAndCps(argumentExprs, env, continuation);
@@ -1712,6 +1728,197 @@ function evaluateQuote(
   return continueWith(continuation, quoteExpr(expressions[0]));
 }
 
+function evaluateQuasiquote(
+  expressions: Expr[],
+  env: Environment,
+  pos: SourcePosition,
+  continuation: Continuation,
+): Bounce {
+  if (expressions.length !== 1) {
+    throw new EvalError(`quasiquote expected 1 argument(s), got ${expressions.length}`, pos);
+  }
+
+  return evaluateQuasiquoteCps(expressions[0], env, 1, continuation);
+}
+
+function evaluateQuasiquoteCps(
+  expression: Expr,
+  env: Environment,
+  depth: number,
+  continuation: Continuation,
+): Bounce {
+  const form = parseQuasiquoteForm(expression);
+
+  if (form !== undefined) {
+    switch (form.name) {
+      case 'quasiquote':
+        return evaluateQuasiquoteCps(form.argument, env, depth + 1, (value) =>
+          continueWith(continuation, listToPairs([makeSymbolValue('quasiquote'), value])),
+        );
+      case 'unquote':
+        if (depth === 1) {
+          return evaluateCps(form.argument, env, continuation);
+        }
+
+        return evaluateQuasiquoteCps(form.argument, env, depth - 1, (value) =>
+          continueWith(continuation, listToPairs([makeSymbolValue('unquote'), value])),
+        );
+      case 'unquote-splicing':
+        if (depth === 1) {
+          throw new EvalError('unquote-splicing can only appear within a list or vector', expression.pos);
+        }
+
+        return evaluateQuasiquoteCps(form.argument, env, depth - 1, (value) =>
+          continueWith(continuation, listToPairs([makeSymbolValue('unquote-splicing'), value])),
+        );
+    }
+  }
+
+  switch (expression.kind) {
+    case 'number':
+    case 'boolean':
+      return continueWith(continuation, expression.value);
+    case 'string':
+      return continueWith(continuation, makeString(expression.value));
+    case 'char':
+      return continueWith(continuation, { kind: 'char', value: expression.value });
+    case 'symbol':
+    case 'resolved-symbol':
+      return continueWith(continuation, makeSymbolValue(expression.name));
+    case 'vector':
+      return evaluateQuasiquoteVectorCps(expression.elements, env, depth, continuation);
+    case 'list':
+      return evaluateQuasiquoteListCps(expression, env, depth, continuation);
+  }
+}
+
+function evaluateQuasiquoteListCps(
+  expression: Extract<Expr, { kind: 'list' }>,
+  env: Environment,
+  depth: number,
+  continuation: Continuation,
+): Bounce {
+  const parts = decomposeExprList(expression, 'quasiquote');
+
+  return evaluateQuasiquoteListTailCps(parts.tail, env, depth, (tailValue) =>
+    evaluateQuasiquoteListElementsCps(parts.elements, env, depth, tailValue, continuation),
+  );
+}
+
+function evaluateQuasiquoteListTailCps(
+  tail: Expr | undefined,
+  env: Environment,
+  depth: number,
+  continuation: Continuation,
+): Bounce {
+  if (tail === undefined) {
+    return continueWith(continuation, EMPTY_LIST);
+  }
+
+  const form = parseQuasiquoteForm(tail);
+  if (form?.name === 'unquote-splicing' && depth === 1) {
+    throw new EvalError('unquote-splicing can only appear within a list or vector', tail.pos);
+  }
+
+  return evaluateQuasiquoteCps(tail, env, depth, continuation);
+}
+
+function evaluateQuasiquoteListElementsCps(
+  elements: Expr[],
+  env: Environment,
+  depth: number,
+  tailValue: SchemeValue,
+  continuation: Continuation,
+  index = elements.length - 1,
+): Bounce {
+  if (index < 0) {
+    return continueWith(continuation, tailValue);
+  }
+
+  const element = elements[index];
+  const form = parseQuasiquoteForm(element);
+
+  if (form?.name === 'unquote-splicing' && depth === 1) {
+    return evaluateCps(form.argument, env, (splicedValue) =>
+      evaluateQuasiquoteListElementsCps(
+        elements,
+        env,
+        depth,
+        appendLists([splicedValue, tailValue], element.pos),
+        continuation,
+        index - 1,
+      ),
+    );
+  }
+
+  return evaluateQuasiquoteCps(element, env, depth, (value) =>
+    evaluateQuasiquoteListElementsCps(
+      elements,
+      env,
+      depth,
+      { kind: 'pair', car: value, cdr: tailValue },
+      continuation,
+      index - 1,
+    ),
+  );
+}
+
+function evaluateQuasiquoteVectorCps(
+  elements: Expr[],
+  env: Environment,
+  depth: number,
+  continuation: Continuation,
+  index = 0,
+  values: SchemeValue[] = [],
+): Bounce {
+  if (index >= elements.length) {
+    return continueWith(continuation, makeVector(values));
+  }
+
+  const element = elements[index];
+  const form = parseQuasiquoteForm(element);
+
+  if (form?.name === 'unquote-splicing' && depth === 1) {
+    return evaluateCps(form.argument, env, (splicedValue) =>
+      evaluateQuasiquoteVectorCps(
+        elements,
+        env,
+        depth,
+        continuation,
+        index + 1,
+        [...values, ...listToArray(splicedValue, 'unquote-splicing', element.pos)],
+      ),
+    );
+  }
+
+  return evaluateQuasiquoteCps(element, env, depth, (value) =>
+    evaluateQuasiquoteVectorCps(elements, env, depth, continuation, index + 1, [...values, value]),
+  );
+}
+
+function parseQuasiquoteForm(
+  expression: Expr,
+): { name: 'quasiquote' | 'unquote' | 'unquote-splicing'; argument: Expr } | undefined {
+  if (expression.kind !== 'list') {
+    return undefined;
+  }
+
+  const parts = decomposeExprList(expression, 'quasiquote');
+  if (parts.tail !== undefined || parts.elements.length !== 2) {
+    return undefined;
+  }
+
+  const name = symbolName(parts.elements[0]);
+  if (name === 'quasiquote' || name === 'unquote' || name === 'unquote-splicing') {
+    return {
+      name,
+      argument: parts.elements[1],
+    };
+  }
+
+  return undefined;
+}
+
 function evaluateSyntax(
   expressions: Expr[],
   env: Environment,
@@ -1964,9 +2171,17 @@ function evaluateGuardClauses(
     return evaluateSequenceCps(bodyExprs, env, continuation);
   }
 
+  const arrowRecipientExpr = getCondArrowRecipient(bodyExprs, clause.pos, 'guard');
+
   return evaluateCps(testExpr, env, (testValue) => {
     if (isFalse(testValue)) {
       return evaluateGuardClauses(clauses, env, raisedPos, continuation, raisedValue, index + 1);
+    }
+
+    if (arrowRecipientExpr !== undefined) {
+      return evaluateCps(arrowRecipientExpr, env, (recipient) =>
+        applyProcedureCps(recipient, [testValue], arrowRecipientExpr.pos, continuation),
+      );
     }
 
     if (bodyExprs.length === 0) {
@@ -2005,9 +2220,17 @@ function evaluateCond(
     return evaluateSequenceCps(bodyExprs, env, continuation);
   }
 
+  const arrowRecipientExpr = getCondArrowRecipient(bodyExprs, clause.pos, 'cond');
+
   return evaluateCps(testExpr, env, (testValue) => {
     if (isFalse(testValue)) {
       return evaluateCond(clauses, env, pos, continuation, index + 1);
+    }
+
+    if (arrowRecipientExpr !== undefined) {
+      return evaluateCps(arrowRecipientExpr, env, (recipient) =>
+        applyProcedureCps(recipient, [testValue], arrowRecipientExpr.pos, continuation),
+      );
     }
 
     if (bodyExprs.length === 0) {
@@ -2016,6 +2239,22 @@ function evaluateCond(
 
     return evaluateSequenceCps(bodyExprs, env, continuation);
   });
+}
+
+function getCondArrowRecipient(
+  bodyExprs: Expr[],
+  clausePos: SourcePosition,
+  formName: 'cond' | 'guard',
+): Expr | undefined {
+  if (bodyExprs.length === 0 || symbolName(bodyExprs[0]) !== '=>') {
+    return undefined;
+  }
+
+  if (bodyExprs.length !== 2) {
+    throw new EvalError(`${formName} => clause expected exactly one recipient expression`, clausePos);
+  }
+
+  return bodyExprs[1];
 }
 
 function evaluateCase(
@@ -2538,7 +2777,18 @@ function matchMacroRule(
     return undefined;
   }
 
-  return matchPatternSequence(pattern.elements.slice(1), expression.elements.slice(1), literals);
+  const patternParts = decomposeExprList(pattern, 'macro pattern');
+  const expressionParts = decomposeExprList(expression, 'macro input');
+
+  if (patternParts.elements.length === 0 || expressionParts.elements.length === 0) {
+    return undefined;
+  }
+
+  return matchPattern(
+    makeExprList(patternParts.elements.slice(1), pattern.pos, patternParts.tail),
+    makeExprList(expressionParts.elements.slice(1), expression.pos, expressionParts.tail),
+    literals,
+  );
 }
 
 function matchPattern(
@@ -2557,6 +2807,17 @@ function matchPattern(
       return expression.kind === 'string' && expression.value === pattern.value ? new Map() : undefined;
     case 'char':
       return expression.kind === 'char' && expression.value === pattern.value ? new Map() : undefined;
+    case 'vector':
+      return expression.kind === 'vector'
+        ? matchPatternSequence(
+            pattern.elements,
+            undefined,
+            expression.elements,
+            undefined,
+            literals,
+            expression.pos,
+          )
+        : undefined;
     case 'symbol': {
       if (pattern.name === '...') {
         return undefined;
@@ -2571,27 +2832,58 @@ function matchPattern(
     case 'resolved-symbol':
       return undefined;
     case 'list':
-      return expression.kind === 'list'
-        ? matchPatternSequence(pattern.elements, expression.elements, literals)
-        : undefined;
+      return expression.kind === 'list' ? matchPatternList(pattern, expression, literals) : undefined;
   }
+}
+
+function matchPatternList(
+  pattern: Extract<Expr, { kind: 'list' }>,
+  expression: Extract<Expr, { kind: 'list' }>,
+  literals: Set<string>,
+): PatternBindings | undefined {
+  const patternParts = decomposeExprList(pattern, 'macro pattern');
+  const expressionParts = decomposeExprList(expression, 'macro input');
+  return matchPatternSequence(
+    patternParts.elements,
+    patternParts.tail,
+    expressionParts.elements,
+    expressionParts.tail,
+    literals,
+    expression.pos,
+  );
 }
 
 function matchPatternSequence(
   patternElements: Expr[],
+  patternTail: Expr | undefined,
   expressionElements: Expr[],
+  expressionTail: Expr | undefined,
   literals: Set<string>,
+  expressionPos: SourcePosition,
 ): PatternBindings | undefined {
   const matchFrom = (patternIndex: number, expressionIndex: number): PatternBindings | undefined => {
     if (patternIndex >= patternElements.length) {
-      return expressionIndex === expressionElements.length ? new Map() : undefined;
+      if (patternTail !== undefined) {
+        return matchPattern(
+          patternTail,
+          listRemainderExpr(expressionElements.slice(expressionIndex), expressionTail, expressionPos),
+          literals,
+        );
+      }
+
+      return expressionIndex === expressionElements.length && expressionTail === undefined
+        ? new Map()
+        : undefined;
     }
 
     const currentPattern = patternElements[patternIndex];
     const nextPattern = patternElements[patternIndex + 1];
 
     if (nextPattern !== undefined && isEllipsisExpr(nextPattern)) {
-      const remainingMinimum = minimumSequenceLength(patternElements.slice(patternIndex + 2));
+      const remainingMinimum = minimumSequenceLength(
+        patternElements.slice(patternIndex + 2),
+        patternTail,
+      );
       const maxCount = expressionElements.length - expressionIndex - remainingMinimum;
 
       if (maxCount < 0) {
@@ -2668,7 +2960,7 @@ function matchPatternSequence(
   return matchFrom(0, 0);
 }
 
-function minimumSequenceLength(patternElements: Expr[]): number {
+function minimumSequenceLength(patternElements: Expr[], patternTail?: Expr): number {
   let total = 0;
 
   for (let index = 0; index < patternElements.length; ) {
@@ -2678,6 +2970,11 @@ function minimumSequenceLength(patternElements: Expr[]): number {
       total += 1;
       index += 1;
     }
+  }
+
+  if (patternTail?.kind === 'list') {
+    const tailParts = decomposeExprList(patternTail, 'macro pattern');
+    total += minimumSequenceLength(tailParts.elements, tailParts.tail);
   }
 
   return total;
@@ -2695,9 +2992,18 @@ function collectPatternVariables(pattern: Expr, literals: Set<string>): Set<stri
         break;
       case 'resolved-symbol':
         break;
-      case 'list':
+      case 'vector':
         for (const element of expression.elements) {
           visit(element);
+        }
+        break;
+      case 'list':
+        const parts = decomposeExprList(expression, 'macro pattern');
+        for (const element of parts.elements) {
+          visit(element);
+        }
+        if (parts.tail !== undefined) {
+          visit(parts.tail);
         }
         break;
       default:
@@ -2786,6 +3092,12 @@ function syntaxEquals(left: Expr, right: Expr): boolean {
     case 'string':
     case 'char':
       return left.value === (right as typeof left).value;
+    case 'vector':
+      return (
+        right.kind === 'vector' &&
+        left.elements.length === right.elements.length &&
+        left.elements.every((element, index) => syntaxEquals(element, right.elements[index]))
+      );
     case 'symbol':
       return left.name === (right as typeof left).name;
     case 'resolved-symbol':
@@ -2840,6 +3152,12 @@ function expandTemplate(
     }
     case 'resolved-symbol':
       return template;
+    case 'vector':
+      return {
+        kind: 'vector',
+        elements: expandTemplateSequence(template.elements, bindings, definitionEnv, scope, path),
+        pos: template.pos,
+      };
     case 'list':
       return expandTemplateList(template, bindings, definitionEnv, scope, path);
   }
@@ -2852,14 +3170,14 @@ function expandTemplateList(
   scope: Map<string, string>,
   path: number[],
 ): Expr {
-  const { elements } = template;
+  const { elements, tail } = decomposeExprList(template, 'macro template');
 
-  if (elements.length === 0) {
+  if (elements.length === 0 && tail === undefined) {
     return template;
   }
 
-  const headName = symbolName(elements[0]);
-  if (headName !== undefined && !bindings.has(headName)) {
+  const headName = elements[0] !== undefined ? symbolName(elements[0]) : undefined;
+  if (tail === undefined && headName !== undefined && !bindings.has(headName)) {
     switch (headName) {
       case 'lambda':
         return expandLambdaTemplate(template, bindings, definitionEnv, scope, path);
@@ -2872,11 +3190,11 @@ function expandTemplateList(
     }
   }
 
-  return {
-    kind: 'list',
-    elements: expandTemplateSequence(elements, bindings, definitionEnv, scope, path),
-    pos: template.pos,
-  };
+  return makeExprList(
+    expandTemplateSequence(elements, bindings, definitionEnv, scope, path),
+    template.pos,
+    tail === undefined ? undefined : expandTemplate(tail, bindings, definitionEnv, scope, path),
+  );
 }
 
 function expandGuardTemplate(
@@ -3381,11 +3699,22 @@ function determineTemplateRepeatCount(
       }
       case 'resolved-symbol':
         return;
-      case 'list':
+      case 'vector':
         for (const element of expression.elements) {
           if (!isEllipsisExpr(element)) {
             visit(element);
           }
+        }
+        return;
+      case 'list':
+        const parts = decomposeExprList(expression, 'macro template');
+        for (const element of parts.elements) {
+          if (!isEllipsisExpr(element)) {
+            visit(element);
+          }
+        }
+        if (parts.tail !== undefined) {
+          visit(parts.tail);
         }
         return;
       default:
@@ -3478,11 +3807,13 @@ function quoteExpr(expression: Expr): SchemeValue {
       return makeString(expression.value);
     case 'char':
       return { kind: 'char', value: expression.value };
+    case 'vector':
+      return makeVector(expression.elements.map((element) => quoteExpr(element)));
     case 'symbol':
     case 'resolved-symbol':
       return { kind: 'symbol', name: expression.name };
     case 'list':
-      return listToPairs(expression.elements.map((element) => quoteExpr(element)));
+      return quoteExprList(expression);
   }
 }
 
@@ -3519,6 +3850,14 @@ function datumToExpr(value: SchemeValue, pos: SourcePosition): Expr {
     };
   }
 
+  if (isVectorValue(value)) {
+    return {
+      kind: 'vector',
+      elements: value.elements.map((element) => datumToExpr(element, pos)),
+      pos,
+    };
+  }
+
   if (isSymbolValue(value)) {
     return {
       kind: 'symbol',
@@ -3536,14 +3875,102 @@ function datumToExpr(value: SchemeValue, pos: SourcePosition): Expr {
   }
 
   if (isPair(value)) {
+    return pairToExpr(value, pos);
+  }
+
+  throw new EvalError('datum->syntax expected a datum', pos);
+}
+
+function quoteExprList(expression: Extract<Expr, { kind: 'list' }>): SchemeValue {
+  const { elements, tail } = decomposeExprList(expression, 'quoted list');
+  let result = tail === undefined ? EMPTY_LIST : quoteExpr(tail);
+
+  for (let index = elements.length - 1; index >= 0; index -= 1) {
+    result = {
+      kind: 'pair',
+      car: quoteExpr(elements[index]),
+      cdr: result,
+    };
+  }
+
+  return result;
+}
+
+function pairToExpr(value: PairValue, pos: SourcePosition): Expr {
+  const elements: Expr[] = [];
+  let current: SchemeValue = value;
+  const seenPairs = new Set<PairValue>();
+
+  while (isPair(current)) {
+    if (seenPairs.has(current)) {
+      throw new EvalError('datum->syntax expected a datum', pos);
+    }
+
+    seenPairs.add(current);
+    elements.push(datumToExpr(current.car, pos));
+    current = current.cdr;
+  }
+
+  return makeExprList(elements, pos, isEmptyList(current) ? undefined : datumToExpr(current, pos));
+}
+
+function makeExprList(elements: Expr[], pos: SourcePosition, tail?: Expr): Expr {
+  if (tail === undefined) {
     return {
       kind: 'list',
-      elements: listToArray(value, 'datum->syntax', pos).map((element) => datumToExpr(element, pos)),
+      elements,
       pos,
     };
   }
 
-  throw new EvalError('datum->syntax expected a datum', pos);
+  if (tail.kind === 'list') {
+    const tailParts = decomposeExprList(tail, 'dotted list');
+    return makeExprList([...elements, ...tailParts.elements], pos, tailParts.tail);
+  }
+
+  if (elements.length === 0) {
+    return tail;
+  }
+
+  return {
+    kind: 'list',
+    elements: [...elements, { kind: 'symbol', name: '.', pos }, tail],
+    pos,
+  };
+}
+
+function listRemainderExpr(elements: Expr[], tail: Expr | undefined, pos: SourcePosition): Expr {
+  return makeExprList(elements, pos, tail);
+}
+
+function decomposeExprList(
+  expression: Extract<Expr, { kind: 'list' }>,
+  context: string,
+): { elements: Expr[]; tail?: Expr } {
+  const flattened: Expr[] = [];
+  let current: Expr = expression;
+
+  while (current.kind === 'list') {
+    const dotIndex = current.elements.findIndex((element) => symbolName(element) === '.');
+
+    if (dotIndex === -1) {
+      flattened.push(...current.elements);
+      return { elements: flattened };
+    }
+
+    if (current.elements.findIndex((element, index) => index > dotIndex && symbolName(element) === '.') !== -1) {
+      throw new EvalError(`${context} has an invalid dotted list`, current.pos);
+    }
+
+    if (dotIndex === 0 || dotIndex !== current.elements.length - 2) {
+      throw new EvalError(`${context} has an invalid dotted list`, current.pos);
+    }
+
+    flattened.push(...current.elements.slice(0, dotIndex));
+    current = current.elements[dotIndex + 1];
+  }
+
+  return { elements: flattened, tail: current };
 }
 
 function listToPairs(elements: SchemeValue[]): SchemeValue {
@@ -3617,10 +4044,34 @@ function tokenize(input: string): TokenStream {
       continue;
     }
 
+    if (char === '`') {
+      advanceChar();
+      tokens.push({ kind: 'quasiquote', pos });
+      continue;
+    }
+
+    if (char === ',') {
+      advanceChar();
+      if (peekChar() === '@') {
+        advanceChar();
+        tokens.push({ kind: 'unquote-splicing', pos });
+      } else {
+        tokens.push({ kind: 'unquote', pos });
+      }
+      continue;
+    }
+
     if (char === '#' && input[index + 1] === '\'') {
       advanceChar();
       advanceChar();
       tokens.push({ kind: 'syntax', pos });
+      continue;
+    }
+
+    if (char === '#' && input[index + 1] === '(') {
+      advanceChar();
+      advanceChar();
+      tokens.push({ kind: 'vector-start', pos });
       continue;
     }
 
@@ -3742,14 +4193,13 @@ class Parser {
       case 'symbol':
         return { kind: 'symbol', name: token.value, pos: token.pos };
       case 'quote':
-        return {
-          kind: 'list',
-          pos: token.pos,
-          elements: [
-            { kind: 'symbol', name: 'quote', pos: token.pos },
-            this.parseExpr(),
-          ],
-        };
+        return this.parseReaderSugar('quote', token.pos);
+      case 'quasiquote':
+        return this.parseReaderSugar('quasiquote', token.pos);
+      case 'unquote':
+        return this.parseReaderSugar('unquote', token.pos);
+      case 'unquote-splicing':
+        return this.parseReaderSugar('unquote-splicing', token.pos);
       case 'syntax':
         return {
           kind: 'list',
@@ -3759,6 +4209,24 @@ class Parser {
             this.parseExpr(),
           ],
         };
+      case 'vector-start': {
+        const elements: Expr[] = [];
+
+        while (true) {
+          const next = this.peek();
+
+          if (next === undefined) {
+            throw new EvalError('unterminated vector', this.eofPosition);
+          }
+
+          if (next.kind === 'rparen') {
+            this.advance();
+            return { kind: 'vector', elements, pos: token.pos };
+          }
+
+          elements.push(this.parseExpr());
+        }
+      }
       case 'lparen': {
         const elements: Expr[] = [];
 
@@ -3784,6 +4252,20 @@ class Parser {
 
   private peek(): Token | undefined {
     return this.tokens[this.index];
+  }
+
+  private parseReaderSugar(
+    name: 'quote' | 'quasiquote' | 'unquote' | 'unquote-splicing',
+    pos: SourcePosition,
+  ): Expr {
+    return {
+      kind: 'list',
+      pos,
+      elements: [
+        { kind: 'symbol', name, pos },
+        this.parseExpr(),
+      ],
+    };
   }
 
   private advance(): Token | undefined {
@@ -4548,13 +5030,25 @@ function listToArray(value: SchemeValue, name: string, pos: SourcePosition): Sch
 }
 
 function appendLists(args: SchemeValue[], pos: SourcePosition): SchemeValue {
-  const elements: SchemeValue[] = [];
-
-  for (const arg of args) {
-    elements.push(...listToArray(arg, 'append', pos));
+  if (args.length === 0) {
+    return EMPTY_LIST;
   }
 
-  return listToPairs(elements);
+  let result = args[args.length - 1];
+
+  for (let argIndex = args.length - 2; argIndex >= 0; argIndex -= 1) {
+    const elements = listToArray(args[argIndex], 'append', pos);
+
+    for (let elementIndex = elements.length - 1; elementIndex >= 0; elementIndex -= 1) {
+      result = {
+        kind: 'pair',
+        car: elements[elementIndex],
+        cdr: result,
+      };
+    }
+  }
+
+  return result;
 }
 
 function isProperList(value: SchemeValue): boolean {
@@ -5199,6 +5693,13 @@ function makeVector(elements: SchemeValue[]): VectorValue {
   return {
     kind: 'vector',
     elements: [...elements],
+  };
+}
+
+function makeSymbolValue(name: string): SymbolValue {
+  return {
+    kind: 'symbol',
+    name,
   };
 }
 
