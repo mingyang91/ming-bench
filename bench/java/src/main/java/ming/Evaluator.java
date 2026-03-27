@@ -135,6 +135,7 @@ public class Evaluator {
     private record AndFrame(List<?> list, int nextIdx, Env env) {}
     private record OrFrame(List<?> list, int nextIdx, Env env) {}
     private record CondFrame(List<?> list, int clauseIdx, Env env) {}
+    private record CondArrowFrame(Object testResult, Env env) {}
     private record CaseFrame(List<?> list, Env env) {}
     private record LetBindFrame(List<String> names, List<Object> initExprs, int bindingIdx,
                                  List<Object> values, List<Object> bodyExprs,
@@ -158,14 +159,14 @@ public class Evaluator {
     record SyntaxCaseTransformer(Object proc, Env defEnv) {}
     record SyntaxTemplate(Object form, Map<String, Object> hygieneBindings) {}
 
-    private static final Set<String> SPECIAL_FORMS = Set.of(
-        "if", "begin", "let", "let*", "set!", "define", "quote", "lambda", "case-lambda",
+    static final Set<String> SPECIAL_FORMS = Set.of(
+        "if", "begin", "let", "let*", "set!", "define", "quote", "quasiquote", "lambda", "case-lambda",
         "and", "or", "cond", "case", "do", "letrec", "letrec*",
         "define-syntax", "syntax-rules", "syntax-case", "syntax", "with-syntax",
         "define-record-type", "guard"
     );
 
-    private int gensymCounter = 0;
+    private final MacroExpander macroExpander = new MacroExpander();
     private int nextEvalId = 0;
     private StringBuilder outputBuffer;
     private Env syntaxDefEnv;
@@ -318,6 +319,13 @@ public class Evaluator {
             Object d = list.get(1);
             if (d instanceof SchemeParser.Located loc) d = loc.expr;
             return new CekState(quoteValue(d), env, false);
+        }
+        case "quasiquote": {
+            if (list.size() != 2) throw new EvalError("quasiquote: expected 1 argument" + posStr);
+            Object d = list.get(1);
+            if (d instanceof SchemeParser.Located loc) d = loc.expr;
+            Object result = processQuasiquote(d, env);
+            return new CekState(result, env, false);
         }
         case "if": {
             if (list.size() < 3 || list.size() > 4) throw new EvalError("if: expected 2-3 arguments" + posStr);
@@ -520,7 +528,7 @@ public class Evaluator {
             }
             Map<String, String> renameMap = new HashMap<>();
             Map<String, Object> hygieneBindings = new HashMap<>();
-            Object expanded = expandSyntaxTemplate(list.get(1), env, renameMap, hygieneBindings);
+            Object expanded = macroExpander.expandSyntaxTemplate(list.get(1), env, renameMap, hygieneBindings, syntaxDefEnv);
             return new CekState(new SyntaxTemplate(expanded, hygieneBindings), env, false);
         }
         case "with-syntax": {
@@ -541,7 +549,7 @@ public class Evaluator {
             Object mv = null;
             try { mv = env.lookup(op, new SchemeParser.Pos(eLine, eCol)); } catch (EvalError ignored) {}
             if (mv instanceof SyntaxRulesMacro macro) {
-                Object[] expanded = expandMacro(macro, list, env);
+                Object[] expanded = macroExpander.expandMacro(macro, list, env);
                 return new CekState(expanded[0], (Env) expanded[1], true);
             }
             if (mv instanceof SyntaxCaseTransformer sct) {
@@ -634,6 +642,12 @@ public class Evaluator {
         if (frame instanceof CondFrame f) {
             return processCondFrame(f, current, env, kont);
         }
+        if (frame instanceof CondArrowFrame f) {
+            // proc has been evaluated (current), now apply it to the test result
+            doApply(current, List.of(f.testResult), kont, 0, 0, evalId);
+            Env newEnv = applyResult[1] != null ? (Env) applyResult[1] : env;
+            return new CekState(applyResult[0], newEnv, (Boolean) applyResult[2]);
+        }
         if (frame instanceof CaseFrame f) {
             return processCaseFrame(f, current, kont);
         }
@@ -701,6 +715,11 @@ public class Evaluator {
         List<?> clause = (List<?>) unwrap(f.list.get(f.clauseIdx));
         if (isTruthy(current)) {
             if (clause.size() == 1) return new CekState(current, env, false);
+            // Handle (test => proc) syntax
+            if (clause.size() == 3 && unwrap(clause.get(1)) instanceof String s && s.equals("=>")) {
+                kont.add(new CondArrowFrame(current, f.env));
+                return new CekState(clause.get(2), f.env, true);
+            }
             Object first = pushBodyFrames(clause, 1, kont, f.env);
             return new CekState(first, f.env, true);
         }
@@ -949,7 +968,16 @@ public class Evaluator {
 
     private String parseParamList(List<?> sig, int startIdx, List<String> params, String formName) throws EvalError {
         String restParam = null;
-        for (int pi = startIdx; pi < sig.size(); pi++) {
+        int end = sig.size();
+        // Handle DottedTail from parser: (x y . rest) -> [x, y, DottedTail(rest)]
+        if (end > startIdx && sig.get(end - 1) instanceof SchemeParser.DottedTail dt) {
+            Object rp = dt.expr();
+            if (rp instanceof SchemeParser.Located loc) rp = loc.expr;
+            if (!(rp instanceof String rpname)) throw new EvalError(formName + ": rest parameter must be symbol");
+            restParam = rpname;
+            end--;
+        }
+        for (int pi = startIdx; pi < end; pi++) {
             Object p = sig.get(pi);
             if (p instanceof SchemeParser.Located loc) p = loc.expr;
             if (p instanceof String pname && pname.equals(".")) {
@@ -971,6 +999,10 @@ public class Evaluator {
         if (list.size() < 3) throw new EvalError("lambda: too few arguments");
         Object ps = list.get(1);
         if (ps instanceof SchemeParser.Located loc) ps = loc.expr;
+        // (lambda args body) where args is a symbol - variadic, captures all args
+        if (ps instanceof String symbol) {
+            return new Lambda(List.of(), symbol, new ArrayList<>(list.subList(2, list.size())), env);
+        }
         if (!(ps instanceof List<?> pl)) throw new EvalError("lambda: params must be a list");
         List<String> params = new ArrayList<>();
         String rest = parseParamList(pl, 0, params, "lambda");
@@ -1073,7 +1105,7 @@ public class Evaluator {
         if (!(to instanceof List<?> testClause) || testClause.isEmpty())
             throw new EvalError("do: test clause must be a list");
 
-        String loopName = "__do_" + (gensymCounter++);
+        String loopName = "__do_" + (macroExpander.nextGensym());
         List<Object> bindings = new ArrayList<>(), stepArgs = new ArrayList<>();
         for (Object vs : varSpecs) {
             if (vs instanceof SchemeParser.Located loc) vs = loc.expr;
@@ -1172,104 +1204,6 @@ public class Evaluator {
         return Boolean.FALSE;
     }
 
-    // --- Macro expansion ---
-
-    @SuppressWarnings("unchecked")
-    private Object[] expandMacro(SyntaxRulesMacro macro, List<?> form, Env useEnv) throws EvalError {
-        for (Object[] rule : macro.rules) {
-            Map<String, Object> bindings = matchPattern(rule[0], form, macro.literals);
-            if (bindings != null) {
-                Map<String, String> renameMap = new HashMap<>();
-                Object expanded = expandTemplate(rule[1], bindings, renameMap);
-                Env evalEnv = useEnv;
-                if (!renameMap.isEmpty()) {
-                    Map<String, Object> hb = new HashMap<>();
-                    for (var e : renameMap.entrySet()) {
-                        try { hb.put(e.getValue(), macro.defEnv.lookup(e.getKey(), new SchemeParser.Pos(0, 0))); }
-                        catch (EvalError ignored) {}
-                    }
-                    if (!hb.isEmpty()) { for (var e : hb.entrySet()) useEnv.define(e.getKey(), e.getValue()); }
-                }
-                return new Object[]{expanded, evalEnv};
-            }
-        }
-        throw new EvalError("no matching pattern for macro " + macro.name);
-    }
-
-    private Map<String, Object> matchPattern(Object pattern, List<?> input, List<String> literals) {
-        if (pattern instanceof SchemeParser.Located loc) pattern = loc.expr;
-        if (!(pattern instanceof List<?> patList)) return null;
-        Map<String, Object> bindings = new HashMap<>();
-        int pi = 1, ii = 1;
-        while (pi < patList.size()) {
-            Object pe = patList.get(pi); if (pe instanceof SchemeParser.Located loc) pe = loc.expr;
-            boolean hasE = false;
-            if (pi + 1 < patList.size()) {
-                Object nx = patList.get(pi + 1); if (nx instanceof SchemeParser.Located loc) nx = loc.expr;
-                if ("...".equals(nx)) hasE = true;
-            }
-            if (hasE) {
-                if (!(pe instanceof String vn)) return null;
-                List<Object> coll = new ArrayList<>();
-                while (ii < input.size()) { coll.add(input.get(ii)); ii++; }
-                bindings.put(vn, coll); pi += 2;
-            } else if (pe instanceof String s && literals.contains(s)) {
-                if (ii >= input.size()) return null;
-                Object ie = input.get(ii); if (ie instanceof SchemeParser.Located loc) ie = loc.expr;
-                if (!s.equals(ie)) return null;
-                pi++; ii++;
-            } else if (pe instanceof String vn) {
-                if (ii >= input.size()) return null;
-                bindings.put(vn, input.get(ii)); pi++; ii++;
-            } else return null;
-        }
-        return ii == input.size() ? bindings : null;
-    }
-
-    @SuppressWarnings("unchecked")
-    private Object expandTemplate(Object template, Map<String, Object> bindings, Map<String, String> renameMap) {
-        if (template instanceof SchemeParser.Located loc) template = loc.expr;
-        if (template instanceof String id) {
-            if (bindings.containsKey(id)) return bindings.get(id);
-            if ("...".equals(id) || SPECIAL_FORMS.contains(id)) return id;
-            if (!renameMap.containsKey(id)) renameMap.put(id, "__" + id + "_" + (gensymCounter++));
-            return renameMap.get(id);
-        }
-        if (template instanceof List<?> tl) {
-            List<Object> result = new ArrayList<>();
-            for (int i = 0; i < tl.size(); i++) {
-                Object elem = tl.get(i);
-                Object raw = elem; if (raw instanceof SchemeParser.Located loc) raw = loc.expr;
-                boolean nxt = false;
-                if (i + 1 < tl.size()) { Object n = tl.get(i + 1); if (n instanceof SchemeParser.Located loc) n = loc.expr; if ("...".equals(n)) nxt = true; }
-                if (nxt) {
-                    String ev = findEllipsisVar(elem, bindings);
-                    if (ev != null) {
-                        for (Object e : (List<Object>) bindings.get(ev)) {
-                            Map<String, Object> sb = new HashMap<>(bindings); sb.put(ev, e);
-                            result.add(expandTemplate(elem, sb, renameMap));
-                        }
-                    }
-                    i++;
-                } else if (raw instanceof String s && "...".equals(s)) { /* skip */ }
-                else result.add(expandTemplate(elem, bindings, renameMap));
-            }
-            return result;
-        }
-        return template;
-    }
-
-    private String findEllipsisVar(Object template, Map<String, Object> bindings) {
-        if (template instanceof SchemeParser.Located loc) template = loc.expr;
-        if (template instanceof String s && bindings.get(s) instanceof List) return s;
-        if (template instanceof List<?> list) {
-            for (Object e : list) { String f = findEllipsisVar(e, bindings); if (f != null) return f; }
-        }
-        return null;
-    }
-
-    // --- syntax-case support ---
-
     @SuppressWarnings("unchecked")
     private CekState processSyntaxCaseFrame(SyntaxCaseFrame f, Object current, Env env) throws EvalError {
         Object scrutinee;
@@ -1280,7 +1214,7 @@ public class Evaluator {
         for (Object clauseObj : f.clauses) {
             List<?> clause = (List<?>) unwrap(clauseObj);
             Object pattern = clause.get(0);
-            Map<String, Object> bindings = matchSyntaxCasePattern(pattern, inputList, f.literals);
+            Map<String, Object> bindings = macroExpander.matchSyntaxCasePattern(pattern, inputList, f.literals);
             if (bindings != null) {
                 Env clauseEnv = new Env(f.env);
                 for (var e : bindings.entrySet()) {
@@ -1314,120 +1248,9 @@ public class Evaluator {
         return new CekState(first != null ? first : Boolean.FALSE, wsEnv, first != null);
     }
 
-    private Map<String, Object> matchSyntaxCasePattern(Object pattern, List<?> input, List<String> literals) {
-        if (pattern instanceof SchemeParser.Located loc) pattern = loc.expr;
-        if (!(pattern instanceof List<?> patList)) return null;
-        Map<String, Object> bindings = new HashMap<>();
-        int pi = 0, ii = 0;
-        while (pi < patList.size()) {
-            Object pe = patList.get(pi);
-            if (pe instanceof SchemeParser.Located loc) pe = loc.expr;
-            boolean hasE = false;
-            if (pi + 1 < patList.size()) {
-                Object nx = patList.get(pi + 1);
-                if (nx instanceof SchemeParser.Located loc) nx = loc.expr;
-                if ("...".equals(nx)) hasE = true;
-            }
-            if (hasE) {
-                if (!(pe instanceof String vn)) return null;
-                List<Object> coll = new ArrayList<>();
-                while (ii < input.size()) { coll.add(input.get(ii)); ii++; }
-                bindings.put(vn, coll); pi += 2;
-            } else if (pe instanceof String s && s.equals("_")) {
-                if (ii >= input.size()) return null;
-                pi++; ii++;
-            } else if (pe instanceof String s && literals.contains(s)) {
-                if (ii >= input.size()) return null;
-                Object ie = input.get(ii);
-                if (ie instanceof SchemeParser.Located loc) ie = loc.expr;
-                if (!s.equals(ie)) return null;
-                pi++; ii++;
-            } else if (pe instanceof String vn) {
-                if (ii >= input.size()) return null;
-                bindings.put(vn, input.get(ii)); pi++; ii++;
-            } else return null;
-        }
-        return ii == input.size() ? bindings : null;
-    }
-
-    @SuppressWarnings("unchecked")
-    private Object expandSyntaxTemplate(Object template, Env env,
-                                         Map<String, String> renameMap,
-                                         Map<String, Object> hygieneBindings) {
-        template = unwrap(template);
-        if (template instanceof String id) {
-            Object val = null;
-            try { val = env.lookup(id, new SchemeParser.Pos(0, 0)); } catch (EvalError ignored) {}
-            if (val instanceof SyntaxObject so) return so.datum;
-            if ("...".equals(id) || SPECIAL_FORMS.contains(id)) return id;
-            if (!renameMap.containsKey(id)) renameMap.put(id, "__" + id + "_" + (gensymCounter++));
-            String renamed = renameMap.get(id);
-            if (syntaxDefEnv != null && !hygieneBindings.containsKey(renamed)) {
-                try {
-                    hygieneBindings.put(renamed, syntaxDefEnv.lookup(id, new SchemeParser.Pos(0, 0)));
-                } catch (EvalError ignored) {}
-            }
-            return renamed;
-        }
-        if (template instanceof List<?> tl) {
-            if (!tl.isEmpty()) {
-                Object head = unwrap(tl.get(0));
-                if ("quote".equals(head)) return tl;
-            }
-            List<Object> result = new ArrayList<>();
-            for (int i = 0; i < tl.size(); i++) {
-                Object elem = tl.get(i);
-                Object raw = unwrap(elem);
-                boolean hasEllipsis = false;
-                if (i + 1 < tl.size()) {
-                    Object nx = unwrap(tl.get(i + 1));
-                    if ("...".equals(nx)) hasEllipsis = true;
-                }
-                if (hasEllipsis) {
-                    String ev = findSyntaxEllipsisVar(elem, env);
-                    if (ev != null) {
-                        Object evVal = null;
-                        try { evVal = env.lookup(ev, new SchemeParser.Pos(0, 0)); } catch (EvalError ignored) {}
-                        if (evVal instanceof SyntaxObject so && so.datum instanceof List<?> items) {
-                            for (Object item : items) {
-                                Env subEnv = new Env(env);
-                                subEnv.define(ev, new SyntaxObject(item));
-                                result.add(expandSyntaxTemplate(elem, subEnv, renameMap, hygieneBindings));
-                            }
-                        }
-                    }
-                    i++;
-                } else if ("...".equals(raw)) {
-                    // skip
-                } else {
-                    result.add(expandSyntaxTemplate(elem, env, renameMap, hygieneBindings));
-                }
-            }
-            return result;
-        }
-        return template;
-    }
-
-    private String findSyntaxEllipsisVar(Object template, Env env) {
-        template = unwrap(template);
-        if (template instanceof String id) {
-            Object val = null;
-            try { val = env.lookup(id, new SchemeParser.Pos(0, 0)); } catch (EvalError ignored) {}
-            if (val instanceof SyntaxObject so && so.datum instanceof List) return id;
-            return null;
-        }
-        if (template instanceof List<?> tl) {
-            for (Object e : tl) {
-                String found = findSyntaxEllipsisVar(e, env);
-                if (found != null) return found;
-            }
-        }
-        return null;
-    }
-
     // --- Utility ---
 
-    private static Object unwrap(Object obj) {
+    static Object unwrap(Object obj) {
         if (obj instanceof SchemeParser.Located loc) return loc.expr;
         return obj;
     }
@@ -1435,11 +1258,65 @@ public class Evaluator {
     private Object quoteValue(Object datum) {
         if (datum instanceof SchemeParser.Located loc) datum = loc.expr;
         if (datum instanceof List<?> list) {
-            Object result = EMPTY_LIST;
-            for (int i = list.size() - 1; i >= 0; i--) result = new Pair(quoteValue(list.get(i)), result);
+            // Check if last element is a DottedTail (improper list)
+            Object result;
+            int end = list.size();
+            if (!list.isEmpty() && list.get(list.size() - 1) instanceof SchemeParser.DottedTail dt) {
+                result = quoteValue(dt.expr());
+                end = list.size() - 1;
+            } else {
+                result = EMPTY_LIST;
+            }
+            for (int i = end - 1; i >= 0; i--) result = new Pair(quoteValue(list.get(i)), result);
             return result;
         }
         return datum;
+    }
+
+    private Object processQuasiquote(Object datum, Env env) throws EvalError {
+        if (datum instanceof SchemeParser.Located loc) datum = loc.expr;
+        if (datum instanceof List<?> list && !list.isEmpty()) {
+            Object first = list.get(0);
+            if (first instanceof SchemeParser.Located loc) first = loc.expr;
+            if (first instanceof String s && s.equals("unquote")) {
+                if (list.size() != 2) throw new EvalError("unquote: expected 1 argument");
+                return eval(list.get(1), env);
+            }
+            // Process each element, handling unquote-splicing
+            List<Object> elements = new ArrayList<>();
+            int end = list.size();
+            Object tail = EMPTY_LIST;
+            if (end > 0 && list.get(end - 1) instanceof SchemeParser.DottedTail dt) {
+                tail = processQuasiquote(dt.expr(), env);
+                end--;
+            }
+            for (int i = 0; i < end; i++) {
+                Object elem = list.get(i);
+                if (elem instanceof SchemeParser.Located loc) elem = loc.expr;
+                if (elem instanceof List<?> el && !el.isEmpty()) {
+                    Object ef = el.get(0);
+                    if (ef instanceof SchemeParser.Located loc) ef = loc.expr;
+                    if (ef instanceof String es && es.equals("unquote-splicing")) {
+                        if (el.size() != 2) throw new EvalError("unquote-splicing: expected 1 argument");
+                        Object spliced = eval(el.get(1), env);
+                        while (spliced instanceof Pair p) {
+                            elements.add(p.car);
+                            spliced = p.cdr;
+                        }
+                        continue;
+                    }
+                }
+                elements.add(processQuasiquote(list.get(i), env));
+            }
+            // Build result as a Pair chain
+            Object result = tail;
+            for (int i = elements.size() - 1; i >= 0; i--) {
+                result = new Pair(elements.get(i), result);
+            }
+            return result;
+        }
+        // Atoms and non-list values are quoted as-is
+        return quoteValue(datum);
     }
 
     private boolean schemeEqv(Object a, Object b) {

@@ -7,6 +7,8 @@ import java.util.List;
 
 class SchemeParser {
 
+    record DottedTail(Object expr) {}
+
     record Pos(int line, int col) {
         String fmt() { return line + ":" + col; }
     }
@@ -46,6 +48,17 @@ class SchemeParser {
             } else if (c == '\'') {
                 tokens.add(new Token("'", line, col));
                 i++; col++;
+            } else if (c == '`') {
+                tokens.add(new Token("`", line, col));
+                i++; col++;
+            } else if (c == ',') {
+                if (i + 1 < len && input.charAt(i + 1) == '@') {
+                    tokens.add(new Token(",@", line, col));
+                    i += 2; col += 2;
+                } else {
+                    tokens.add(new Token(",", line, col));
+                    i++; col++;
+                }
             } else if (c == '"') {
                 int startLine = line, startCol = col;
                 StringBuilder sb = new StringBuilder();
@@ -154,6 +167,30 @@ class SchemeParser {
             quoted.add(datum instanceof Located loc ? loc.expr : datum);
             return new Located(quoted, tLine, tCol);
         }
+        if (token.equals("`")) {
+            pos[0]++;
+            Object datum = parse(tokens, pos);
+            List<Object> qq = new ArrayList<>();
+            qq.add("quasiquote");
+            qq.add(datum instanceof Located loc ? loc.expr : datum);
+            return new Located(qq, tLine, tCol);
+        }
+        if (token.equals(",")) {
+            pos[0]++;
+            Object datum = parse(tokens, pos);
+            List<Object> uq = new ArrayList<>();
+            uq.add("unquote");
+            uq.add(datum instanceof Located loc ? loc.expr : datum);
+            return new Located(uq, tLine, tCol);
+        }
+        if (token.equals(",@")) {
+            pos[0]++;
+            Object datum = parse(tokens, pos);
+            List<Object> uqs = new ArrayList<>();
+            uqs.add("unquote-splicing");
+            uqs.add(datum instanceof Located loc ? loc.expr : datum);
+            return new Located(uqs, tLine, tCol);
+        }
         if (token.equals("#'")) {
             pos[0]++;
             Object datum = parse(tokens, pos);
@@ -178,8 +215,34 @@ class SchemeParser {
         if (token.equals("(")) {
             pos[0]++;
             List<Object> list = new ArrayList<>();
+            boolean dotted = false;
             while (pos[0] < tokens.size() && !tokens.get(pos[0]).value().equals(")")) {
-                list.add(parse(tokens, pos));
+                // Check for dot notation: (a b . c)
+                if (pos[0] < tokens.size() && tokens.get(pos[0]).value() instanceof String s && s.equals(".")
+                        && !list.isEmpty()) {
+                    int savedPos = pos[0];
+                    pos[0]++; // skip the dot
+                    if (pos[0] < tokens.size() && !tokens.get(pos[0]).value().equals(")")) {
+                        Object tail = parse(tokens, pos);
+                        // Verify: next token must be ) for valid dotted pair
+                        if (pos[0] < tokens.size() && tokens.get(pos[0]).value().equals(")")) {
+                            list.add(new DottedTail(tail));
+                            dotted = true;
+                            break;
+                        } else {
+                            // Not a valid dotted pair (more than one expr after dot)
+                            // Restore and parse normally: add dot as symbol, and the parsed tail too
+                            pos[0] = savedPos;
+                            list.add(parse(tokens, pos)); // parse the "." as a symbol
+                        }
+                    } else {
+                        // Not a dotted pair (nothing after dot before close), parse dot as symbol
+                        pos[0] = savedPos;
+                        list.add(parse(tokens, pos));
+                    }
+                } else {
+                    list.add(parse(tokens, pos));
+                }
             }
             if (pos[0] >= tokens.size()) {
                 throw new EvalError("missing closing paren at " + tLine + ":" + tCol);
