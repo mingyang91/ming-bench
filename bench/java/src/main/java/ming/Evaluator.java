@@ -166,7 +166,7 @@ public class Evaluator {
     record MacroTransformer(Lambda lambda, Env defEnv) {}
 
     private static final Set<String> MACRO_SPECIAL_FORMS = Set.of(
-        "quote", "if", "define", "lambda", "case-lambda", "and", "begin", "let", "let*", "cond", "set!", "or",
+        "quote", "quasiquote", "if", "define", "lambda", "case-lambda", "and", "begin", "let", "let*", "cond", "set!", "or",
         "define-syntax", "syntax-rules", "syntax-case", "syntax", "with-syntax",
         "letrec", "letrec*", "case", "do",
         "call/cc", "call-with-current-continuation",
@@ -279,7 +279,7 @@ public class Evaluator {
                 "caaar", "caadr", "cadar", "cdaar", "cdadr", "cddar",
                 "caaaar", "caaadr", "caadar", "caaddr", "cadaar", "cadadr", "cadddr",
                 "cdaaar", "cdaadr", "cdadar", "cdaddr", "cddaar", "cddadr", "cdddar", "cddddr",
-                "raise",
+                "raise", "error",
                 "values", "call-with-values",
                 "syntax->datum", "datum->syntax")) {
             env.define(name, "builtin:" + name);
@@ -395,7 +395,7 @@ public class Evaluator {
         return exprs;
     }
 
-    enum TokenType { LPAREN, RPAREN, QUOTE, SYNTAX_QUOTE, STRING, ATOM }
+    enum TokenType { LPAREN, RPAREN, QUOTE, SYNTAX_QUOTE, QUASIQUOTE, UNQUOTE, UNQUOTE_SPLICING, STRING, ATOM }
 
     record Token(TokenType type, String value, int line, int col) {}
 
@@ -415,6 +415,17 @@ public class Evaluator {
             if (c == '(') { tokens.add(new Token(TokenType.LPAREN, "(", line, col)); i++; col++; continue; }
             if (c == ')') { tokens.add(new Token(TokenType.RPAREN, ")", line, col)); i++; col++; continue; }
             if (c == '\'') { tokens.add(new Token(TokenType.QUOTE, "'", line, col)); i++; col++; continue; }
+            if (c == '`') { tokens.add(new Token(TokenType.QUASIQUOTE, "`", line, col)); i++; col++; continue; }
+            if (c == ',') {
+                if (i + 1 < len && input.charAt(i + 1) == '@') {
+                    tokens.add(new Token(TokenType.UNQUOTE_SPLICING, ",@", line, col));
+                    i += 2; col += 2;
+                } else {
+                    tokens.add(new Token(TokenType.UNQUOTE, ",", line, col));
+                    i++; col++;
+                }
+                continue;
+            }
             if (c == '#' && i + 1 < len && input.charAt(i + 1) == '\'') {
                 tokens.add(new Token(TokenType.SYNTAX_QUOTE, "#'", line, col));
                 i += 2; col += 2; continue;
@@ -487,6 +498,27 @@ public class Evaluator {
                 Object quoted = parseExpr(tokens, pos);
                 LocatedList q = new LocatedList(tok.line(), tok.col());
                 q.add("syntax");
+                q.add(quoted);
+                yield q;
+            }
+            case QUASIQUOTE -> {
+                Object quoted = parseExpr(tokens, pos);
+                LocatedList q = new LocatedList(tok.line(), tok.col());
+                q.add("quasiquote");
+                q.add(quoted);
+                yield q;
+            }
+            case UNQUOTE -> {
+                Object quoted = parseExpr(tokens, pos);
+                LocatedList q = new LocatedList(tok.line(), tok.col());
+                q.add("unquote");
+                q.add(quoted);
+                yield q;
+            }
+            case UNQUOTE_SPLICING -> {
+                Object quoted = parseExpr(tokens, pos);
+                LocatedList q = new LocatedList(tok.line(), tok.col());
+                q.add("unquote-splicing");
                 q.add(quoted);
                 yield q;
             }
@@ -588,6 +620,10 @@ public class Evaluator {
                     case "quote" -> {
                         if (list.size() != 2) throw errAt(eline, ecol, "quote: expected 1 argument");
                         return k.apply(toSchemeValue(list.get(1)));
+                    }
+                    case "quasiquote" -> {
+                        if (list.size() != 2) throw errAt(eline, ecol, "quasiquote: expected 1 argument");
+                        return expandQuasiquote(list.get(1), env, k);
                     }
                     case "if" -> {
                         if (list.size() < 3 || list.size() > 4) throw errAt(eline, ecol, "if: bad syntax");
@@ -1222,6 +1258,78 @@ public class Evaluator {
         }));
     }
 
+    // Quasiquote expansion
+    private Bounce expandQuasiquote(Object template, Env env, Cont k) throws EvalError {
+        if (!(template instanceof List<?> list)) {
+            // Atom — just quote it
+            return k.apply(toSchemeValue(template));
+        }
+        if (list.size() == 2 && "unquote".equals(symName(list.get(0)))) {
+            return bounce(() -> evalK(list.get(1), env, k));
+        }
+        // Check for dot notation: (a b . c) where second-to-last is "."
+        int dotIdx = -1;
+        for (int i = 0; i < list.size(); i++) {
+            if (".".equals(symName(list.get(i)))) { dotIdx = i; break; }
+        }
+        if (dotIdx >= 0 && dotIdx == list.size() - 2) {
+            // Dotted list: expand elements before dot, then expand the tail
+            return expandQQDotted(list, 0, dotIdx, env, k);
+        }
+        // Regular list: expand each element, handling unquote-splicing
+        return expandQQList(list, 0, env, k);
+    }
+
+    private Bounce expandQQList(List<?> list, int idx, Env env, Cont k) throws EvalError {
+        if (idx >= list.size()) return k.apply(Empty.NIL);
+        Object elem = list.get(idx);
+        if (elem instanceof List<?> sub && sub.size() == 2 && "unquote-splicing".equals(symName(sub.get(0)))) {
+            return bounce(() -> evalK(sub.get(1), env, spliced -> {
+                return expandQQList(list, idx + 1, env, rest -> {
+                    // Append spliced to rest
+                    return k.apply(schemeAppend(spliced, rest));
+                });
+            }));
+        }
+        return bounce(() -> expandQuasiquote(elem, env, val -> {
+            return expandQQList(list, idx + 1, env, rest -> {
+                return k.apply(new Pair(val, rest));
+            });
+        }));
+    }
+
+    private Bounce expandQQDotted(List<?> list, int idx, int dotIdx, Env env, Cont k) throws EvalError {
+        if (idx >= dotIdx) {
+            // Expand the tail (element after the dot)
+            Object tail = list.get(dotIdx + 1);
+            if (tail instanceof List<?> sub && sub.size() == 2 && "unquote".equals(symName(sub.get(0)))) {
+                return bounce(() -> evalK(sub.get(1), env, k));
+            }
+            return expandQuasiquote(tail, env, k);
+        }
+        Object elem = list.get(idx);
+        if (elem instanceof List<?> sub && sub.size() == 2 && "unquote-splicing".equals(symName(sub.get(0)))) {
+            return bounce(() -> evalK(sub.get(1), env, spliced -> {
+                return expandQQDotted(list, idx + 1, dotIdx, env, rest -> {
+                    return k.apply(schemeAppend(spliced, rest));
+                });
+            }));
+        }
+        return bounce(() -> expandQuasiquote(elem, env, val -> {
+            return expandQQDotted(list, idx + 1, dotIdx, env, rest -> {
+                return k.apply(new Pair(val, rest));
+            });
+        }));
+    }
+
+    private Object schemeAppend(Object a, Object b) {
+        if (a instanceof Empty) return b;
+        if (a instanceof Pair p) {
+            return new Pair(p.car(), schemeAppend(p.cdr(), b));
+        }
+        return b; // shouldn't happen for well-formed lists
+    }
+
     private Bounce evalCondK(List<?> list, int idx, Env env, int el, int ec, Cont k) throws EvalError {
         if (idx >= list.size()) return k.apply(VOID);
         if (!(list.get(idx) instanceof List<?> clause) || clause.isEmpty())
@@ -1235,6 +1343,10 @@ public class Evaluator {
         return bounce(() -> evalK(test, env, val -> {
             if (!isFalse(val)) {
                 if (clause.size() == 1) return k.apply(val);
+                if (clause.size() == 3 && "=>".equals(symName(clause.get(1)))) {
+                    return bounce(() -> evalK(clause.get(2), env, proc ->
+                        applyK(proc, List.of(val), el, ec, k)));
+                }
                 return evalSeqK(clause, 1, env, k);
             }
             return evalCondK(list, idx + 1, env, el, ec, k);
@@ -1402,6 +1514,15 @@ public class Evaluator {
                 if (args.size() != 1) throw new EvalError("raise: expected 1 argument");
                 throw new SchemeRaisedException(args.get(0));
             }
+            if ("error".equals(name)) {
+                if (args.isEmpty()) throw new EvalError("error: expected at least 1 argument");
+                StringBuilder sb = new StringBuilder();
+                sb.append(schemeToString(args.get(0)));
+                for (int i = 1; i < args.size(); i++) {
+                    sb.append(" ").append(schemeToString(args.get(i)));
+                }
+                throw new SchemeRaisedException(sb.toString());
+            }
             if ("values".equals(name)) {
                 if (args.size() == 1) return k.apply(args.get(0));
                 return k.apply(new SchemeValues(args));
@@ -1526,6 +1647,18 @@ public class Evaluator {
     @SuppressWarnings("unchecked")
     private Object toSchemeValue(Object parsed) {
         if (parsed instanceof List<?> list) {
+            // Handle dotted pair notation: (a b . c) -> improper list
+            int dotIdx = -1;
+            for (int i = 0; i < list.size(); i++) {
+                if (".".equals(symName(list.get(i)))) { dotIdx = i; break; }
+            }
+            if (dotIdx >= 0 && dotIdx == list.size() - 2) {
+                Object result = toSchemeValue(list.get(list.size() - 1));
+                for (int i = dotIdx - 1; i >= 0; i--) {
+                    result = new Pair(toSchemeValue(list.get(i)), result);
+                }
+                return result;
+            }
             Object result = Empty.NIL;
             for (int i = list.size() - 1; i >= 0; i--) {
                 result = new Pair(toSchemeValue(list.get(i)), result);
