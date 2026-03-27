@@ -457,6 +457,11 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
     return { tag: 'boolean', val: args[0].tag === 'symbol' };
   }});
 
+  envSet(env, 'procedure?', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1) throw new EvalError('procedure? requires 1 argument');
+    return { tag: 'boolean', val: args[0].tag === 'procedure' };
+  }});
+
   // I/O
   const displayVal = (v: SchemeVal): string => {
     switch (v.tag) {
@@ -871,6 +876,7 @@ function makeVariadicClosure(fixed: string[], rest: string, body: SchemeVal[], c
 const SPECIAL_FORMS = new Set([
   'quote', 'if', 'define', 'set!', 'lambda', 'begin', 'let', 'let*', 'letrec',
   'cond', 'and', 'or', 'define-syntax', 'syntax-rules', 'define-record-type',
+  'case-lambda',
 ]);
 
 let gensymCounter = 0;
@@ -1210,6 +1216,51 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             let result: SchemeVal = { tag: 'void' };
             for (const expr of body) result = evaluate(expr, local);
             return result;
+          }};
+        }
+
+        if (name === 'case-lambda') {
+          // (case-lambda (params body...) ...)
+          if (elems.length < 2) throw new EvalError(`${epos}: case-lambda requires at least one clause`);
+          const clauses: { fixed: string[]; rest: string | null; body: SchemeVal[]; }[] = [];
+          for (let i = 1; i < elems.length; i++) {
+            const clause = elems[i];
+            if (clause.tag !== 'list' || clause.val.length < 2)
+              throw new EvalError(`${epos}: case-lambda: invalid clause`);
+            const paramList = clause.val[0];
+            if (paramList.tag === 'symbol') {
+              // rest-only: (args body...)
+              clauses.push({ fixed: [], rest: paramList.val, body: clause.val.slice(1) });
+            } else if (paramList.tag !== 'list') {
+              throw new EvalError(`${epos}: case-lambda: params must be a list or symbol`);
+            } else {
+              const { fixed, rest } = parseParams(paramList.val, epos);
+              clauses.push({ fixed, rest, body: clause.val.slice(1) });
+            }
+          }
+          const closedEnv = env;
+          return { tag: 'procedure' as const, val: (args: SchemeVal[]) => {
+            for (const c of clauses) {
+              if (c.rest !== null) {
+                if (args.length >= c.fixed.length) {
+                  const local = makeEnv(closedEnv);
+                  for (let i = 0; i < c.fixed.length; i++) envSet(local, c.fixed[i], args[i]);
+                  envSet(local, c.rest, arrayToList(args.slice(c.fixed.length)));
+                  let result: SchemeVal = { tag: 'void' };
+                  for (const expr of c.body) result = evaluate(expr, local);
+                  return result;
+                }
+              } else {
+                if (args.length === c.fixed.length) {
+                  const local = makeEnv(closedEnv);
+                  for (let i = 0; i < c.fixed.length; i++) envSet(local, c.fixed[i], args[i]);
+                  let result: SchemeVal = { tag: 'void' };
+                  for (const expr of c.body) result = evaluate(expr, local);
+                  return result;
+                }
+              }
+            }
+            throw new EvalError(`${epos}: case-lambda: no matching clause for ${args.length} args`);
           }};
         }
 
