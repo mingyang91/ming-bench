@@ -43,6 +43,7 @@ type Value =
   | UserProc;
 
 type BindingSpec = { name: string; init: Expr };
+type Cell = { value: Value };
 
 const EMPTY_LIST: EmptyList = { kind: 'empty-list' };
 const VOID: VoidValue = { kind: 'void' };
@@ -61,21 +62,37 @@ class OutputBuffer {
 }
 
 class Env {
-  private readonly bindings = new Map<string, Value>();
+  private readonly bindings = new Map<string, Cell>();
 
   constructor(private readonly parent?: Env) {}
 
   define(name: string, value: Value): void {
-    this.bindings.set(name, value);
+    this.bindings.set(name, { value });
   }
 
   lookup(name: string): Value {
-    if (this.bindings.has(name)) {
-      return this.bindings.get(name)!;
+    const cell = this.bindings.get(name);
+    if (cell !== undefined) {
+      return cell.value;
     }
 
     if (this.parent !== undefined) {
       return this.parent.lookup(name);
+    }
+
+    throw new EvalError(`unbound symbol: ${name}`);
+  }
+
+  set(name: string, value: Value): void {
+    const cell = this.bindings.get(name);
+    if (cell !== undefined) {
+      cell.value = value;
+      return;
+    }
+
+    if (this.parent !== undefined) {
+      this.parent.set(name, value);
+      return;
     }
 
     throw new EvalError(`unbound symbol: ${name}`);
@@ -489,6 +506,8 @@ function evalList(items: Expr[], env: Env): Value {
         return evalOr(items.slice(1), env);
       case 'quote':
         return evalQuote(items.slice(1));
+      case 'set!':
+        return evalSet(items.slice(1), env);
     }
   }
 
@@ -645,6 +664,18 @@ function evalNamedLet(name: string, bindingsExpr: Expr, body: Expr[], env: Env):
 function evalQuote(args: Expr[]): Value {
   assertExactArity('quote', args, 1);
   return quoteExpr(args[0]!);
+}
+
+function evalSet(args: Expr[], env: Env): Value {
+  assertExactArity('set!', args, 2);
+
+  const target = args[0]!;
+  if (target.kind !== 'symbol') {
+    throw new EvalError('set! expects a symbol name');
+  }
+
+  env.set(target.name, evalExpr(args[1]!, env));
+  return VOID;
 }
 
 function parseParams(items: Expr[]): string[] {

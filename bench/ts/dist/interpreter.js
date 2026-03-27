@@ -18,14 +18,27 @@ class Env {
         this.parent = parent;
     }
     define(name, value) {
-        this.bindings.set(name, value);
+        this.bindings.set(name, { value });
     }
     lookup(name) {
-        if (this.bindings.has(name)) {
-            return this.bindings.get(name);
+        const cell = this.bindings.get(name);
+        if (cell !== undefined) {
+            return cell.value;
         }
         if (this.parent !== undefined) {
             return this.parent.lookup(name);
+        }
+        throw new EvalError(`unbound symbol: ${name}`);
+    }
+    set(name, value) {
+        const cell = this.bindings.get(name);
+        if (cell !== undefined) {
+            cell.value = value;
+            return;
+        }
+        if (this.parent !== undefined) {
+            this.parent.set(name, value);
+            return;
         }
         throw new EvalError(`unbound symbol: ${name}`);
     }
@@ -384,6 +397,8 @@ function evalList(items, env) {
                 return evalOr(items.slice(1), env);
             case 'quote':
                 return evalQuote(items.slice(1));
+            case 'set!':
+                return evalSet(items.slice(1), env);
         }
     }
     const proc = evalExpr(first, env);
@@ -511,6 +526,15 @@ function evalNamedLet(name, bindingsExpr, body, env) {
 function evalQuote(args) {
     assertExactArity('quote', args, 1);
     return quoteExpr(args[0]);
+}
+function evalSet(args, env) {
+    assertExactArity('set!', args, 2);
+    const target = args[0];
+    if (target.kind !== 'symbol') {
+        throw new EvalError('set! expects a symbol name');
+    }
+    env.set(target.name, evalExpr(args[1], env));
+    return VOID;
 }
 function parseParams(items) {
     return items.map((item) => {
