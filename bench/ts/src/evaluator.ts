@@ -2,7 +2,7 @@ import { EvalError } from './evalError.js';
 
 // ── Types ──────────────────────────────────────────────────────────────
 
-type SchemeVal =
+type SchemeValBase =
   | { tag: 'number'; val: number }
   | { tag: 'boolean'; val: boolean }
   | { tag: 'string'; val: string }
@@ -12,6 +12,10 @@ type SchemeVal =
   | { tag: 'nil' }
   | { tag: 'procedure'; val: (args: SchemeVal[]) => SchemeVal }
   | { tag: 'void' };
+
+type SchemeVal = SchemeValBase & { pos?: string };
+
+type Token = { text: string; pos: string };
 
 const NIL: SchemeVal = { tag: 'nil' };
 
@@ -32,74 +36,83 @@ function quoteSyntax(val: SchemeVal): SchemeVal {
 
 // ── Parser ─────────────────────────────────────────────────────────────
 
-function tokenize(input: string): string[] {
-  const tokens: string[] = [];
+function tokenize(input: string): Token[] {
+  const tokens: Token[] = [];
   let i = 0;
+  let line = 1;
+  let col = 1;
+
+  function advance(): void {
+    if (input[i] === '\n') { line++; col = 1; } else { col++; }
+    i++;
+  }
+
   while (i < input.length) {
     const ch = input[i];
     // whitespace
-    if (/\s/.test(ch)) { i++; continue; }
+    if (/\s/.test(ch)) { advance(); continue; }
     // comment
-    if (ch === ';') { while (i < input.length && input[i] !== '\n') i++; continue; }
+    if (ch === ';') { while (i < input.length && input[i] !== '\n') advance(); continue; }
+    const startPos = `${line}:${col}`;
     // quote shorthand
-    if (ch === "'") { tokens.push("'"); i++; continue; }
+    if (ch === "'") { tokens.push({ text: "'", pos: startPos }); advance(); continue; }
     // parens
-    if (ch === '(' || ch === ')') { tokens.push(ch); i++; continue; }
+    if (ch === '(' || ch === ')') { tokens.push({ text: ch, pos: startPos }); advance(); continue; }
     // string literal
     if (ch === '"') {
       let s = '"';
-      i++;
+      advance();
       while (i < input.length && input[i] !== '"') {
-        if (input[i] === '\\') { s += input[i++]; }
-        s += input[i++];
+        if (input[i] === '\\') { s += input[i]; advance(); }
+        s += input[i]; advance();
       }
-      if (i < input.length) { s += '"'; i++; }
-      tokens.push(s);
+      if (i < input.length) { s += '"'; advance(); }
+      tokens.push({ text: s, pos: startPos });
       continue;
     }
     // #t, #f
     if (ch === '#' && i + 1 < input.length) {
-      if (input[i + 1] === 't') { tokens.push('#t'); i += 2; continue; }
-      if (input[i + 1] === 'f') { tokens.push('#f'); i += 2; continue; }
+      if (input[i + 1] === 't') { tokens.push({ text: '#t', pos: startPos }); advance(); advance(); continue; }
+      if (input[i + 1] === 'f') { tokens.push({ text: '#f', pos: startPos }); advance(); advance(); continue; }
     }
     // atom
     let atom = '';
     while (i < input.length && !/[\s()";]/.test(input[i])) {
-      atom += input[i++];
+      atom += input[i]; advance();
     }
-    tokens.push(atom);
+    tokens.push({ text: atom, pos: startPos });
   }
   return tokens;
 }
 
-function parse(tokens: string[], pos: { i: number }): SchemeVal {
+function parse(tokens: Token[], pos: { i: number }): SchemeVal {
   if (pos.i >= tokens.length) throw new EvalError('unexpected end of input');
   const tok = tokens[pos.i++];
 
-  if (tok === "'") {
+  if (tok.text === "'") {
     const quoted = parse(tokens, pos);
-    return { tag: 'list', val: [{ tag: 'symbol', val: 'quote' }, quoted] };
+    return { tag: 'list', val: [{ tag: 'symbol', val: 'quote', pos: tok.pos }, quoted], pos: tok.pos };
   }
-  if (tok === '(') {
+  if (tok.text === '(') {
     const elems: SchemeVal[] = [];
-    while (pos.i < tokens.length && tokens[pos.i] !== ')') {
+    while (pos.i < tokens.length && tokens[pos.i].text !== ')') {
       elems.push(parse(tokens, pos));
     }
-    if (pos.i >= tokens.length) throw new EvalError('missing closing paren');
+    if (pos.i >= tokens.length) throw new EvalError(`${tok.pos}: missing closing paren`);
     pos.i++; // skip ')'
-    return { tag: 'list', val: elems };
+    return { tag: 'list', val: elems, pos: tok.pos };
   }
-  if (tok === ')') throw new EvalError('unexpected )');
+  if (tok.text === ')') throw new EvalError(`${tok.pos}: unexpected )`);
   return parseAtom(tok);
 }
 
-function parseAtom(tok: string): SchemeVal {
-  if (tok === '#t') return { tag: 'boolean', val: true };
-  if (tok === '#f') return { tag: 'boolean', val: false };
-  if (tok.startsWith('"')) return { tag: 'string', val: tok.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\') };
-  const n = Number(tok);
-  if (!isNaN(n) && tok !== '') return { tag: 'number', val: n };
-  return { tag: 'symbol', val: tok };
+function parseAtom(tok: Token): SchemeVal {
+  if (tok.text === '#t') return { tag: 'boolean', val: true, pos: tok.pos };
+  if (tok.text === '#f') return { tag: 'boolean', val: false, pos: tok.pos };
+  if (tok.text.startsWith('"')) return { tag: 'string', val: tok.text.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\'), pos: tok.pos };
+  const n = Number(tok.text);
+  if (!isNaN(n) && tok.text !== '') return { tag: 'number', val: n, pos: tok.pos };
+  return { tag: 'symbol', val: tok.text, pos: tok.pos };
 }
 
 function parseAll(input: string): SchemeVal[] {
@@ -116,14 +129,14 @@ function parseAll(input: string): SchemeVal[] {
 
 type Env = { bindings: Map<string, SchemeVal>; parent: Env | null };
 
-function envLookup(env: Env, name: string): SchemeVal {
+function envLookup(env: Env, name: string, pos?: string): SchemeVal {
   let cur: Env | null = env;
   while (cur) {
     const val = cur.bindings.get(name);
     if (val !== undefined) return val;
     cur = cur.parent;
   }
-  throw new EvalError(`unbound variable: ${name}`);
+  throw new EvalError(`${pos ?? '?'}: unbound variable: ${name}`);
 }
 
 function envSet(env: Env, name: string, val: SchemeVal): void {
@@ -308,18 +321,19 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
       return expr;
 
     case 'symbol':
-      return envLookup(env, expr.val);
+      return envLookup(env, expr.val, expr.pos);
 
     case 'list': {
       const elems = expr.val;
-      if (elems.length === 0) throw new EvalError('empty application');
+      const epos = expr.pos ?? '?';
+      if (elems.length === 0) throw new EvalError(`${epos}: empty application`);
 
       // Special forms
       if (elems[0].tag === 'symbol') {
         const name = elems[0].val;
 
         if (name === 'quote') {
-          if (elems.length !== 2) throw new EvalError('quote requires 1 argument');
+          if (elems.length !== 2) throw new EvalError(`${epos}: quote requires 1 argument`);
           return quoteSyntax(elems[1]);
         }
 
@@ -336,19 +350,19 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           if (elems.length >= 4 && elems[1].tag === 'symbol') {
             const loopName = elems[1].val;
             const bindings = elems[2];
-            if (bindings.tag !== 'list') throw new EvalError('let bindings must be a list');
+            if (bindings.tag !== 'list') throw new EvalError(`${epos}: let bindings must be a list`);
             const params: string[] = [];
             const inits: SchemeVal[] = [];
             for (const b of bindings.val) {
               if (b.tag !== 'list' || b.val.length !== 2 || b.val[0].tag !== 'symbol')
-                throw new EvalError('invalid let binding');
+                throw new EvalError(`${epos}: invalid let binding`);
               params.push(b.val[0].val);
               inits.push(evaluate(b.val[1], env));
             }
             const body = elems.slice(3);
             const local = makeEnv(env);
             const loopProc: SchemeVal = { tag: 'procedure', val: (args: SchemeVal[]) => {
-              if (args.length !== params.length) throw new EvalError(`expected ${params.length} args, got ${args.length}`);
+              if (args.length !== params.length) throw new EvalError(`${epos}: expected ${params.length} args, got ${args.length}`);
               const inner = makeEnv(local);
               for (let i = 0; i < params.length; i++) envSet(inner, params[i], args[i]);
               let result: SchemeVal = { tag: 'void' };
@@ -359,13 +373,13 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             return loopProc.val(inits);
           }
           // Regular let
-          if (elems.length < 3) throw new EvalError('let requires bindings and body');
+          if (elems.length < 3) throw new EvalError(`${epos}: let requires bindings and body`);
           const bindings = elems[1];
-          if (bindings.tag !== 'list') throw new EvalError('let bindings must be a list');
+          if (bindings.tag !== 'list') throw new EvalError(`${epos}: let bindings must be a list`);
           const local = makeEnv(env);
           for (const b of bindings.val) {
             if (b.tag !== 'list' || b.val.length !== 2 || b.val[0].tag !== 'symbol')
-              throw new EvalError('invalid let binding');
+              throw new EvalError(`${epos}: invalid let binding`);
             envSet(local, b.val[0].val, evaluate(b.val[1], env));
           }
           let result: SchemeVal = { tag: 'void' };
@@ -378,7 +392,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         if (name === 'cond') {
           for (let i = 1; i < elems.length; i++) {
             const clause = elems[i];
-            if (clause.tag !== 'list' || clause.val.length < 2) throw new EvalError('invalid cond clause');
+            if (clause.tag !== 'list' || clause.val.length < 2) throw new EvalError(`${epos}: invalid cond clause`);
             if (clause.val[0].tag === 'symbol' && clause.val[0].val === 'else') {
               let result: SchemeVal = { tag: 'void' };
               for (let j = 1; j < clause.val.length; j++) result = evaluate(clause.val[j], env);
@@ -395,7 +409,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         }
 
         if (name === 'if') {
-          if (elems.length < 3 || elems.length > 4) throw new EvalError('if requires 2 or 3 arguments');
+          if (elems.length < 3 || elems.length > 4) throw new EvalError(`${epos}: if requires 2 or 3 arguments`);
           const cond = evaluate(elems[1], env);
           if (isTruthy(cond)) return evaluate(elems[2], env);
           if (elems.length === 4) return evaluate(elems[3], env);
@@ -403,7 +417,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         }
 
         if (name === 'define') {
-          if (elems.length < 3) throw new EvalError('define requires at least 2 arguments');
+          if (elems.length < 3) throw new EvalError(`${epos}: define requires at least 2 arguments`);
           if (elems[1].tag === 'symbol') {
             // (define x expr)
             const val = evaluate(elems[2], env);
@@ -414,12 +428,12 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             // (define (f params...) body...)
             const fname = elems[1].val[0].val;
             const params = elems[1].val.slice(1).map(p => {
-              if (p.tag !== 'symbol') throw new EvalError('parameter must be a symbol');
+              if (p.tag !== 'symbol') throw new EvalError(`${epos}: parameter must be a symbol`);
               return p.val;
             });
             const body = elems.slice(2);
             const closure: SchemeVal = { tag: 'procedure', val: (args: SchemeVal[]) => {
-              if (args.length !== params.length) throw new EvalError(`expected ${params.length} args, got ${args.length}`);
+              if (args.length !== params.length) throw new EvalError(`${epos}: expected ${params.length} args, got ${args.length}`);
               const local = makeEnv(env);
               for (let i = 0; i < params.length; i++) envSet(local, params[i], args[i]);
               let result: SchemeVal = { tag: 'void' };
@@ -429,21 +443,21 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             envSet(env, fname, closure);
             return { tag: 'void' };
           }
-          throw new EvalError('invalid define');
+          throw new EvalError(`${epos}: invalid define`);
         }
 
         if (name === 'lambda') {
-          if (elems.length < 3) throw new EvalError('lambda requires params and body');
+          if (elems.length < 3) throw new EvalError(`${epos}: lambda requires params and body`);
           const paramList = elems[1];
-          if (paramList.tag !== 'list') throw new EvalError('lambda params must be a list');
+          if (paramList.tag !== 'list') throw new EvalError(`${epos}: lambda params must be a list`);
           const params = paramList.val.map(p => {
-            if (p.tag !== 'symbol') throw new EvalError('parameter must be a symbol');
+            if (p.tag !== 'symbol') throw new EvalError(`${epos}: parameter must be a symbol`);
             return p.val;
           });
           const body = elems.slice(2);
           const closedEnv = env;
           return { tag: 'procedure', val: (args: SchemeVal[]) => {
-            if (args.length !== params.length) throw new EvalError(`expected ${params.length} args, got ${args.length}`);
+            if (args.length !== params.length) throw new EvalError(`${epos}: expected ${params.length} args, got ${args.length}`);
             const local = makeEnv(closedEnv);
             for (let i = 0; i < params.length; i++) envSet(local, params[i], args[i]);
             let result: SchemeVal = { tag: 'void' };
@@ -475,13 +489,20 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
 
       // Procedure application
       const proc = evaluate(elems[0], env);
-      if (proc.tag !== 'procedure') throw new EvalError('not a procedure');
+      if (proc.tag !== 'procedure') throw new EvalError(`${epos}: not a procedure`);
       const args = elems.slice(1).map(a => evaluate(a, env));
-      return proc.val(args);
+      try {
+        return proc.val(args);
+      } catch (e) {
+        if (e instanceof EvalError && !/^\d/.test(e.message)) {
+          throw new EvalError(`${epos}: ${e.message}`);
+        }
+        throw e;
+      }
     }
 
     default:
-      throw new EvalError('cannot evaluate');
+      throw new EvalError(`${expr.pos ?? '?'}: cannot evaluate`);
   }
 }
 
