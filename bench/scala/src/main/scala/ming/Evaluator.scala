@@ -48,6 +48,8 @@ object Evaluator:
         evalQuote(args, formPos)
       case Expr.Symbol("lambda", formPos) :: args =>
         evalLambda(args, env, formPos)
+      case Expr.Symbol("set!", formPos) :: args =>
+        evalSet(args, env, formPos, context)
       case Expr.Symbol("begin", _) :: args =>
         evalBegin(args, env, context)
       case Expr.Symbol("let", formPos) :: args =>
@@ -98,6 +100,15 @@ object Evaluator:
         Value.Closure(name = None, params = parseParameterNames(paramsExpr), body = body, env = env)
       case _ =>
         throw EvalError.at(pos, "lambda expects parameters and at least one body expression")
+
+  private def evalSet(args: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
+    args match
+      case Expr.Symbol(name, symbolPos) :: valueExpr :: Nil =>
+        val value = eval(valueExpr, env, context)
+        if env.assign(name, value) then Value.Void
+        else throw EvalError.at(symbolPos, s"unbound variable: $name")
+      case _ =>
+        throw EvalError.at(pos, "invalid set!")
 
   private def evalBegin(args: List[Expr], env: Env, context: EvalContext): Value =
     evalSequence(args, env, context)

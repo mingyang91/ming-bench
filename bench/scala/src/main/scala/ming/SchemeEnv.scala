@@ -13,6 +13,12 @@ final private[ming] class Env private (
   def define(name: String, value: Value): Unit =
     bindings.update(name, value)
 
+  def assign(name: String, value: Value): Boolean =
+    if bindings.contains(name) then
+      bindings.update(name, value)
+      true
+    else parent.exists(_.assign(name, value))
+
   def lookup(name: String): Option[Value] =
     bindings
       .get(name)
