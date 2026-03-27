@@ -97,6 +97,9 @@ public class Evaluator {
     // Lambda (closure) — restParam is non-null for variadic (dot notation)
     record Lambda(List<String> params, String restParam, List<Object> body, Env env) {}
 
+    // case-lambda: multiple clauses with different arities
+    record CaseLambda(List<Lambda> clauses) {}
+
     // Record types
     static class RecordType {
         final String name;
@@ -121,7 +124,7 @@ public class Evaluator {
     record SyntaxRules(List<String> literals, List<List<Object>> patterns, List<Object> templates, Env defEnv) {}
 
     private static final Set<String> MACRO_SPECIAL_FORMS = Set.of(
-        "quote", "if", "define", "lambda", "and", "begin", "let", "cond", "set!", "or",
+        "quote", "if", "define", "lambda", "case-lambda", "and", "begin", "let", "cond", "set!", "or",
         "define-syntax", "syntax-rules"
     );
 
@@ -156,7 +159,8 @@ public class Evaluator {
                 "string=?", "string<?", "string-ci=?",
                 "string-upcase", "string-downcase",
                 "exact?", "inexact?", "exact->inexact", "inexact->exact",
-                "numerator", "denominator", "integer?", "rational?")) {
+                "numerator", "denominator", "integer?", "rational?",
+                "procedure?")) {
             env.define(name, "builtin:" + name);
         }
         return env;
@@ -176,6 +180,7 @@ public class Evaluator {
         if (val == Empty.NIL) return "()";
         if (val instanceof Pair p) return pairToString(p, true);
         if (val instanceof Lambda) return "#<procedure>";
+        if (val instanceof CaseLambda) return "#<procedure>";
         if (val instanceof SyntaxRules) return "#<syntax>";
         if (val instanceof SchemeRecord) return "#<record>";
         if (val instanceof java.util.function.Function) return "#<procedure>";
@@ -194,6 +199,7 @@ public class Evaluator {
         if (val == Empty.NIL) return "()";
         if (val instanceof Pair p) return pairToString(p, false);
         if (val instanceof Lambda) return "#<procedure>";
+        if (val instanceof CaseLambda) return "#<procedure>";
         if (val instanceof SchemeRecord) return "#<record>";
         if (val instanceof java.util.function.Function) return "#<procedure>";
         return val.toString();
@@ -489,6 +495,36 @@ public class Evaluator {
                         List<Object> body = new ArrayList<>();
                         for (int i = 2; i < list.size(); i++) body.add(list.get(i));
                         return new Lambda(params, restParam, body, env);
+                    }
+                    case "case-lambda" -> {
+                        if (list.size() < 2) throw errAt(eline, ecol, "case-lambda: bad syntax");
+                        List<Lambda> clauses = new ArrayList<>();
+                        for (int ci = 1; ci < list.size(); ci++) {
+                            if (!(list.get(ci) instanceof List<?> clause) || clause.size() < 2)
+                                throw errAt(eline, ecol, "case-lambda: bad clause");
+                            if (!(clause.get(0) instanceof List<?> paramList))
+                                throw errAt(eline, ecol, "case-lambda: bad clause");
+                            List<String> cparams = new ArrayList<>();
+                            String crest = null;
+                            for (int pi = 0; pi < paramList.size(); pi++) {
+                                String pname = symName(paramList.get(pi));
+                                if (pname == null)
+                                    throw errAt(eline, ecol, "case-lambda: parameter must be a symbol");
+                                if (".".equals(pname)) {
+                                    if (pi + 2 != paramList.size())
+                                        throw errAt(eline, ecol, "case-lambda: bad dot syntax");
+                                    crest = symName(paramList.get(pi + 1));
+                                    if (crest == null)
+                                        throw errAt(eline, ecol, "case-lambda: parameter must be a symbol");
+                                    break;
+                                }
+                                cparams.add(pname);
+                            }
+                            List<Object> cbody = new ArrayList<>();
+                            for (int bi = 1; bi < clause.size(); bi++) cbody.add(clause.get(bi));
+                            clauses.add(new Lambda(cparams, crest, cbody, env));
+                        }
+                        return new CaseLambda(clauses);
                     }
                     case "and" -> {
                         Object result = Boolean.TRUE;
@@ -787,6 +823,20 @@ public class Evaluator {
                 result = eval(bodyExpr, callEnv);
             }
             return result;
+        }
+        if (proc instanceof CaseLambda cl) {
+            for (Lambda clause : cl.clauses()) {
+                if (clause.restParam() != null) {
+                    if (args.size() >= clause.params().size()) {
+                        return apply(clause, args);
+                    }
+                } else {
+                    if (args.size() == clause.params().size()) {
+                        return apply(clause, args);
+                    }
+                }
+            }
+            throw new EvalError("case-lambda: no matching clause for " + args.size() + " arguments");
         }
         throw new EvalError("not a procedure: " + schemeToString(proc));
     }
@@ -1508,6 +1558,13 @@ public class Evaluator {
             case "rational?" -> {
                 checkMinArgs(args, 1, "rational?");
                 yield isExact(args.get(0));
+            }
+            case "procedure?" -> {
+                checkMinArgs(args, 1, "procedure?");
+                Object a = args.get(0);
+                yield a instanceof Lambda || a instanceof CaseLambda
+                    || (a instanceof String s && s.startsWith("builtin:"))
+                    || a instanceof java.util.function.Function;
             }
             default -> throw new EvalError("unbound variable: " + name);
         };
