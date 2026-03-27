@@ -423,6 +423,7 @@ public class Evaluator {
 
     @SuppressWarnings("unchecked")
     private Object eval(Object expr, Env env) throws EvalError {
+      TCO: while (true) { // TCO trampoline loop
         if (expr instanceof Long || expr instanceof Double || expr instanceof SchemeRational || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar || expr instanceof SchemeVector) {
             return expr;
         }
@@ -455,9 +456,9 @@ public class Evaluator {
                         if (list.size() < 3 || list.size() > 4) throw errAt(eline, ecol, "if: bad syntax");
                         Object cond = eval(list.get(1), env);
                         if (!isFalse(cond)) {
-                            return eval(list.get(2), env);
+                            expr = list.get(2); continue TCO; // TCO
                         } else if (list.size() == 4) {
-                            return eval(list.get(3), env);
+                            expr = list.get(3); continue TCO; // TCO
                         }
                         return VOID;
                     }
@@ -552,19 +553,19 @@ public class Evaluator {
                         return new CaseLambda(clauses);
                     }
                     case "and" -> {
-                        Object result = Boolean.TRUE;
-                        for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i), env);
+                        if (list.size() == 1) return Boolean.TRUE;
+                        for (int i = 1; i < list.size() - 1; i++) {
+                            Object result = eval(list.get(i), env);
                             if (isFalse(result)) return result;
                         }
-                        return result;
+                        expr = list.get(list.size() - 1); continue TCO; // TCO
                     }
                     case "begin" -> {
-                        Object result = VOID;
-                        for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i), env);
+                        if (list.size() == 1) return VOID;
+                        for (int i = 1; i < list.size() - 1; i++) {
+                            eval(list.get(i), env);
                         }
-                        return result;
+                        expr = list.get(list.size() - 1); continue TCO; // TCO
                     }
                     case "let" -> {
                         if (list.size() < 3) throw errAt(eline, ecol, "let: bad syntax");
@@ -589,8 +590,15 @@ public class Evaluator {
                             Env letEnv = new Env(env);
                             Lambda loopLam = new Lambda(params, null, body, letEnv);
                             letEnv.define(secondName, loopLam);
-                            List<Object> args = new ArrayList<>(inits);
-                            return apply(loopLam, args);
+                            // Inline lambda application for TCO
+                            Env callEnv = new Env(letEnv);
+                            for (int i = 0; i < params.size(); i++) {
+                                callEnv.define(params.get(i), inits.get(i));
+                            }
+                            for (int i = 0; i < body.size() - 1; i++) {
+                                eval(body.get(i), callEnv);
+                            }
+                            expr = body.get(body.size() - 1); env = callEnv; continue TCO; // TCO
                         }
                         // Regular let
                         List<?> bindings = (List<?>) second;
@@ -602,11 +610,10 @@ public class Evaluator {
                                 throw errAt(eline, ecol, "let: bad binding");
                             letEnv.define(bname, eval(binding.get(1), env));
                         }
-                        Object result = VOID;
-                        for (int i = 2; i < list.size(); i++) {
-                            result = eval(list.get(i), letEnv);
+                        for (int i = 2; i < list.size() - 1; i++) {
+                            eval(list.get(i), letEnv);
                         }
-                        return result;
+                        expr = list.get(list.size() - 1); env = letEnv; continue TCO; // TCO
                     }
                     case "cond" -> {
                         for (int i = 1; i < list.size(); i++) {
@@ -615,20 +622,19 @@ public class Evaluator {
                             Object test = clause.get(0);
                             String testSym = symName(test);
                             if ("else".equals(testSym)) {
-                                Object result = VOID;
-                                for (int j = 1; j < clause.size(); j++) {
-                                    result = eval(clause.get(j), env);
+                                for (int j = 1; j < clause.size() - 1; j++) {
+                                    eval(clause.get(j), env);
                                 }
-                                return result;
+                                if (clause.size() > 1) { expr = clause.get(clause.size() - 1); continue TCO; }
+                                return VOID;
                             }
                             Object val = eval(test, env);
                             if (!isFalse(val)) {
                                 if (clause.size() == 1) return val;
-                                Object result = VOID;
-                                for (int j = 1; j < clause.size(); j++) {
-                                    result = eval(clause.get(j), env);
+                                for (int j = 1; j < clause.size() - 1; j++) {
+                                    eval(clause.get(j), env);
                                 }
-                                return result;
+                                expr = clause.get(clause.size() - 1); continue TCO;
                             }
                         }
                         return VOID;
@@ -652,12 +658,12 @@ public class Evaluator {
                         throw errAt(tline, tcol, "set!: unbound variable: " + tname);
                     }
                     case "or" -> {
-                        Object result = Boolean.FALSE;
-                        for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i), env);
+                        if (list.size() == 1) return Boolean.FALSE;
+                        for (int i = 1; i < list.size() - 1; i++) {
+                            Object result = eval(list.get(i), env);
                             if (!isFalse(result)) return result;
                         }
-                        return result;
+                        expr = list.get(list.size() - 1); continue TCO; // TCO
                     }
                     case "define-record-type" -> {
                         // (define-record-type <name> (constructor field...) predicate (field accessor)...)
@@ -719,7 +725,6 @@ public class Evaluator {
                         if (!(list.get(1) instanceof List<?> bindings))
                             throw errAt(eline, ecol, "letrec: bad syntax");
                         Env letrecEnv = new Env(env);
-                        // First define all variables as uninitialized
                         List<String> names = new ArrayList<>();
                         for (Object b : bindings) {
                             List<?> binding = (List<?>) b;
@@ -729,18 +734,16 @@ public class Evaluator {
                             names.add(bname);
                             letrecEnv.define(bname, VOID);
                         }
-                        // Evaluate init expressions in the letrec env
                         int idx = 0;
                         for (Object b : bindings) {
                             List<?> binding = (List<?>) b;
                             letrecEnv.define(names.get(idx), eval(binding.get(1), letrecEnv));
                             idx++;
                         }
-                        Object result = VOID;
-                        for (int i = 2; i < list.size(); i++) {
-                            result = eval(list.get(i), letrecEnv);
+                        for (int i = 2; i < list.size() - 1; i++) {
+                            eval(list.get(i), letrecEnv);
                         }
-                        return result;
+                        expr = list.get(list.size() - 1); env = letrecEnv; continue TCO; // TCO
                     }
                     case "letrec*" -> {
                         if (list.size() < 3) throw errAt(eline, ecol, "letrec*: bad syntax");
@@ -754,11 +757,10 @@ public class Evaluator {
                                 throw errAt(eline, ecol, "letrec*: bad binding");
                             letrecEnv.define(bname, eval(binding.get(1), letrecEnv));
                         }
-                        Object result = VOID;
-                        for (int i = 2; i < list.size(); i++) {
-                            result = eval(list.get(i), letrecEnv);
+                        for (int i = 2; i < list.size() - 1; i++) {
+                            eval(list.get(i), letrecEnv);
                         }
-                        return result;
+                        expr = list.get(list.size() - 1); env = letrecEnv; continue TCO; // TCO
                     }
                     case "case" -> {
                         if (list.size() < 2) throw errAt(eline, ecol, "case: bad syntax");
@@ -769,22 +771,22 @@ public class Evaluator {
                             Object datums = clause.get(0);
                             String dSym = symName(datums);
                             if ("else".equals(dSym)) {
-                                Object result = VOID;
-                                for (int j = 1; j < clause.size(); j++) {
-                                    result = eval(clause.get(j), env);
+                                for (int j = 1; j < clause.size() - 1; j++) {
+                                    eval(clause.get(j), env);
                                 }
-                                return result;
+                                if (clause.size() > 1) { expr = clause.get(clause.size() - 1); continue TCO; }
+                                return VOID;
                             }
                             if (!(datums instanceof List<?> datumList))
                                 throw errAt(eline, ecol, "case: bad clause");
                             for (Object d : datumList) {
                                 Object datum = toSchemeValue(d);
                                 if (schemeEqv(key, datum)) {
-                                    Object result = VOID;
-                                    for (int j = 1; j < clause.size(); j++) {
-                                        result = eval(clause.get(j), env);
+                                    for (int j = 1; j < clause.size() - 1; j++) {
+                                        eval(clause.get(j), env);
                                     }
-                                    return result;
+                                    if (clause.size() > 1) { expr = clause.get(clause.size() - 1); continue TCO; }
+                                    return VOID;
                                 }
                             }
                         }
@@ -893,6 +895,45 @@ public class Evaluator {
             for (int i = 1; i < list.size(); i++) {
                 args.add(eval(list.get(i), env));
             }
+            // Inline Lambda/CaseLambda for TCO
+            if (proc instanceof CaseLambda cl) {
+                Lambda matched = null;
+                for (Lambda clause : cl.clauses()) {
+                    if (clause.restParam() != null) {
+                        if (args.size() >= clause.params().size()) { matched = clause; break; }
+                    } else {
+                        if (args.size() == clause.params().size()) { matched = clause; break; }
+                    }
+                }
+                if (matched == null) throw new EvalError("case-lambda: no matching clause for " + args.size() + " arguments");
+                proc = matched;
+            }
+            if (proc instanceof Lambda lam) {
+                if (lam.restParam() != null) {
+                    if (args.size() < lam.params().size())
+                        throw new EvalError("wrong number of arguments: expected at least " + lam.params().size() + ", got " + args.size());
+                } else {
+                    if (args.size() != lam.params().size())
+                        throw new EvalError("wrong number of arguments: expected " + lam.params().size() + ", got " + args.size());
+                }
+                Env callEnv = new Env(lam.env());
+                for (int i = 0; i < lam.params().size(); i++) {
+                    callEnv.define(lam.params().get(i), args.get(i));
+                }
+                if (lam.restParam() != null) {
+                    Object rest = Empty.NIL;
+                    for (int i = args.size() - 1; i >= lam.params().size(); i--) {
+                        rest = new Pair(args.get(i), rest);
+                    }
+                    callEnv.define(lam.restParam(), rest);
+                }
+                for (int i = 0; i < lam.body().size() - 1; i++) {
+                    eval(lam.body().get(i), callEnv);
+                }
+                expr = lam.body().get(lam.body().size() - 1);
+                env = callEnv;
+                continue TCO; // TCO
+            }
             try {
                 return apply(proc, args);
             } catch (EvalError e) {
@@ -903,6 +944,7 @@ public class Evaluator {
             }
         }
         throw new EvalError("cannot evaluate: " + expr);
+      } // end TCO trampoline loop
     }
 
     // Convert parsed data to Scheme values (for quote)
