@@ -25,6 +25,7 @@ private[ming] object Builtins:
     "boolean?",
     "symbol?",
     "char?",
+    "procedure?",
     "eq?",
     "equal?",
     "abs",
@@ -79,7 +80,7 @@ private[ming] object Builtins:
       case "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?" | "char<?" =>
         invokeCharBuiltin(name, args, pos)
       case "null?" | "pair?" | "number?" | "exact?" | "inexact?" | "integer?" | "rational?" | "string?" | "boolean?" |
-          "symbol?" | "char?" =>
+          "symbol?" | "char?" | "procedure?" =>
         invokePredicateBuiltin(name, args, pos)
       case builtin if OutputBuiltins.handles(builtin) =>
         OutputBuiltins.invoke(builtin, args, pos, context)
@@ -251,6 +252,8 @@ private[ming] object Builtins:
           case Value.CharVal(_) => true
           case _                => false
         }
+      case "procedure?" =>
+        unaryPredicate(name, args, pos)(ValueSemantics.isProcedure)
       case _ =>
         unknownProcedure(name, pos)
 

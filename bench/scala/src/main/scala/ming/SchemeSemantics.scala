@@ -7,6 +7,14 @@ private[ming] object ValueSemantics:
       case Value.BoolVal(false) => false
       case _                    => true
 
+  def isProcedure(value: Value): Boolean =
+    value match
+      case Value.BuiltinProc(_) | Value.RecordConstructor(_) | Value.RecordPredicate(_) |
+          Value.RecordAccessor(_, _, _) | Value.CaseClosure(_, _, _) | Value.Closure(_, _, _, _, _) =>
+        true
+      case _ =>
+        false
+
   def typeName(value: Value): String =
     value match
       case Value.IntVal(_) | Value.RationalVal(_, _) | Value.InexactVal(_) =>
@@ -18,7 +26,7 @@ private[ming] object ValueSemantics:
       case Value.EmptyList     => "null"
       case Value.PairVal(_, _) => "pair"
       case Value.BuiltinProc(_) | Value.RecordConstructor(_) | Value.RecordPredicate(_) |
-          Value.RecordAccessor(_, _, _) | Value.Closure(_, _, _, _, _) =>
+          Value.RecordAccessor(_, _, _) | Value.CaseClosure(_, _, _) | Value.Closure(_, _, _, _, _) =>
         "procedure"
       case Value.RecordVal(_) => "record"
       case Value.Void         => "void"
@@ -70,6 +78,11 @@ private[ming] object ValueSemantics:
           case (
                 leftClosure @ Value.Closure(_, _, _, _, _),
                 rightClosure @ Value.Closure(_, _, _, _, _)
+              ) =>
+            leftClosure eq rightClosure
+          case (
+                leftClosure @ Value.CaseClosure(_, _, _),
+                rightClosure @ Value.CaseClosure(_, _, _)
               ) =>
             leftClosure eq rightClosure
           case _ =>

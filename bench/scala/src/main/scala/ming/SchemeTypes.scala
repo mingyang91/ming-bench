@@ -27,6 +27,7 @@ private[ming] enum Value:
   case RecordPredicate(recordType: RecordType)
   case RecordAccessor(recordType: RecordType, fieldIndex: Int, name: String)
   case RecordVal(instance: RecordInstance)
+  case CaseClosure(name: Option[String], clauses: List[CaseLambdaClause], env: Env)
 
   case Closure(
     name: Option[String],
@@ -63,6 +64,17 @@ final private[ming] case class RecordFieldSpec(
   fieldName: String,
   accessorName: String
 )
+
+final private[ming] case class CaseLambdaClause(
+  params: List[String],
+  restParam: Option[String],
+  body: List[Expr]
+):
+
+  def matchesArgCount(actualArgCount: Int): Boolean =
+    restParam match
+      case Some(_) => actualArgCount >= params.length
+      case None    => actualArgCount == params.length
 
 final private[ming] class RecordType(
   val typeName: String,
