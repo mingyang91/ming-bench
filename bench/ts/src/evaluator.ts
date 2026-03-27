@@ -25,7 +25,9 @@ type SchemeValBase =
   | { tag: 'guardExn'; val: SchemeVal }
   | { tag: 'case-closure'; clauses: { params: string[]; rest: string | null; body: SchemeVal[] }[]; closedEnv: Env }
   | { tag: 'values'; vals: SchemeVal[] }
-  | { tag: 'callWithValues' };
+  | { tag: 'callWithValues' }
+  | { tag: 'macro-proc'; proc: SchemeVal }
+  | { tag: 'syntax-object'; form: SchemeVal; hygieneBindings: Map<string, SchemeVal> };
 
 type Winder = { inThunk: SchemeVal; outThunk: SchemeVal };
 
@@ -63,6 +65,9 @@ type Cont =
   | { tag: 'guardK'; varName: string; clauses: SchemeVal[]; env: Env; epos: string; next: Cont }
   | { tag: 'raiseReturnK'; next: Cont }
   | { tag: 'cwvK'; consumer: SchemeVal; epos: string; next: Cont }
+  | { tag: 'macroExpandK'; useEnv: Env; next: Cont }
+  | { tag: 'syntaxCaseK'; literals: string[]; clauses: SchemeVal[]; defEnv: Env; epos: string; next: Cont }
+  | { tag: 'withSyntaxK'; bindings: Bindings; rest: [SchemeVal, SchemeVal][]; body: SchemeVal[]; env: Env; epos: string; next: Cont }
   ;
 
 class ContinuationEscape { constructor(public k: Cont, public val: SchemeVal, public winders: Winder[]) {} }
@@ -246,8 +251,9 @@ function tokenize(input: string): Token[] {
       tokens.push({ text: s, pos: startPos });
       continue;
     }
-    // #t, #f, #\char
+    // #t, #f, #'expr, #\char
     if (ch === '#' && i + 1 < input.length) {
+      if (input[i + 1] === "'") { tokens.push({ text: "#'", pos: startPos }); advance(); advance(); continue; }
       if (input[i + 1] === 't') { tokens.push({ text: '#t', pos: startPos }); advance(); advance(); continue; }
       if (input[i + 1] === 'f') { tokens.push({ text: '#f', pos: startPos }); advance(); advance(); continue; }
       if (input[i + 1] === '\\') {
@@ -275,6 +281,10 @@ function parse(tokens: Token[], pos: { i: number }): SchemeVal {
   if (tok.text === "'") {
     const quoted = parse(tokens, pos);
     return { tag: 'list', val: [{ tag: 'symbol', val: 'quote', pos: tok.pos }, quoted], pos: tok.pos };
+  }
+  if (tok.text === "#'") {
+    const syntaxExpr = parse(tokens, pos);
+    return { tag: 'list', val: [{ tag: 'symbol', val: 'syntax', pos: tok.pos }, syntaxExpr], pos: tok.pos };
   }
   if (tok.text === '(') {
     const elems: SchemeVal[] = [];
@@ -666,6 +676,8 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
       }
       case 'list': return `(${v.val.map(x => displayVal(x, seen)).join(' ')})`;
       case 'macro': return '#<macro>';
+      case 'macro-proc': return '#<macro>';
+      case 'syntax-object': return '#<syntax>';
       case 'record': return '#<record>';
       case 'vector': return '#(' + v.val.map(x => displayVal(x, seen)).join(' ') + ')';
     }
@@ -1244,6 +1256,21 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
     return { tag: 'symbol', val: args[0].val };
   }});
 
+  // Syntax object operations
+  envSet(env, 'syntax->datum', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1) throw new EvalError('syntax->datum: expected 1 argument');
+    const v = args[0];
+    if ((v as any).tag === 'syntax-object') return (v as any).form;
+    return v;
+  }});
+
+  envSet(env, 'datum->syntax', { tag: 'procedure', val: (args) => {
+    if (args.length !== 2) throw new EvalError('datum->syntax: expected 2 arguments');
+    // First arg is template-id (context), second is datum
+    // In our simple implementation, just return the datum
+    return args[1];
+  }});
+
   // Vector operations
   envSet(env, 'vector', { tag: 'procedure', val: (args) => {
     return { tag: 'vector', val: [...args] };
@@ -1389,6 +1416,7 @@ const SPECIAL_FORMS = new Set([
   'cond', 'and', 'or', 'define-syntax', 'syntax-rules', 'define-record-type',
   'case-lambda', 'let*', 'letrec', 'letrec*', 'case', 'do',
   'call/cc', 'call-with-current-continuation',
+  'syntax-case', 'syntax', 'with-syntax',
 ]);
 
 let gensymCounter = 0;
@@ -1463,6 +1491,8 @@ function collectFreeSymbols(template: SchemeVal, patternVars: Set<string>, resul
       result.add(template.val);
     }
   } else if (template.tag === 'list') {
+    // Skip contents of (quote ...)
+    if (template.val.length >= 1 && template.val[0].tag === 'symbol' && template.val[0].val === 'quote') return;
     for (const elem of template.val) collectFreeSymbols(elem, patternVars, result);
   }
 }
@@ -1548,6 +1578,86 @@ function expandMacroToForm(transformer: MacroTransformer, form: SchemeVal, env: 
     }
   }
   throw new EvalError('no matching pattern for macro');
+}
+
+// ── syntax-case support ───────────────────────────────────────────────
+
+let syntaxBindingsStack: { bindings: Bindings; defEnv: Env }[] = [];
+
+function expandSyntaxTemplate(template: SchemeVal, defEnv: Env, useEnv: Env): SchemeVal {
+  // Merge all syntax bindings from the stack
+  const mergedBindings: Bindings = new Map();
+  for (const frame of syntaxBindingsStack) {
+    for (const [k, v] of frame.bindings) mergedBindings.set(k, v);
+  }
+
+  const patternVars = new Set(mergedBindings.keys());
+  const freeSyms = new Set<string>();
+  collectFreeSymbols(template, patternVars, freeSyms);
+
+  const renames = new Map<string, string>();
+  for (const sym of freeSyms) renames.set(sym, gensym(sym));
+
+  const expanded = expandTemplate(template, mergedBindings, renames);
+
+  // Build wrapper env for hygiene: renamed symbols get values from defEnv
+  const wrapperEnv = makeEnv(useEnv);
+  for (const [original, gensymName] of renames) {
+    try {
+      const val = envLookup(defEnv, original);
+      envSet(wrapperEnv, gensymName, val);
+    } catch {
+      // not bound in defEnv
+    }
+  }
+
+  return { ...expanded, _syntaxEnv: wrapperEnv } as any;
+}
+
+function syntaxCaseExpand(stxVal: SchemeVal, literals: string[], clauses: SchemeVal[], defEnv: Env, useEnv: Env, epos: string): { form: SchemeVal; env: Env } {
+  // stxVal is the syntax object to match
+  const formElems = stxVal.tag === 'list' ? stxVal.val : [stxVal];
+
+  for (const clause of clauses) {
+    if (clause.tag !== 'list' || clause.val.length < 2)
+      throw new EvalError(`${epos}: syntax-case: invalid clause`);
+    const pattern = clause.val[0];
+    const hasGuard = clause.val.length > 2;
+    const body = hasGuard ? clause.val[2] : clause.val[1];
+
+    const bindings: Bindings = new Map();
+    let matched = false;
+
+    if (pattern.tag === 'list') {
+      matched = matchPattern(pattern.val, formElems, bindings, literals);
+    } else if (pattern.tag === 'symbol') {
+      // single symbol pattern matches anything
+      bindings.set(pattern.val, stxVal);
+      matched = true;
+    } else {
+      matched = false;
+    }
+
+    if (matched) {
+      // Push bindings and evaluate the body
+      syntaxBindingsStack.push({ bindings, defEnv });
+      try {
+        // If the body is (syntax template), expand directly
+        if (body.tag === 'list' && body.val.length === 2 && body.val[0].tag === 'symbol' && body.val[0].val === 'syntax') {
+          const expanded = expandSyntaxTemplate(body.val[1], defEnv, useEnv);
+          const env = (expanded as any)._syntaxEnv || useEnv;
+          delete (expanded as any)._syntaxEnv;
+          return { form: expanded, env };
+        }
+        // Otherwise we need to evaluate the body - return it for CEK evaluation
+        // This handles with-syntax and other complex bodies
+        return { form: body, env: useEnv };
+      } finally {
+        syntaxBindingsStack.pop();
+      }
+    }
+  }
+  throw new EvalError(`${epos}: syntax-case: no matching pattern`);
 }
 
 function isFalsy(v: SchemeVal): boolean {
@@ -1661,6 +1771,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
       switch (c.tag) {
         case 'number': case 'boolean': case 'string': case 'char':
         case 'nil': case 'pair': case 'vector': case 'void':
+        case 'syntax-object': case 'macro-proc':
           m = 1; continue;
         case 'symbol':
           c = envLookup(e, c.val, c.pos); m = 1; continue;
@@ -1946,8 +2057,14 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
               if (elems[1].tag !== 'symbol') throw new EvalError(`${epos}: define-syntax: name must be a symbol`);
               const macroName = elems[1].val;
               const sr = elems[2];
+              // Check if it's (lambda ...) — procedural macro (syntax-case)
+              if (sr.tag === 'list' && sr.val.length >= 3 && sr.val[0].tag === 'symbol' && sr.val[0].val === 'lambda') {
+                // Evaluate the lambda to get a closure, then store as macro-proc
+                k = { tag: 'defK', name: macroName + '\x00macro-proc', env: e, next: k };
+                c = sr; continue;
+              }
               if (sr.tag !== 'list' || sr.val.length < 2 || sr.val[0].tag !== 'symbol' || sr.val[0].val !== 'syntax-rules')
-                throw new EvalError(`${epos}: define-syntax: expected syntax-rules`);
+                throw new EvalError(`${epos}: define-syntax: expected syntax-rules or lambda`);
               const literalList = sr.val[1];
               if (literalList.tag !== 'list') throw new EvalError(`${epos}: syntax-rules: literals must be a list`);
               const literals = literalList.val.map(l => {
@@ -2010,6 +2127,82 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
               }
               c = VOID; m = 1; continue;
             }
+
+            // syntax-case: (syntax-case expr (literals) clause ...)
+            if (name === 'syntax-case') {
+              if (elems.length < 3) throw new EvalError(`${epos}: syntax-case requires at least 2 arguments`);
+              const literals: string[] = [];
+              const litList = elems[2];
+              if (litList.tag === 'list') {
+                for (const l of litList.val) {
+                  if (l.tag === 'symbol') literals.push(l.val);
+                }
+              }
+              const clauses = elems.slice(3);
+              k = { tag: 'syntaxCaseK', literals, clauses, defEnv: e, epos, next: k };
+              c = elems[1]; m = 0; continue;
+            }
+
+            // syntax: (syntax template) = #'template
+            if (name === 'syntax') {
+              if (elems.length !== 2) throw new EvalError(`${epos}: syntax requires 1 argument`);
+              const template = elems[1];
+
+              // Merge all syntax bindings from the stack
+              const mergedBindings: Bindings = new Map();
+              let defEnvForHygiene: Env = e;
+              for (const frame of syntaxBindingsStack) {
+                for (const [bk, bv] of frame.bindings) mergedBindings.set(bk, bv);
+                defEnvForHygiene = frame.defEnv;
+              }
+
+              const patternVars = new Set(mergedBindings.keys());
+              const freeSyms = new Set<string>();
+              collectFreeSymbols(template, patternVars, freeSyms);
+
+              const renames = new Map<string, string>();
+              for (const sym of freeSyms) renames.set(sym, gensym(sym));
+
+              const expanded = expandTemplate(template, mergedBindings, renames);
+
+              const hygieneBindings = new Map<string, SchemeVal>();
+              for (const [original, gensymName] of renames) {
+                try {
+                  const val = envLookup(defEnvForHygiene, original);
+                  hygieneBindings.set(gensymName, val);
+                } catch { /* not bound */ }
+              }
+
+              c = { tag: 'syntax-object', form: expanded, hygieneBindings } as SchemeVal;
+              m = 1; continue;
+            }
+
+            // with-syntax: (with-syntax ((pat expr) ...) body ...)
+            if (name === 'with-syntax') {
+              if (elems.length < 3) throw new EvalError(`${epos}: with-syntax requires bindings and body`);
+              const bindingSpecs = elems[1];
+              if (bindingSpecs.tag !== 'list') throw new EvalError(`${epos}: with-syntax: bindings must be a list`);
+              const body = elems.slice(2);
+              const pairs: [SchemeVal, SchemeVal][] = [];
+              for (const spec of bindingSpecs.val) {
+                if (spec.tag !== 'list' || spec.val.length !== 2)
+                  throw new EvalError(`${epos}: with-syntax: each binding must be (pattern expr)`);
+                pairs.push([spec.val[0], spec.val[1]]);
+              }
+              if (pairs.length === 0) {
+                // No bindings, just evaluate body
+                if (body.length === 1) { c = body[0]; continue; }
+                k = { tag: 'seq', rest: body.slice(1), env: e, next: k };
+                c = body[0]; continue;
+              }
+              // Evaluate first expr, then match pattern
+              const [firstPat, firstExpr] = pairs[0];
+              const restPairs = pairs.slice(1);
+              k = { tag: 'withSyntaxK', bindings: new Map(), rest: restPairs.map(([p, ex]) => [p, ex]), body, env: e, epos, next: k };
+              // Store the pattern to match in a temp way - put it in the continuation
+              (k as any)._currentPat = firstPat;
+              c = firstExpr; m = 0; continue;
+            }
           }
 
           // Check for macro application
@@ -2019,6 +2212,14 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             if (headVal && headVal.tag === 'macro') {
               const expanded = expandMacroToForm(headVal.transformer, c, e);
               c = expanded.form; e = expanded.env; continue;
+            }
+            if (headVal && headVal.tag === 'macro-proc') {
+              // Procedural macro: call transformer with the whole form as argument
+              // The result of calling the transformer is the expanded form
+              const macroProc = headVal.proc;
+              const formAsSyntax = c; // the whole (macro-name args...) form
+              ({ c, e, k, m } = cekApply(macroProc, [formAsSyntax], epos, { tag: 'macroExpandK', useEnv: e, next: k } as any));
+              continue;
             }
           }
 
@@ -2049,7 +2250,14 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         }
 
         case 'defK': {
-          const f = k; envSet(f.env, f.name, c); k = f.next; c = VOID; continue;
+          const f = k;
+          if (f.name.endsWith('\x00macro-proc')) {
+            const realName = f.name.slice(0, -'\x00macro-proc'.length);
+            envSet(f.env, realName, { tag: 'macro-proc', proc: c } as SchemeVal);
+          } else {
+            envSet(f.env, f.name, c);
+          }
+          k = f.next; c = VOID; continue;
         }
 
         case 'setK': {
@@ -2280,6 +2488,106 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           continue;
         }
 
+        case 'macroExpandK': {
+          const f = k as any;
+          k = f.next;
+          // c is the result of the transformer — should be a syntax-object
+          if (c.tag === 'syntax-object') {
+            const so = c as any;
+            // Inject hygiene bindings directly into the use-site env
+            for (const [gName, val] of so.hygieneBindings) {
+              envSet(f.useEnv, gName, val);
+            }
+            c = so.form; e = f.useEnv; m = 0; continue;
+          }
+          // If not a syntax-object, just evaluate the result as a form
+          e = f.useEnv; m = 0; continue;
+        }
+
+        case 'syntaxCaseK': {
+          const f = k as any;
+          k = f.next;
+          // c is the evaluated scrutinee
+          const stxVal = c;
+          const formElems = stxVal.tag === 'list' ? stxVal.val : [stxVal];
+
+          let matched = false;
+          for (const clause of f.clauses) {
+            if (clause.tag !== 'list' || clause.val.length < 2) continue;
+            const pattern = clause.val[0];
+            const hasGuard = clause.val.length > 2;
+            const body = hasGuard ? clause.val[2] : clause.val[1];
+
+            const bindings: Bindings = new Map();
+            if (pattern.tag === 'list') {
+              matched = matchPattern(pattern.val, formElems, bindings, f.literals);
+            } else if (pattern.tag === 'symbol' && pattern.val !== '_') {
+              bindings.set(pattern.val, stxVal);
+              matched = true;
+            } else if (pattern.tag === 'symbol' && pattern.val === '_') {
+              matched = true;
+            }
+
+            if (matched) {
+              syntaxBindingsStack.push({ bindings, defEnv: f.defEnv });
+              // We need to pop after body evaluation — use a seq-like approach
+              // Actually, we need a special continuation to pop the stack
+              k = { tag: 'syntaxPopK' } as any;
+              (k as any).next = f.next;
+              c = body; e = f.defEnv; m = 0;
+              break;
+            }
+          }
+          if (!matched) throw new EvalError(`${f.epos}: syntax-case: no matching pattern`);
+          continue;
+        }
+
+        case 'syntaxPopK' as any: {
+          syntaxBindingsStack.pop();
+          k = (k as any).next;
+          continue;
+        }
+
+        case 'withSyntaxK': {
+          const f = k as any;
+          // c is the evaluated expr; match it against the current pattern
+          const pat: SchemeVal = f._currentPat;
+          const bindings: Bindings = new Map(f.bindings);
+
+          // Match the pattern against the value
+          if (pat.tag === 'symbol') {
+            bindings.set(pat.val, c);
+          } else if (pat.tag === 'list') {
+            const formElems = c.tag === 'list' ? c.val : [c];
+            if (!matchPattern(pat.val, formElems, bindings, [])) {
+              throw new EvalError(`${f.epos}: with-syntax: pattern match failed`);
+            }
+          }
+
+          if (f.rest.length > 0) {
+            // More bindings to process
+            const [nextPat, nextExpr] = f.rest[0];
+            const restPairs = f.rest.slice(1);
+            k = { tag: 'withSyntaxK', bindings, rest: restPairs, body: f.body, env: f.env, epos: f.epos, next: f.next };
+            (k as any)._currentPat = nextPat;
+            c = nextExpr; e = f.env; m = 0;
+          } else {
+            // All bindings processed, push them and evaluate body
+            // Find the defEnv from the syntax bindings stack
+            const defEnv = syntaxBindingsStack.length > 0 ? syntaxBindingsStack[syntaxBindingsStack.length - 1].defEnv : f.env;
+            syntaxBindingsStack.push({ bindings, defEnv });
+            k = { tag: 'syntaxPopK' } as any;
+            (k as any).next = f.next;
+            const body = f.body;
+            if (body.length === 1) { c = body[0]; e = f.env; m = 0; }
+            else {
+              k = { tag: 'seq', rest: body.slice(1), env: f.env, next: k };
+              c = body[0]; e = f.env; m = 0;
+            }
+          }
+          continue;
+        }
+
         default:
           throw new EvalError('unknown continuation frame');
       }
@@ -2341,6 +2649,8 @@ function display(val: SchemeVal, seen?: Set<SchemeVal>): string {
     case 'callWithValues': return '#<procedure>';
     case 'values': return (val as any).vals.map((v: SchemeVal) => display(v, seen)).join('\n');
     case 'macro': return '#<macro>';
+    case 'macro-proc': return '#<macro>';
+    case 'syntax-object': return '#<syntax>';
     case 'record': return '#<record>';
     case 'vector': return '#(' + val.val.map(v => display(v, seen)).join(' ') + ')';
   }
