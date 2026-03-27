@@ -272,6 +272,12 @@ func evalListInEnv(list *ListExpr, env *Env) (Value, error) {
 			return evalAnd(list.Items[1:], env)
 		case "or":
 			return evalOr(list.Items[1:], env)
+		case "let":
+			return evalLet(list.Items[1:], env)
+		case "begin":
+			return evalBegin(list.Items[1:], env)
+		case "cond":
+			return evalCond(list.Items[1:], env)
 		}
 	}
 
@@ -433,6 +439,112 @@ func evalOr(exprs []Expr, env *Env) (Value, error) {
 	return result, nil
 }
 
+func evalLet(args []Expr, env *Env) (Value, error) {
+	if len(args) < 2 {
+		return nil, &EvalError{Message: "let requires bindings and body"}
+	}
+	// Named let: (let name ((var init) ...) body...)
+	offset := 0
+	var loopName string
+	if atom, ok := args[0].(*AtomExpr); ok {
+		loopName = atom.Token
+		offset = 1
+		if len(args) < 3 {
+			return nil, &EvalError{Message: "named let requires bindings and body"}
+		}
+	}
+	bindList, ok := args[offset].(*ListExpr)
+	if !ok {
+		return nil, &EvalError{Message: "let: expected binding list"}
+	}
+	names := make([]string, len(bindList.Items))
+	vals := make([]Value, len(bindList.Items))
+	for i, item := range bindList.Items {
+		pair, ok := item.(*ListExpr)
+		if !ok || len(pair.Items) != 2 {
+			return nil, &EvalError{Message: "let: bad binding"}
+		}
+		nameAtom, ok := pair.Items[0].(*AtomExpr)
+		if !ok {
+			return nil, &EvalError{Message: "let: expected symbol in binding"}
+		}
+		names[i] = nameAtom.Token
+		v, err := evalInEnv(pair.Items[1], env)
+		if err != nil {
+			return nil, err
+		}
+		vals[i] = v
+	}
+	letEnv := newEnv(env)
+	for i, name := range names {
+		letEnv.set(name, vals[i])
+	}
+	body := args[offset+1:]
+	if loopName != "" {
+		// Named let: bind name to a lambda that recurses
+		lambda := &LambdaVal{Params: names, Body: body, Env: letEnv}
+		letEnv.set(loopName, lambda)
+		// The lambda's env is letEnv which contains itself
+	}
+	var result Value
+	var err error
+	for _, bodyExpr := range body {
+		result, err = evalInEnv(bodyExpr, letEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalBegin(args []Expr, env *Env) (Value, error) {
+	var result Value = &VoidVal{}
+	var err error
+	for _, e := range args {
+		result, err = evalInEnv(e, env)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalCond(clauses []Expr, env *Env) (Value, error) {
+	for _, clause := range clauses {
+		cl, ok := clause.(*ListExpr)
+		if !ok || len(cl.Items) == 0 {
+			return nil, &EvalError{Message: "cond: bad clause"}
+		}
+		// Check for else
+		if atom, ok := cl.Items[0].(*AtomExpr); ok && atom.Token == "else" {
+			var result Value = &VoidVal{}
+			var err error
+			for _, e := range cl.Items[1:] {
+				result, err = evalInEnv(e, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		test, err := evalInEnv(cl.Items[0], env)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(test) {
+			var result Value = test
+			for _, e := range cl.Items[1:] {
+				result, err = evalInEnv(e, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+	}
+	return &VoidVal{}, nil
+}
+
 // --------------- Procedure application ---------------
 
 func applyProc(op Value, args []Value) (Value, error) {
@@ -574,6 +686,139 @@ func makeBuiltinEnv() *Env {
 			return nil, &EvalError{Message: "not requires 1 argument"}
 		}
 		return &BoolVal{Val: !isTruthy(args[0])}, nil
+	})
+
+	addBuiltin("cons", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "cons requires 2 arguments"}
+		}
+		return &PairVal{Car: args[0], Cdr: args[1]}, nil
+	})
+
+	addBuiltin("car", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "car requires 1 argument"}
+		}
+		p, ok := args[0].(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "car: not a pair"}
+		}
+		return p.Car, nil
+	})
+
+	addBuiltin("cdr", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "cdr requires 1 argument"}
+		}
+		p, ok := args[0].(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "cdr: not a pair"}
+		}
+		return p.Cdr, nil
+	})
+
+	addBuiltin("null?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "null? requires 1 argument"}
+		}
+		_, ok := args[0].(*NilVal)
+		return &BoolVal{Val: ok}, nil
+	})
+
+	addBuiltin("list", func(args []Value) (Value, error) {
+		var result Value = &NilVal{}
+		for i := len(args) - 1; i >= 0; i-- {
+			result = &PairVal{Car: args[i], Cdr: result}
+		}
+		return result, nil
+	})
+
+	addBuiltin("length", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "length requires 1 argument"}
+		}
+		var count int64
+		cur := args[0]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				break
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "length: not a proper list"}
+			}
+			count++
+			cur = p.Cdr
+		}
+		return &IntVal{Val: count}, nil
+	})
+
+	addBuiltin("append", func(args []Value) (Value, error) {
+		if len(args) == 0 {
+			return &NilVal{}, nil
+		}
+		// Collect all but last into a flat slice, then append last as tail
+		result := args[len(args)-1]
+		for i := len(args) - 2; i >= 0; i-- {
+			var elems []Value
+			cur := args[i]
+			for {
+				if _, ok := cur.(*NilVal); ok {
+					break
+				}
+				p, ok := cur.(*PairVal)
+				if !ok {
+					return nil, &EvalError{Message: "append: not a proper list"}
+				}
+				elems = append(elems, p.Car)
+				cur = p.Cdr
+			}
+			for j := len(elems) - 1; j >= 0; j-- {
+				result = &PairVal{Car: elems[j], Cdr: result}
+			}
+		}
+		return result, nil
+	})
+
+	// Type predicates
+	addBuiltin("number?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "number? requires 1 argument"}
+		}
+		_, ok := args[0].(*IntVal)
+		return &BoolVal{Val: ok}, nil
+	})
+
+	addBuiltin("string?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string? requires 1 argument"}
+		}
+		_, ok := args[0].(*StringVal)
+		return &BoolVal{Val: ok}, nil
+	})
+
+	addBuiltin("boolean?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "boolean? requires 1 argument"}
+		}
+		_, ok := args[0].(*BoolVal)
+		return &BoolVal{Val: ok}, nil
+	})
+
+	addBuiltin("pair?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "pair? requires 1 argument"}
+		}
+		_, ok := args[0].(*PairVal)
+		return &BoolVal{Val: ok}, nil
+	})
+
+	addBuiltin("symbol?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "symbol? requires 1 argument"}
+		}
+		_, ok := args[0].(*SymbolVal)
+		return &BoolVal{Val: ok}, nil
 	})
 
 	return env
