@@ -61,15 +61,46 @@ public class Evaluator {
     static final Object DYNAMIC_WIND_PROC = new Object() {
         @Override public String toString() { return "#<procedure dynamic-wind>"; }
     };
+    static final Object RAISE_PROC = new Object() {
+        @Override public String toString() { return "#<procedure raise>"; }
+    };
+    static final Object WITH_EXCEPTION_HANDLER_PROC = new Object() {
+        @Override public String toString() { return "#<procedure with-exception-handler>"; }
+    };
+
+    static class SchemeRaise extends RuntimeException {
+        final Object value;
+        SchemeRaise(Object v) { super(null, null, true, false); value = v; }
+    }
+
+    static class GuardHandler {
+        final List<Object> savedKont;
+        final List<DynamicWindEntry> savedWindStack;
+        final List<Object> clauses;
+        final String varName;
+        final Env guardEnv;
+        final List<Object> savedExceptionHandlers;
+        GuardHandler(List<Object> kont, List<DynamicWindEntry> ws, List<Object> clauses,
+                     String var, Env env, List<Object> exHandlers) {
+            this.savedKont = new ArrayList<>(kont);
+            this.savedWindStack = new ArrayList<>(ws);
+            this.clauses = clauses;
+            this.varName = var;
+            this.guardEnv = env;
+            this.savedExceptionHandlers = new ArrayList<>(exHandlers);
+        }
+    }
 
     static class Continuation {
         final List<Object> savedKont;
         final int evalId;
         final List<DynamicWindEntry> savedWindStack;
-        Continuation(List<Object> kont, int evalId, List<DynamicWindEntry> windStack) {
+        final List<Object> savedExceptionHandlers;
+        Continuation(List<Object> kont, int evalId, List<DynamicWindEntry> windStack, List<Object> exHandlers) {
             this.savedKont = new ArrayList<>(kont);
             this.evalId = evalId;
             this.savedWindStack = new ArrayList<>(windStack);
+            this.savedExceptionHandlers = new ArrayList<>(exHandlers);
         }
     }
 
@@ -105,17 +136,21 @@ public class Evaluator {
     private record DWAfterInFrame(Object inThunk, Object bodyThunk, Object outThunk) {}
     private record DWAfterBodyFrame(Object inThunk, Object outThunk) {}
     private record DWAfterOutFrame(Object bodyValue) {}
+    private record GuardAfterFrame() {}
+    private record WEHAfterFrame() {}
+    private record RaiseReturnFrame() {}
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "if", "begin", "let", "let*", "set!", "define", "quote", "lambda", "case-lambda",
         "and", "or", "cond", "case", "do", "letrec", "letrec*",
-        "define-syntax", "syntax-rules", "define-record-type"
+        "define-syntax", "syntax-rules", "define-record-type", "guard"
     );
 
     private int gensymCounter = 0;
     private int nextEvalId = 0;
     private StringBuilder outputBuffer;
     private final List<DynamicWindEntry> windStack = new ArrayList<>();
+    private final List<Object> exceptionHandlers = new ArrayList<>();
 
     public String evalStr(String input) throws EvalError {
         outputBuffer = new StringBuilder();
@@ -157,12 +192,15 @@ public class Evaluator {
         env.define("call/cc", CALLCC_PROC);
         env.define("call-with-current-continuation", CALLCC_PROC);
         env.define("dynamic-wind", DYNAMIC_WIND_PROC);
+        env.define("raise", RAISE_PROC);
+        env.define("with-exception-handler", WITH_EXCEPTION_HANDLER_PROC);
         env.define("procedure?", new BuiltinProc("procedure?", args -> {
             if (args.size() != 1) throw new EvalError("procedure?: expected 1 arg");
             Object v = args.get(0);
             return (v instanceof Lambda || v instanceof CaseLambda || v instanceof BuiltinProc
                     || v instanceof Continuation || v == CALLCC_PROC
-                    || v == DYNAMIC_WIND_PROC) ? Boolean.TRUE : Boolean.FALSE;
+                    || v == DYNAMIC_WIND_PROC || v == RAISE_PROC
+                    || v == WITH_EXCEPTION_HANDLER_PROC) ? Boolean.TRUE : Boolean.FALSE;
         }));
         return env;
     }
@@ -365,6 +403,37 @@ public class Evaluator {
                     case "define-record-type": {
                         current = handleDefineRecordType(list, env); evaluating = false; continue;
                     }
+                    case "guard": {
+                        // (guard (var clause ...) body ...)
+                        Object gs = unwrap(list.get(1));
+                        if (!(gs instanceof List<?> guardSpec) || guardSpec.isEmpty())
+                            throw new EvalError("guard: invalid syntax");
+                        String var = (String) unwrap(guardSpec.get(0));
+                        List<Object> clauses = new ArrayList<>();
+                        boolean hasElse = false;
+                        for (int ci = 1; ci < guardSpec.size(); ci++) {
+                            clauses.add(guardSpec.get(ci));
+                            Object cl = unwrap(guardSpec.get(ci));
+                            if (cl instanceof List<?> clList && !clList.isEmpty()) {
+                                Object test = unwrap(clList.get(0));
+                                if (test instanceof String s && s.equals("else")) hasElse = true;
+                            }
+                        }
+                        if (!hasElse) {
+                            List<Object> raiseExpr = List.of("raise", var);
+                            clauses.add(List.of("else", raiseExpr));
+                        }
+                        GuardHandler gh = new GuardHandler(kont, windStack, clauses, var, env, exceptionHandlers);
+                        exceptionHandlers.add(gh);
+                        kont.add(new GuardAfterFrame());
+                        if (list.size() == 2) { current = Boolean.FALSE; evaluating = false; }
+                        else if (list.size() == 3) { current = list.get(2); }
+                        else {
+                            List<Object> bodyExprs = new ArrayList<>(list.subList(2, list.size()));
+                            current = pushBodyFrames(bodyExprs, kont, env);
+                        }
+                        continue;
+                    }
                     default: {
                         Object mv = null;
                         try { mv = env.lookup(op, new SchemeParser.Pos(eLine, eCol)); } catch (EvalError ignored) {}
@@ -393,6 +462,7 @@ public class Evaluator {
               if (ci.cont.evalId == evalId) {
                   performWindTransition(ci.cont.savedWindStack);
                   kont.clear(); kont.addAll(ci.cont.savedKont);
+                  exceptionHandlers.clear(); exceptionHandlers.addAll(ci.cont.savedExceptionHandlers);
                   current = ci.value; evaluating = false;
               } else throw ci;
           }
@@ -497,6 +567,19 @@ public class Evaluator {
         }
         if (frame instanceof DWAfterOutFrame f) {
             return new CekState(f.bodyValue, env, false);
+        }
+        if (frame instanceof GuardAfterFrame) {
+            // Body completed normally, pop the guard handler
+            exceptionHandlers.remove(exceptionHandlers.size() - 1);
+            return new CekState(current, env, false);
+        }
+        if (frame instanceof WEHAfterFrame) {
+            // Thunk completed normally, pop the exception handler
+            exceptionHandlers.remove(exceptionHandlers.size() - 1);
+            return new CekState(current, env, false);
+        }
+        if (frame instanceof RaiseReturnFrame) {
+            throw new EvalError("raise: handler returned");
         }
         throw new EvalError("unknown frame: " + frame.getClass().getSimpleName());
     }
@@ -616,9 +699,42 @@ public class Evaluator {
             doApply(inThunk, List.of(), kont, eLine, eCol, evalId);
             return;
         }
+        if (proc == RAISE_PROC) {
+            if (args.size() != 1) throw new EvalError("raise: expected 1 argument" + posStr);
+            Object value = args.get(0);
+            if (exceptionHandlers.isEmpty())
+                throw new EvalError("unhandled exception: " + schemeToString(value));
+            Object handler = exceptionHandlers.remove(exceptionHandlers.size() - 1);
+            if (handler instanceof GuardHandler gh) {
+                performWindTransition(gh.savedWindStack);
+                kont.clear(); kont.addAll(gh.savedKont);
+                exceptionHandlers.clear(); exceptionHandlers.addAll(gh.savedExceptionHandlers);
+                Env clauseEnv = new Env(gh.guardEnv);
+                clauseEnv.define(gh.varName, value);
+                List<Object> condExpr = new ArrayList<>();
+                condExpr.add("cond");
+                condExpr.addAll(gh.clauses);
+                applyResult = new Object[]{condExpr, clauseEnv, true};
+                return;
+            } else {
+                // Procedure handler from with-exception-handler
+                kont.add(new RaiseReturnFrame());
+                proc = handler; args = List.of(value);
+                // Fall through to apply handler
+            }
+        }
+        if (proc == WITH_EXCEPTION_HANDLER_PROC) {
+            if (args.size() != 2) throw new EvalError("with-exception-handler: expected 2 arguments" + posStr);
+            Object handler = args.get(0);
+            Object thunk = args.get(1);
+            exceptionHandlers.add(handler);
+            kont.add(new WEHAfterFrame());
+            proc = thunk; args = List.of();
+            // Fall through to apply thunk
+        }
         if (proc == CALLCC_PROC) {
             if (args.size() != 1) throw new EvalError("call/cc: expected 1 argument" + posStr);
-            Continuation k = new Continuation(kont, evalId, windStack);
+            Continuation k = new Continuation(kont, evalId, windStack, exceptionHandlers);
             proc = args.get(0); args = List.of(k);
             // Fall through to apply proc
         }
