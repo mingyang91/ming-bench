@@ -16,6 +16,7 @@ type locatedExpr struct {
 type listExpr []locatedExpr
 type symbolExpr string
 type stringExpr string
+type charExpr rune
 type boolExpr bool
 type numberExpr int
 
@@ -254,9 +255,34 @@ func parseAtom(raw string) expr {
 		return boolExpr(false)
 	}
 
+	if ch, ok := parseCharLiteral(raw); ok {
+		return charExpr(ch)
+	}
+
 	if n, err := strconv.Atoi(raw); err == nil {
 		return numberExpr(n)
 	}
 
 	return symbolExpr(raw)
+}
+
+func parseCharLiteral(raw string) (rune, bool) {
+	if !strings.HasPrefix(raw, "#\\") {
+		return 0, false
+	}
+
+	literal := raw[2:]
+	switch literal {
+	case "space":
+		return ' ', true
+	case "newline":
+		return '\n', true
+	}
+
+	runes := []rune(literal)
+	if len(runes) == 1 {
+		return runes[0], true
+	}
+
+	return 0, false
 }

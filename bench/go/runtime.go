@@ -17,7 +17,10 @@ type procedure interface {
 
 type numberValue int
 type boolValue bool
-type stringValue string
+type stringValue struct {
+	chars   []rune
+	mutable bool
+}
 type symbolValue string
 type charValue rune
 type voidValue struct{}
@@ -59,6 +62,26 @@ const (
 var emptyList = emptyListValue{}
 var currentOutput *strings.Builder
 
+func newStringValue(text string) *stringValue {
+	return &stringValue{
+		chars:   []rune(text),
+		mutable: true,
+	}
+}
+
+func copyStringValue(s *stringValue, mutable bool) *stringValue {
+	chars := make([]rune, len(s.chars))
+	copy(chars, s.chars)
+	return &stringValue{
+		chars:   chars,
+		mutable: mutable,
+	}
+}
+
+func (s *stringValue) text() string {
+	return string(s.chars)
+}
+
 func (n numberValue) schemeString() string {
 	return strconv.Itoa(int(n))
 }
@@ -78,11 +101,11 @@ func (b boolValue) isTruthy() bool {
 	return bool(b)
 }
 
-func (s stringValue) schemeString() string {
-	return strconv.Quote(string(s))
+func (s *stringValue) schemeString() string {
+	return strconv.Quote(s.text())
 }
 
-func (stringValue) isTruthy() bool {
+func (*stringValue) isTruthy() bool {
 	return true
 }
 
@@ -124,11 +147,11 @@ func (p pairValue) schemeString() string {
 
 func formatValue(v value, mode outputMode) string {
 	switch value := v.(type) {
-	case stringValue:
+	case *stringValue:
 		if mode == outputModeDisplay {
-			return string(value)
+			return value.text()
 		}
-		return strconv.Quote(string(value))
+		return strconv.Quote(value.text())
 	case charValue:
 		return formatChar(rune(value), mode)
 	case pairValue:
@@ -278,6 +301,8 @@ func newGlobalEnv() *env {
 	global.define("symbol->string", builtinProc{name: "symbol->string", fn: evalSymbolToString})
 	global.define("string->symbol", builtinProc{name: "string->symbol", fn: evalStringToSymbol})
 	global.define("string-ref", builtinProc{name: "string-ref", fn: evalStringRef})
+	global.define("string-copy", builtinProc{name: "string-copy", fn: evalStringCopy})
+	global.define("string-set!", builtinProc{name: "string-set!", fn: evalStringSet})
 	return global
 }
 
@@ -328,7 +353,9 @@ func evalExpr(e locatedExpr, env *env) (value, error) {
 	case boolExpr:
 		return boolValue(expr), nil
 	case stringExpr:
-		return stringValue(expr), nil
+		return newStringValue(string(expr)), nil
+	case charExpr:
+		return charValue(expr), nil
 	case symbolExpr:
 		v, ok := env.lookup(string(expr))
 		if !ok {
@@ -666,7 +693,9 @@ func quoteExpr(e locatedExpr) (value, error) {
 	case boolExpr:
 		return boolValue(expr), nil
 	case stringExpr:
-		return stringValue(expr), nil
+		return newStringValue(string(expr)), nil
+	case charExpr:
+		return charValue(expr), nil
 	case symbolExpr:
 		return symbolValue(expr), nil
 	case listExpr:
@@ -902,7 +931,7 @@ func evalBooleanPred(args []value) (value, error) {
 
 func evalStringPred(args []value) (value, error) {
 	return evalTypePredicate(args, "string?", func(v value) bool {
-		_, ok := v.(stringValue)
+		_, ok := v.(*stringValue)
 		return ok
 	})
 }
@@ -961,7 +990,7 @@ func evalStringAppend(args []value) (value, error) {
 		}
 		builder.WriteString(s)
 	}
-	return stringValue(builder.String()), nil
+	return newStringValue(builder.String()), nil
 }
 
 func evalStringLength(args []value) (value, error) {
@@ -1001,7 +1030,7 @@ func evalSubstring(args []value) (value, error) {
 		return nil, newCurrentEvalError("'substring' indices out of range")
 	}
 
-	return stringValue(string(runes[start:end])), nil
+	return newStringValue(string(runes[start:end])), nil
 }
 
 func evalStringToNumber(args []value) (value, error) {
@@ -1032,7 +1061,7 @@ func evalNumberToString(args []value) (value, error) {
 		return nil, err
 	}
 
-	return stringValue(strconv.Itoa(n)), nil
+	return newStringValue(strconv.Itoa(n)), nil
 }
 
 func evalSymbolToString(args []value) (value, error) {
@@ -1045,7 +1074,7 @@ func evalSymbolToString(args []value) (value, error) {
 		return nil, err
 	}
 
-	return stringValue(symbol), nil
+	return newStringValue(symbol), nil
 }
 
 func evalStringToSymbol(args []value) (value, error) {
@@ -1082,6 +1111,50 @@ func evalStringRef(args []value) (value, error) {
 	}
 
 	return charValue(runes[index]), nil
+}
+
+func evalStringCopy(args []value) (value, error) {
+	if len(args) != 1 {
+		return nil, newCurrentEvalError("'string-copy' expects exactly 1 argument")
+	}
+
+	s, err := expectStringValue(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	return copyStringValue(s, true), nil
+}
+
+func evalStringSet(args []value) (value, error) {
+	if len(args) != 3 {
+		return nil, newCurrentEvalError("'string-set!' expects exactly 3 arguments")
+	}
+
+	s, err := expectStringValue(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	index, err := expectNumber(args[1])
+	if err != nil {
+		return nil, err
+	}
+
+	ch, err := expectChar(args[2])
+	if err != nil {
+		return nil, err
+	}
+
+	if index < 0 || index >= len(s.chars) {
+		return nil, newCurrentEvalError("'string-set!' index out of range")
+	}
+	if !s.mutable {
+		return nil, newCurrentEvalError("'string-set!' cannot mutate immutable string")
+	}
+
+	s.chars[index] = ch
+	return voidValue{}, nil
 }
 
 func evalTypePredicate(args []value, name string, pred func(value) bool) (value, error) {
@@ -1138,12 +1211,28 @@ func expectNumber(v value) (int, error) {
 	return int(n), nil
 }
 
-func expectString(v value) (string, error) {
-	s, ok := v.(stringValue)
+func expectStringValue(v value) (*stringValue, error) {
+	s, ok := v.(*stringValue)
 	if !ok {
-		return "", newCurrentEvalError("expected string, got %s", v.schemeString())
+		return nil, newCurrentEvalError("expected string, got %s", v.schemeString())
 	}
-	return string(s), nil
+	return s, nil
+}
+
+func expectString(v value) (string, error) {
+	s, err := expectStringValue(v)
+	if err != nil {
+		return "", err
+	}
+	return s.text(), nil
+}
+
+func expectChar(v value) (rune, error) {
+	ch, ok := v.(charValue)
+	if !ok {
+		return 0, newCurrentEvalError("expected character, got %s", v.schemeString())
+	}
+	return rune(ch), nil
 }
 
 func expectSymbol(v value) (string, error) {
