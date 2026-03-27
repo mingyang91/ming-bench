@@ -136,7 +136,19 @@ func tokenize(input string) []Token {
 			col++
 		} else if ch == '#' {
 			startCol := col
-			if i+1 < len(input) && (input[i+1] == 't' || input[i+1] == 'f') {
+			if i+1 < len(input) && input[i+1] == '\\' {
+				// Character literal: #\a, #\space, #\newline, etc.
+				j := i + 2
+				c := col + 2
+				// Read the character name or single char
+				for j < len(input) && !unicode.IsSpace(rune(input[j])) && input[j] != '(' && input[j] != ')' && input[j] != '"' && input[j] != ';' {
+					j++
+					c++
+				}
+				tokens = append(tokens, Token{input[i:j], line, startCol})
+				i = j
+				col = c
+			} else if i+1 < len(input) && (input[i+1] == 't' || input[i+1] == 'f') {
 				tokens = append(tokens, Token{input[i : i+2], line, startCol})
 				i += 2
 				col += 2
@@ -278,6 +290,22 @@ func evalAtomInEnv(atom *AtomExpr, env *Env) (Value, error) {
 	}
 	if token == "#f" {
 		return &BoolVal{Val: false}, nil
+	}
+	if len(token) >= 2 && token[0] == '#' && token[1] == '\\' {
+		name := token[2:]
+		switch name {
+		case "space":
+			return &CharVal{Val: ' '}, nil
+		case "newline":
+			return &CharVal{Val: '\n'}, nil
+		case "tab":
+			return &CharVal{Val: '\t'}, nil
+		default:
+			if len(name) == 1 {
+				return &CharVal{Val: rune(name[0])}, nil
+			}
+			return nil, errAt(atom, "unknown character name: "+name)
+		}
 	}
 	if len(token) > 0 && token[0] == '"' {
 		s, err := strconv.Unquote(token)
@@ -1009,6 +1037,44 @@ func makeBuiltinEnv(outBuf *strings.Builder) *Env {
 			return nil, &EvalError{Message: "string->symbol: expected string"}
 		}
 		return &SymbolVal{Name: s.Val}, nil
+	})
+
+	// L06: string-copy, string-set!
+	addBuiltin("string-copy", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string-copy requires 1 argument"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-copy: expected string"}
+		}
+		return &StringVal{Val: s.Val}, nil
+	})
+
+	addBuiltin("string-set!", func(args []Value) (Value, error) {
+		if len(args) != 3 {
+			return nil, &EvalError{Message: "string-set! requires 3 arguments"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-set!: expected string"}
+		}
+		idx, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-set!: expected number"}
+		}
+		ch, ok := args[2].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-set!: expected char"}
+		}
+		i := int(idx.Val)
+		if i < 0 || i >= len(s.Val) {
+			return nil, &EvalError{Message: "string-set!: index out of range"}
+		}
+		bs := []byte(s.Val)
+		bs[i] = byte(ch.Val)
+		s.Val = string(bs)
+		return &VoidVal{}, nil
 	})
 
 	addBuiltin("string-ref", func(args []Value) (Value, error) {
