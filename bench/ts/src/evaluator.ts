@@ -13,7 +13,8 @@ type SchemeValBase =
   | { tag: 'nil' }
   | { tag: 'procedure'; val: (args: SchemeVal[]) => SchemeVal }
   | { tag: 'void' }
-  | { tag: 'macro'; transformer: MacroTransformer };
+  | { tag: 'macro'; transformer: MacroTransformer }
+  | { tag: 'record'; type: symbol; fields: Map<string, SchemeVal> };
 
 type MacroTransformer = {
   literals: string[];
@@ -476,6 +477,7 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
       }
       case 'list': return `(${v.val.map(displayVal).join(' ')})`;
       case 'macro': return '#<macro>';
+      case 'record': return '#<record>';
     }
   };
 
@@ -868,7 +870,7 @@ function makeVariadicClosure(fixed: string[], rest: string, body: SchemeVal[], c
 
 const SPECIAL_FORMS = new Set([
   'quote', 'if', 'define', 'set!', 'lambda', 'begin', 'let', 'let*', 'letrec',
-  'cond', 'and', 'or', 'define-syntax', 'syntax-rules',
+  'cond', 'and', 'or', 'define-syntax', 'syntax-rules', 'define-record-type',
 ]);
 
 let gensymCounter = 0;
@@ -1239,6 +1241,59 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           return { tag: 'void' };
         }
 
+        if (name === 'define-record-type') {
+          // (define-record-type <name> (constructor field...) predicate (field accessor)...)
+          if (elems.length < 4) throw new EvalError(`${epos}: define-record-type requires at least 3 arguments`);
+          const typeName = elems[1];
+          if (typeName.tag !== 'symbol') throw new EvalError(`${epos}: define-record-type: type name must be a symbol`);
+          const typeTag = Symbol(typeName.val);
+          const ctorSpec = elems[2];
+          if (ctorSpec.tag !== 'list' || ctorSpec.val.length < 1 || ctorSpec.val[0].tag !== 'symbol')
+            throw new EvalError(`${epos}: define-record-type: invalid constructor`);
+          const ctorName = ctorSpec.val[0].val;
+          const ctorFields = ctorSpec.val.slice(1).map(f => {
+            if (f.tag !== 'symbol') throw new EvalError(`${epos}: define-record-type: field must be a symbol`);
+            return f.val;
+          });
+          const predSpec = elems[3];
+          if (predSpec.tag !== 'symbol') throw new EvalError(`${epos}: define-record-type: predicate must be a symbol`);
+          const predName = predSpec.val;
+          // Parse field accessors
+          const fieldAccessors: { field: string; accessor: string }[] = [];
+          for (let i = 4; i < elems.length; i++) {
+            const fd = elems[i];
+            if (fd.tag !== 'list' || fd.val.length < 2 || fd.val[0].tag !== 'symbol' || fd.val[1].tag !== 'symbol')
+              throw new EvalError(`${epos}: define-record-type: invalid field spec`);
+            fieldAccessors.push({ field: fd.val[0].val, accessor: fd.val[1].val });
+          }
+          // Define constructor
+          envSet(env, ctorName, { tag: 'procedure', val: (args: SchemeVal[]) => {
+            if (args.length !== ctorFields.length)
+              throw new EvalError(`${epos}: ${ctorName}: expected ${ctorFields.length} args, got ${args.length}`);
+            const fields = new Map<string, SchemeVal>();
+            for (let i = 0; i < ctorFields.length; i++) fields.set(ctorFields[i], args[i]);
+            return { tag: 'record', type: typeTag, fields } as SchemeVal;
+          }});
+          // Define predicate
+          envSet(env, predName, { tag: 'procedure', val: (args: SchemeVal[]) => {
+            if (args.length !== 1) throw new EvalError(`${epos}: ${predName}: expected 1 arg`);
+            return { tag: 'boolean', val: args[0].tag === 'record' && (args[0] as any).type === typeTag };
+          }});
+          // Define accessors
+          for (const { field, accessor } of fieldAccessors) {
+            const fName = field;
+            const aName = accessor;
+            envSet(env, aName, { tag: 'procedure', val: (args: SchemeVal[]) => {
+              if (args.length !== 1) throw new EvalError(`${epos}: ${aName}: expected 1 arg`);
+              const rec = args[0];
+              if (rec.tag !== 'record' || rec.type !== typeTag)
+                throw new EvalError(`${epos}: ${aName}: not a ${typeName.val}`);
+              return rec.fields.get(fName)!;
+            }});
+          }
+          return { tag: 'void' };
+        }
+
         if (name === 'and') {
           if (elems.length === 1) return { tag: 'boolean', val: true };
           let result: SchemeVal = { tag: 'boolean', val: true };
@@ -1327,6 +1382,7 @@ function display(val: SchemeVal): string {
     case 'void': return '';
     case 'procedure': return '#<procedure>';
     case 'macro': return '#<macro>';
+    case 'record': return '#<record>';
   }
 }
 
