@@ -5,9 +5,12 @@ use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
 use crate::scheme::value::Value;
 
-pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+pub type Output = Rc<RefCell<String>>;
+
+pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
     match expr {
-        Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Lambda { .. } => {
+        Value::Integer(_) | Value::Boolean(_) | Value::String(_)
+        | Value::Char(_) | Value::Lambda { .. } => {
             Ok(expr.clone())
         }
         Value::Symbol(name) => env.borrow().get(name),
@@ -17,8 +20,8 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
             }
             if let Value::Symbol(op) = &elems[0] {
                 match op.as_str() {
-                    "define" => return eval_define(&elems[1..], env),
-                    "if" => return eval_if(&elems[1..], env),
+                    "define" => return eval_define(&elems[1..], env, out),
+                    "if" => return eval_if(&elems[1..], env, out),
                     "quote" => {
                         if elems.len() != 2 {
                             return Err(EvalError::Arity("quote requires 1 argument".into()));
@@ -26,40 +29,38 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
                         return Ok(elems[1].clone());
                     }
                     "lambda" => return eval_lambda(&elems[1..], env),
-                    "and" => return eval_and(&elems[1..], env),
-                    "or" => return eval_or(&elems[1..], env),
-                    "let" => return eval_let(&elems[1..], env),
-                    "begin" => return eval_begin(&elems[1..], env),
-                    "cond" => return eval_cond(&elems[1..], env),
+                    "and" => return eval_and(&elems[1..], env, out),
+                    "or" => return eval_or(&elems[1..], env, out),
+                    "let" => return eval_let(&elems[1..], env, out),
+                    "begin" => return eval_begin(&elems[1..], env, out),
+                    "cond" => return eval_cond(&elems[1..], env, out),
                     _ => {}
                 }
             }
-            let func = eval(&elems[0], env)?;
+            let func = eval(&elems[0], env, out)?;
             let args: Vec<Value> = elems[1..]
                 .iter()
-                .map(|a| eval(a, env))
+                .map(|a| eval(a, env, out))
                 .collect::<Result<_, _>>()?;
-            apply(&func, &args)
+            apply(&func, &args, out)
         }
         Value::Void => Ok(Value::Void),
     }
 }
 
-fn eval_define(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_define(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity("define requires arguments".into()));
     }
     match &args[0] {
-        // (define x expr)
         Value::Symbol(name) => {
             if args.len() != 2 {
                 return Err(EvalError::Arity("define requires 2 arguments".into()));
             }
-            let val = eval(&args[1], env)?;
+            let val = eval(&args[1], env, out)?;
             env.borrow_mut().set(name.clone(), val);
             Ok(Value::Void)
         }
-        // (define (f params...) body...)
         Value::List(sig) => {
             if sig.is_empty() {
                 return Err(EvalError::Parse("define: empty signature".into()));
@@ -88,15 +89,15 @@ fn eval_define(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalErro
     }
 }
 
-fn eval_if(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_if(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(EvalError::Arity("if requires 2 or 3 arguments".into()));
     }
-    let cond = eval(&args[0], env)?;
+    let cond = eval(&args[0], env, out)?;
     if cond.is_truthy() {
-        eval(&args[1], env)
+        eval(&args[1], env, out)
     } else if args.len() == 3 {
-        eval(&args[2], env)
+        eval(&args[2], env, out)
     } else {
         Ok(Value::Void)
     }
@@ -124,7 +125,7 @@ fn eval_lambda(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalErro
     })
 }
 
-fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
+fn apply(func: &Value, args: &[Value], out: &Output) -> Result<Value, EvalError> {
     match func {
         Value::Lambda { params, body, env } => {
             if args.len() != params.len() {
@@ -140,16 +141,16 @@ fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
             }
             let mut result = Value::Void;
             for expr in body {
-                result = eval(expr, &local_env)?;
+                result = eval(expr, &local_env, out)?;
             }
             Ok(result)
         }
-        Value::Symbol(op) => apply_builtin(op, args),
+        Value::Symbol(op) => apply_builtin(op, args, out),
         _ => Err(EvalError::Type(format!("not a procedure: {}", func))),
     }
 }
 
-fn apply_builtin(op: &str, vals: &[Value]) -> Result<Value, EvalError> {
+fn apply_builtin(op: &str, vals: &[Value], out: &Output) -> Result<Value, EvalError> {
     match op {
         "+" => {
             let mut sum: i64 = 0;
@@ -214,7 +215,6 @@ fn apply_builtin(op: &str, vals: &[Value]) -> Result<Value, EvalError> {
                     Ok(Value::List(new))
                 }
                 _ => {
-                    // Dotted pair - represent as 2-element list for now
                     Ok(Value::List(vec![vals[0].clone(), vals[1].clone()]))
                 }
             }
@@ -290,11 +290,120 @@ fn apply_builtin(op: &str, vals: &[Value]) -> Result<Value, EvalError> {
             if vals.len() != 1 { return Err(EvalError::Arity("pair? requires 1 argument".into())); }
             Ok(Value::Boolean(matches!(&vals[0], Value::List(e) if !e.is_empty())))
         }
+        "char?" => {
+            if vals.len() != 1 { return Err(EvalError::Arity("char? requires 1 argument".into())); }
+            Ok(Value::Boolean(matches!(&vals[0], Value::Char(_))))
+        }
+        // L05: display, write, newline
+        "display" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Arity("display requires 1 argument".into()));
+            }
+            out.borrow_mut().push_str(&vals[0].to_display_repr());
+            Ok(Value::Void)
+        }
+        "write" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Arity("write requires 1 argument".into()));
+            }
+            out.borrow_mut().push_str(&vals[0].to_display());
+            Ok(Value::Void)
+        }
+        "newline" => {
+            if !vals.is_empty() {
+                return Err(EvalError::Arity("newline requires 0 arguments".into()));
+            }
+            out.borrow_mut().push('\n');
+            Ok(Value::Void)
+        }
+        // L05: string operations
+        "string-append" => {
+            let mut result = std::string::String::new();
+            for v in vals {
+                match v {
+                    Value::String(s) => result.push_str(s),
+                    _ => return Err(EvalError::Type("string-append: expected string".into())),
+                }
+            }
+            Ok(Value::String(result))
+        }
+        "string-length" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Arity("string-length requires 1 argument".into()));
+            }
+            match &vals[0] {
+                Value::String(s) => Ok(Value::Integer(s.len() as i64)),
+                _ => Err(EvalError::Type("string-length: expected string".into())),
+            }
+        }
+        "substring" => {
+            if vals.len() != 3 {
+                return Err(EvalError::Arity("substring requires 3 arguments".into()));
+            }
+            let s = match &vals[0] {
+                Value::String(s) => s,
+                _ => return Err(EvalError::Type("substring: expected string".into())),
+            };
+            let start = expect_int(&vals[1])? as usize;
+            let end = expect_int(&vals[2])? as usize;
+            Ok(Value::String(s[start..end].to_string()))
+        }
+        "string->number" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Arity("string->number requires 1 argument".into()));
+            }
+            match &vals[0] {
+                Value::String(s) => match s.parse::<i64>() {
+                    Ok(n) => Ok(Value::Integer(n)),
+                    Err(_) => Ok(Value::Boolean(false)),
+                },
+                _ => Err(EvalError::Type("string->number: expected string".into())),
+            }
+        }
+        "number->string" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Arity("number->string requires 1 argument".into()));
+            }
+            let n = expect_int(&vals[0])?;
+            Ok(Value::String(n.to_string()))
+        }
+        "symbol->string" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Arity("symbol->string requires 1 argument".into()));
+            }
+            match &vals[0] {
+                Value::Symbol(s) => Ok(Value::String(s.clone())),
+                _ => Err(EvalError::Type("symbol->string: expected symbol".into())),
+            }
+        }
+        "string->symbol" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Arity("string->symbol requires 1 argument".into()));
+            }
+            match &vals[0] {
+                Value::String(s) => Ok(Value::Symbol(s.clone())),
+                _ => Err(EvalError::Type("string->symbol: expected string".into())),
+            }
+        }
+        "string-ref" => {
+            if vals.len() != 2 {
+                return Err(EvalError::Arity("string-ref requires 2 arguments".into()));
+            }
+            let s = match &vals[0] {
+                Value::String(s) => s,
+                _ => return Err(EvalError::Type("string-ref: expected string".into())),
+            };
+            let idx = expect_int(&vals[1])? as usize;
+            match s.chars().nth(idx) {
+                Some(c) => Ok(Value::Char(c)),
+                None => Err(EvalError::Type("string-ref: index out of bounds".into())),
+            }
+        }
         _ => Err(EvalError::UnboundVariable(op.into())),
     }
 }
 
-fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity("let requires bindings and body".into()));
     }
@@ -314,7 +423,7 @@ fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> 
                 Value::List(pair) if pair.len() == 2 => {
                     if let Value::Symbol(var) = &pair[0] {
                         params.push(var.clone());
-                        inits.push(eval(&pair[1], env)?);
+                        inits.push(eval(&pair[1], env, out)?);
                     } else {
                         return Err(EvalError::Type("let: expected symbol in binding".into()));
                     }
@@ -330,9 +439,8 @@ fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> 
             env: Rc::clone(&loop_env),
         };
         loop_env.borrow_mut().set(name.clone(), lambda);
-        // Call with initial values
         let func = loop_env.borrow().get(name)?;
-        apply(&func, &inits)
+        apply(&func, &inits, out)
     } else {
         let bindings_list = match &args[0] {
             Value::List(b) => b,
@@ -343,7 +451,7 @@ fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> 
             match binding {
                 Value::List(pair) if pair.len() == 2 => {
                     if let Value::Symbol(var) = &pair[0] {
-                        let val = eval(&pair[1], env)?;
+                        let val = eval(&pair[1], env, out)?;
                         local_env.borrow_mut().set(var.clone(), val);
                     } else {
                         return Err(EvalError::Type("let: expected symbol in binding".into()));
@@ -354,21 +462,21 @@ fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> 
         }
         let mut result = Value::Void;
         for expr in &args[1..] {
-            result = eval(expr, &local_env)?;
+            result = eval(expr, &local_env, out)?;
         }
         Ok(result)
     }
 }
 
-fn eval_begin(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_begin(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
     let mut result = Value::Void;
     for expr in args {
-        result = eval(expr, env)?;
+        result = eval(expr, env, out)?;
     }
     Ok(result)
 }
 
-fn eval_cond(clauses: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_cond(clauses: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
     for clause in clauses {
         match clause {
             Value::List(parts) if !parts.is_empty() => {
@@ -376,16 +484,16 @@ fn eval_cond(clauses: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalErr
                     if s == "else" {
                         let mut result = Value::Void;
                         for expr in &parts[1..] {
-                            result = eval(expr, env)?;
+                            result = eval(expr, env, out)?;
                         }
                         return Ok(result);
                     }
                 }
-                let test = eval(&parts[0], env)?;
+                let test = eval(&parts[0], env, out)?;
                 if test.is_truthy() {
                     let mut result = test;
                     for expr in &parts[1..] {
-                        result = eval(expr, env)?;
+                        result = eval(expr, env, out)?;
                     }
                     return Ok(result);
                 }
@@ -396,30 +504,30 @@ fn eval_cond(clauses: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalErr
     Ok(Value::Void)
 }
 
-fn eval_and(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_and(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Ok(Value::Boolean(true));
     }
     for arg in &args[..args.len() - 1] {
-        let val = eval(arg, env)?;
+        let val = eval(arg, env, out)?;
         if !val.is_truthy() {
             return Ok(val);
         }
     }
-    eval(&args[args.len() - 1], env)
+    eval(&args[args.len() - 1], env, out)
 }
 
-fn eval_or(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_or(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Ok(Value::Boolean(false));
     }
     for arg in &args[..args.len() - 1] {
-        let val = eval(arg, env)?;
+        let val = eval(arg, env, out)?;
         if val.is_truthy() {
             return Ok(val);
         }
     }
-    eval(&args[args.len() - 1], env)
+    eval(&args[args.len() - 1], env, out)
 }
 
 fn expect_int(v: &Value) -> Result<i64, EvalError> {

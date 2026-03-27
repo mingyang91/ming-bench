@@ -16,6 +16,7 @@ pub enum Value {
         body: Vec<Value>,
         env: Rc<RefCell<Env>>,
     },
+    Char(char),
     Void,
 }
 
@@ -27,6 +28,7 @@ impl PartialEq for Value {
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Void, Value::Void) => true,
             (Value::Lambda { .. }, Value::Lambda { .. }) => false,
             _ => false,
@@ -47,8 +49,23 @@ impl Value {
                     elems.iter().map(|v| v.to_display()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Char(c) => format!("#\\{}", c),
             Value::Lambda { .. } => "#<procedure>".into(),
             Value::Void => "".into(),
+        }
+    }
+
+    /// Display representation (no quotes on strings, chars as raw)
+    pub fn to_display_repr(&self) -> std::string::String {
+        match self {
+            Value::String(s) => s.clone(),
+            Value::Char(c) => c.to_string(),
+            Value::List(elems) => {
+                let inner: Vec<std::string::String> =
+                    elems.iter().map(|v| v.to_display_repr()).collect();
+                format!("({})", inner.join(" "))
+            }
+            _ => self.to_display(),
         }
     }
 

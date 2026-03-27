@@ -7,29 +7,39 @@ mod value;
 pub use error::EvalError;
 use env::Env;
 use parser::Parser;
-use eval::eval;
+use eval::{eval, Output};
 use value::Value;
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+const BUILTINS: &[&str] = &[
+    "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
+    "cons", "car", "cdr", "list", "length", "null?", "append",
+    "number?", "boolean?", "string?", "symbol?", "pair?", "char?",
+    "display", "write", "newline",
+    "string-append", "string-length", "substring",
+    "string->number", "number->string",
+    "symbol->string", "string->symbol", "string-ref",
+];
+
+fn make_env() -> Rc<RefCell<Env>> {
+    let env = Env::new();
+    for name in BUILTINS {
+        env.borrow_mut().set(name.to_string(), Value::Symbol(name.to_string()));
+    }
+    env
+}
 
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
-///
-/// # Examples
-/// ```
-/// use ming::scheme::eval_str;
-/// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
-/// ```
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = Parser::new(input).parse_all()?;
-    let env = Env::new();
-    // Pre-populate builtins as symbols
-    for name in &["+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
-                   "cons", "car", "cdr", "list", "length", "null?", "append",
-                   "number?", "boolean?", "string?", "symbol?", "pair?"] {
-        env.borrow_mut().set(name.to_string(), Value::Symbol(name.to_string()));
-    }
+    let env = make_env();
+    let out: Output = Rc::new(RefCell::new(String::new()));
     let mut result = Value::Boolean(false);
     for (expr, line, col) in exprs {
-        result = eval(&expr, &env).map_err(|e| EvalError::WithPosition {
+        result = eval(&expr, &env, &out).map_err(|e| EvalError::WithPosition {
             error: Box::new(e),
             line,
             col,
@@ -41,8 +51,19 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    let result = eval_str(input)?;
-    Ok((result, String::new()))
+    let exprs = Parser::new(input).parse_all()?;
+    let env = make_env();
+    let out: Output = Rc::new(RefCell::new(String::new()));
+    let mut result = Value::Boolean(false);
+    for (expr, line, col) in exprs {
+        result = eval(&expr, &env, &out).map_err(|e| EvalError::WithPosition {
+            error: Box::new(e),
+            line,
+            col,
+        })?;
+    }
+    let output = out.borrow().clone();
+    Ok((result.to_display(), output))
 }
 
 #[cfg(test)]
