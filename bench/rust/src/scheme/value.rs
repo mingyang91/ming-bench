@@ -52,6 +52,7 @@ pub enum Value {
     CaseLambda {
         clauses: Vec<(Vec<std::string::String>, Option<std::string::String>, Vec<Value>, Rc<RefCell<Env>>)>,
     },
+    Vector(Rc<RefCell<Vec<Value>>>),
 }
 
 impl PartialEq for Value {
@@ -72,6 +73,7 @@ impl PartialEq for Value {
             (Value::Record { type_id: a, fields: af }, Value::Record { type_id: b, fields: bf }) => a == b && af == bf,
             (Value::RecordProc { .. }, Value::RecordProc { .. }) => false,
             (Value::CaseLambda { .. }, Value::CaseLambda { .. }) => false,
+            (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -127,6 +129,11 @@ impl Value {
             Value::Record { .. } => "#<record>".into(),
             Value::RecordProc { .. } => "#<procedure>".into(),
             Value::CaseLambda { .. } => "#<procedure>".into(),
+            Value::Vector(v) => {
+                let elems = v.borrow();
+                let inner: Vec<std::string::String> = elems.iter().map(|v| v.to_display()).collect();
+                format!("#({})", inner.join(" "))
+            }
             Value::Void => "".into(),
         }
     }
@@ -153,6 +160,11 @@ impl Value {
             }
             Value::Pair(a, b) => format!("({} . {})", a.to_display_repr(), b.to_display_repr()),
             Value::CaseLambda { .. } => "#<procedure>".into(),
+            Value::Vector(v) => {
+                let elems = v.borrow();
+                let inner: Vec<std::string::String> = elems.iter().map(|v| v.to_display_repr()).collect();
+                format!("#({})", inner.join(" "))
+            }
             _ => self.to_display(),
         }
     }

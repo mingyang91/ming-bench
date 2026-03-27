@@ -34,6 +34,10 @@ const BUILTINS: &[&str] = &[
     "numerator", "denominator", "integer?", "rational?",
     // L13
     "procedure?",
+    // L14
+    "eqv?", "vector", "make-vector", "vector-ref", "vector-length",
+    "vector?", "vector->list", "list->vector",
+    "for-each",
 ];
 
 fn make_env() -> Rc<RefCell<Env>> {
