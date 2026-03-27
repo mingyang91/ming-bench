@@ -384,10 +384,17 @@ func evalInput(input string) (string, string, error) {
 	intp := newInterpreter()
 	result := any(voidValue{})
 
-	for _, expression := range parsed {
-		result, err = intp.eval(expression, intp.global)
+	if continuationsEnabledAtCurrentLevel() {
+		result, err = intp.evalProgramWithContinuations(parsed)
 		if err != nil {
 			return "", intp.output.String(), err
+		}
+	} else {
+		for _, expression := range parsed {
+			result, err = intp.eval(expression, intp.global)
+			if err != nil {
+				return "", intp.output.String(), err
+			}
 		}
 	}
 
@@ -415,7 +422,7 @@ func installBuiltins(env *environment) {
 		"cons", "car", "cdr", "set-car!", "set-cdr!", "null?", "list", "length", "append", "reverse",
 		"vector", "make-vector", "vector?", "vector-length", "vector-ref", "vector-set!", "vector->list", "list->vector",
 		"string?", "number?", "integer?", "rational?", "exact?", "inexact?", "boolean?", "pair?", "symbol?", "procedure?",
-		"apply", "eqv?", "eq?", "equal?",
+		"apply", "eqv?", "eq?", "equal?", "call/cc", "call-with-current-continuation",
 		"display", "write", "newline", "error",
 		"string-append", "string-length", "substring", "make-string", "string",
 		"string->number", "number->string", "exact->inexact", "inexact->exact", "numerator", "denominator",
@@ -2235,6 +2242,9 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		if len(args) != 1 {
 			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
 		}
+		if _, ok := args[0].(*continuationProcedure); ok {
+			return true, nil
+		}
 		_, ok := args[0].(callable)
 		return ok, nil
 
@@ -2856,6 +2866,9 @@ func eqValues(left, right any) bool {
 	case *caseLambdaProcedure:
 		r, ok := right.(*caseLambdaProcedure)
 		return ok && l == r
+	case *continuationProcedure:
+		r, ok := right.(*continuationProcedure)
+		return ok && l == r
 	default:
 		return false
 	}
@@ -2952,6 +2965,9 @@ func equalValuesSeen(left, right any, seenPairs map[pairComparison]struct{}, see
 		return ok && l == r
 	case *caseLambdaProcedure:
 		r, ok := right.(*caseLambdaProcedure)
+		return ok && l == r
+	case *continuationProcedure:
+		r, ok := right.(*continuationProcedure)
 		return ok && l == r
 	default:
 		return false
@@ -3088,6 +3104,8 @@ func formatValueWithState(value any, state *formatState) string {
 		return formatPairWithState(v, state)
 	case *recordValue:
 		return fmt.Sprintf("#<record %s>", v.recordType.name)
+	case *continuationProcedure:
+		return "#<procedure>"
 	case callable:
 		return "#<procedure>"
 	default:
