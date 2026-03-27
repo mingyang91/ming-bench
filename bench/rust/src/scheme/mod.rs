@@ -5,6 +5,7 @@ mod number;
 mod parser;
 mod record;
 mod render;
+mod special_forms;
 
 pub use error::{EvalError, SourcePos};
 use macros::{MacroEnvRef, MacroEnvironment};
@@ -79,7 +80,7 @@ struct Procedure {
 struct ProcedureClause {
     params: Vec<String>,
     rest_param: Option<String>,
-    body: Vec<Expr>,
+    body: Rc<Expr>,
 }
 
 #[derive(Clone)]
@@ -184,6 +185,27 @@ enum BuiltinKind {
 struct Environment {
     parent: Option<EnvRef>,
     bindings: HashMap<String, BindingRef>,
+}
+
+#[derive(Clone)]
+struct OwnedExprRef {
+    root: Rc<Expr>,
+    path: Vec<usize>,
+}
+
+enum EvalTarget<'a> {
+    BorrowedExpr(&'a Expr),
+    BorrowedSequence(&'a [Expr]),
+    OwnedExpr(OwnedExprRef),
+}
+
+enum EvalStep<'a> {
+    Value(Value),
+    Tail {
+        target: EvalTarget<'a>,
+        env: EnvRef,
+        macro_env: MacroEnvRef,
+    },
 }
 
 impl Value {
@@ -408,7 +430,7 @@ impl ProcedureClause {
         Self {
             params,
             rest_param,
-            body,
+            body: wrap_procedure_body(body),
         }
     }
 
@@ -435,6 +457,51 @@ impl Environment {
     }
 }
 
+impl OwnedExprRef {
+    fn new(root: Rc<Expr>) -> Self {
+        Self {
+            root,
+            path: Vec::new(),
+        }
+    }
+
+    fn current(&self) -> &Expr {
+        let mut expr = self.root.as_ref();
+        for &index in &self.path {
+            let Expr::List(items, _) = expr else {
+                unreachable!("owned expression paths must stay within list expressions");
+            };
+            expr = items
+                .get(index)
+                .expect("owned expression path index must be valid");
+        }
+        expr
+    }
+
+    fn child(&self, index: usize) -> Self {
+        let mut path = self.path.clone();
+        path.push(index);
+        Self {
+            root: Rc::clone(&self.root),
+            path,
+        }
+    }
+}
+
+fn wrap_procedure_body(body: Vec<Expr>) -> Rc<Expr> {
+    match body.len() {
+        0 => unreachable!("procedure bodies must not be empty"),
+        1 => Rc::new(body.into_iter().next().expect("body length checked")),
+        _ => {
+            let position = body[0].position();
+            let mut items = Vec::with_capacity(body.len() + 1);
+            items.push(Expr::Symbol("begin".into(), position));
+            items.extend(body);
+            Rc::new(Expr::List(items, position))
+        }
+    }
+}
+
 fn make_procedure(clauses: Vec<ProcedureClause>, env: &EnvRef, macro_env: &MacroEnvRef) -> Value {
     Value::Procedure(Rc::new(Procedure {
         clauses,
@@ -455,6 +522,14 @@ fn single_clause_procedure(
         env,
         macro_env,
     )
+}
+
+fn apply_callable(callable: Value, args: &[Value]) -> Result<Value, EvalError> {
+    special_forms::apply_callable(callable, args)
+}
+
+fn parse_required_param_names(items: &[Expr]) -> Result<Vec<String>, EvalError> {
+    special_forms::parse_required_param_names(items)
 }
 
 fn values_eq(lhs: &Value, rhs: &Value) -> bool {
@@ -552,6 +627,61 @@ fn env_set(env: &EnvRef, name: &str, value: Value) -> bool {
     }
 }
 
+fn tail_borrowed_expr<'a>(expr: &'a Expr, env: &EnvRef, macro_env: &MacroEnvRef) -> EvalStep<'a> {
+    EvalStep::Tail {
+        target: EvalTarget::BorrowedExpr(expr),
+        env: Rc::clone(env),
+        macro_env: Rc::clone(macro_env),
+    }
+}
+
+fn tail_borrowed_sequence<'a>(
+    exprs: &'a [Expr],
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+) -> EvalStep<'a> {
+    EvalStep::Tail {
+        target: EvalTarget::BorrowedSequence(exprs),
+        env: Rc::clone(env),
+        macro_env: Rc::clone(macro_env),
+    }
+}
+
+fn tail_owned_expr<'a>(expr: OwnedExprRef, env: &EnvRef, macro_env: &MacroEnvRef) -> EvalStep<'a> {
+    EvalStep::Tail {
+        target: EvalTarget::OwnedExpr(expr),
+        env: Rc::clone(env),
+        macro_env: Rc::clone(macro_env),
+    }
+}
+
+fn eval_target<'a>(
+    mut target: EvalTarget<'a>,
+    mut env: EnvRef,
+    mut macro_env: MacroEnvRef,
+) -> Result<Value, EvalError> {
+    loop {
+        let step = match &target {
+            EvalTarget::BorrowedExpr(expr) => eval_expr_step(expr, &env, &macro_env)?,
+            EvalTarget::BorrowedSequence(exprs) => eval_sequence_step(exprs, &env, &macro_env)?,
+            EvalTarget::OwnedExpr(expr) => eval_owned_expr_step(expr, &env, &macro_env)?,
+        };
+
+        match step {
+            EvalStep::Value(value) => return Ok(value),
+            EvalStep::Tail {
+                target: next_target,
+                env: next_env,
+                macro_env: next_macro_env,
+            } => {
+                target = next_target;
+                env = next_env;
+                macro_env = next_macro_env;
+            }
+        }
+    }
+}
+
 fn eval_program(exprs: &[Expr], output: OutputRef) -> Result<Value, EvalError> {
     if exprs.is_empty() {
         return Err(EvalError::EmptyInput);
@@ -567,21 +697,47 @@ fn eval_sequence(
     env: &EnvRef,
     macro_env: &MacroEnvRef,
 ) -> Result<Value, EvalError> {
-    let mut last = Value::Void;
-
-    for expr in exprs {
-        last = eval_expr(expr, env, macro_env)?;
-    }
-
-    Ok(last)
+    eval_target(
+        EvalTarget::BorrowedSequence(exprs),
+        Rc::clone(env),
+        Rc::clone(macro_env),
+    )
 }
 
 fn eval_expr(expr: &Expr, env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
+    eval_target(
+        EvalTarget::BorrowedExpr(expr),
+        Rc::clone(env),
+        Rc::clone(macro_env),
+    )
+}
+
+fn eval_sequence_step<'a>(
+    exprs: &'a [Expr],
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+) -> Result<EvalStep<'a>, EvalError> {
+    let Some((last, prefix)) = exprs.split_last() else {
+        return Ok(EvalStep::Value(Value::Void));
+    };
+
+    for expr in prefix {
+        eval_expr(expr, env, macro_env)?;
+    }
+
+    Ok(tail_borrowed_expr(last, env, macro_env))
+}
+
+fn eval_expr_step<'a>(
+    expr: &'a Expr,
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+) -> Result<EvalStep<'a>, EvalError> {
     match expr {
-        Expr::Number(value, _) => Ok(Value::Number(*value)),
-        Expr::Boolean(value, _) => Ok(Value::Boolean(*value)),
-        Expr::String(value, _) => Ok(Value::String(value.clone())),
-        Expr::Char(value, _) => Ok(Value::Char(*value)),
+        Expr::Number(value, _) => Ok(EvalStep::Value(Value::Number(*value))),
+        Expr::Boolean(value, _) => Ok(EvalStep::Value(Value::Boolean(*value))),
+        Expr::String(value, _) => Ok(EvalStep::Value(Value::String(value.clone()))),
+        Expr::Char(value, _) => Ok(EvalStep::Value(Value::Char(*value))),
         Expr::Symbol(name, position) => {
             let value = env_lookup(env, name).ok_or_else(|| {
                 EvalError::UnboundVariable { name: name.clone() }.with_position(*position)
@@ -589,7 +745,7 @@ fn eval_expr(expr: &Expr, env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value
             if matches!(value, Value::Uninitialized) {
                 Err(EvalError::UninitializedBinding { name: name.clone() }.with_position(*position))
             } else {
-                Ok(value)
+                Ok(EvalStep::Value(value))
             }
         }
         Expr::CapturedSymbol(name, binding, position) => {
@@ -597,21 +753,55 @@ fn eval_expr(expr: &Expr, env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value
             if matches!(value, Value::Uninitialized) {
                 Err(EvalError::UninitializedBinding { name: name.clone() }.with_position(*position))
             } else {
-                Ok(value)
+                Ok(EvalStep::Value(value))
+            }
+        }
+        Expr::List(items, position) => eval_borrowed_list_step(items, *position, env, macro_env)
+            .map_err(|err| err.with_position(*position)),
+    }
+}
+
+fn eval_owned_expr_step<'a>(
+    expr: &OwnedExprRef,
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+) -> Result<EvalStep<'a>, EvalError> {
+    match expr.current() {
+        Expr::Number(value, _) => Ok(EvalStep::Value(Value::Number(*value))),
+        Expr::Boolean(value, _) => Ok(EvalStep::Value(Value::Boolean(*value))),
+        Expr::String(value, _) => Ok(EvalStep::Value(Value::String(value.clone()))),
+        Expr::Char(value, _) => Ok(EvalStep::Value(Value::Char(*value))),
+        Expr::Symbol(name, position) => {
+            let value = env_lookup(env, name).ok_or_else(|| {
+                EvalError::UnboundVariable { name: name.clone() }.with_position(*position)
+            })?;
+            if matches!(value, Value::Uninitialized) {
+                Err(EvalError::UninitializedBinding { name: name.clone() }.with_position(*position))
+            } else {
+                Ok(EvalStep::Value(value))
+            }
+        }
+        Expr::CapturedSymbol(name, binding, position) => {
+            let value = binding.borrow().clone();
+            if matches!(value, Value::Uninitialized) {
+                Err(EvalError::UninitializedBinding { name: name.clone() }.with_position(*position))
+            } else {
+                Ok(EvalStep::Value(value))
             }
         }
         Expr::List(items, position) => {
-            eval_list(items, *position, env, macro_env).map_err(|err| err.with_position(*position))
+            eval_owned_list_step(expr, items, *position, env, macro_env)
+                .map_err(|err| err.with_position(*position))
         }
     }
 }
 
-fn eval_list(
-    items: &[Expr],
+fn eval_borrowed_list_step<'a>(
+    items: &'a [Expr],
     position: SourcePos,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<Value, EvalError> {
+) -> Result<EvalStep<'a>, EvalError> {
     let Some(head) = items.first() else {
         return Err(EvalError::SyntaxError {
             message: "cannot evaluate empty list".into(),
@@ -623,70 +813,79 @@ fn eval_list(
     if let Expr::Symbol(name, _) = head {
         match name.as_str() {
             "define" => {
-                return eval_define(&items[1..], env, macro_env)
+                return special_forms::eval_define(&items[1..], env, macro_env)
+                    .map(EvalStep::Value)
                     .map_err(|err| err.with_position(head_position))
             }
             "define-syntax" => {
                 return macros::eval_define_syntax(&items[1..], env, macro_env)
+                    .map(EvalStep::Value)
                     .map_err(|err| err.with_position(head_position))
             }
             "if" => {
-                return eval_if(&items[1..], env, macro_env)
+                return special_forms::eval_if(&items[1..], env, macro_env)
                     .map_err(|err| err.with_position(head_position))
             }
             "quote" => {
-                return eval_quote(&items[1..]).map_err(|err| err.with_position(head_position))
+                return special_forms::eval_quote(&items[1..])
+                    .map(EvalStep::Value)
+                    .map_err(|err| err.with_position(head_position))
             }
             "lambda" => {
-                return eval_lambda(&items[1..], env, macro_env)
+                return special_forms::eval_lambda(&items[1..], env, macro_env)
+                    .map(EvalStep::Value)
                     .map_err(|err| err.with_position(head_position))
             }
             "case-lambda" => {
-                return eval_case_lambda(&items[1..], env, macro_env)
+                return special_forms::eval_case_lambda(&items[1..], env, macro_env)
+                    .map(EvalStep::Value)
                     .map_err(|err| err.with_position(head_position))
             }
             "define-record-type" => {
                 return eval_define_record_type(&items[1..], env)
+                    .map(EvalStep::Value)
                     .map_err(|err| err.with_position(head_position))
             }
             "set!" => {
-                return eval_set(&items[1..], env, macro_env)
+                return special_forms::eval_set(&items[1..], env, macro_env)
+                    .map(EvalStep::Value)
                     .map_err(|err| err.with_position(head_position))
             }
             "and" => {
-                return eval_and(&items[1..], env, macro_env)
+                return special_forms::eval_and(&items[1..], env, macro_env)
                     .map_err(|err| err.with_position(head_position))
             }
             "or" => {
-                return eval_or(&items[1..], env, macro_env)
+                return special_forms::eval_or(&items[1..], env, macro_env)
                     .map_err(|err| err.with_position(head_position))
             }
             "begin" => {
-                return eval_begin(&items[1..], env, macro_env)
+                return special_forms::eval_begin(&items[1..], env, macro_env)
                     .map_err(|err| err.with_position(head_position))
             }
             "cond" => {
-                return eval_cond(&items[1..], env, macro_env)
+                return special_forms::eval_cond(&items[1..], env, macro_env)
                     .map_err(|err| err.with_position(head_position))
             }
             "let" => {
-                return eval_let(&items[1..], env, macro_env)
+                return special_forms::eval_let(&items[1..], env, macro_env)
                     .map_err(|err| err.with_position(head_position))
             }
             "letrec" => {
-                return eval_letrec(&items[1..], env, macro_env, false)
+                return special_forms::eval_letrec(&items[1..], env, macro_env, false)
                     .map_err(|err| err.with_position(head_position))
             }
             "letrec*" => {
-                return eval_letrec(&items[1..], env, macro_env, true)
+                return special_forms::eval_letrec(&items[1..], env, macro_env, true)
                     .map_err(|err| err.with_position(head_position))
             }
             "case" => {
-                return eval_case(&items[1..], env, macro_env)
+                return special_forms::eval_case(&items[1..], env, macro_env)
                     .map_err(|err| err.with_position(head_position))
             }
             "do" => {
-                return eval_do(&items[1..], env, macro_env)
+                return special_forms::eval_do(&items[1..], env, macro_env)
+                    .map(EvalStep::Value)
                     .map_err(|err| err.with_position(head_position))
             }
             _ => {}
@@ -696,7 +895,7 @@ fn eval_list(
     if let Some(expanded) = macros::expand_macro_call(items, position, macro_env)
         .map_err(|err| err.with_position(head_position))?
     {
-        return eval_expr(&expanded, env, macro_env);
+        return eval_expr(&expanded, env, macro_env).map(EvalStep::Value);
     }
 
     let callable = match head {
@@ -711,686 +910,127 @@ fn eval_list(
         args.push(eval_expr(expr, env, macro_env)?);
     }
 
-    apply_callable(callable, &args).map_err(|err| err.with_position(head_position))
+    special_forms::apply_callable_result(callable, &args)
+        .map_err(|err| err.with_position(head_position))
 }
 
-fn eval_define(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
-    if let [Expr::Symbol(name, _), value_expr] = args {
-        let value = eval_expr(value_expr, env, macro_env)?;
-        env_define(env, name.clone(), value);
-        return Ok(Value::Void);
-    }
-
-    if let Some((Expr::List(signature, _), body)) = args.split_first() {
-        let Some((Expr::Symbol(name, _), params)) = signature.split_first() else {
-            return Err(EvalError::SyntaxError {
-                message: "invalid function definition".into(),
-            });
-        };
-
-        if body.is_empty() {
-            return Err(EvalError::SyntaxError {
-                message: "function definition requires a body".into(),
-            });
-        }
-
-        let (params, rest_param) = parse_param_list_items(params)?;
-        let procedure = single_clause_procedure(params, rest_param, body.to_vec(), env, macro_env);
-
-        env_define(env, name.clone(), procedure);
-        return Ok(Value::Void);
-    }
-
-    Err(EvalError::SyntaxError {
-        message: "invalid define".into(),
-    })
-}
-
-fn eval_if(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
-    match args {
-        [condition, consequent] => {
-            if eval_expr(condition, env, macro_env)?.is_truthy() {
-                eval_expr(consequent, env, macro_env)
-            } else {
-                Ok(Value::Void)
-            }
-        }
-        [condition, consequent, alternate] => {
-            if eval_expr(condition, env, macro_env)?.is_truthy() {
-                eval_expr(consequent, env, macro_env)
-            } else {
-                eval_expr(alternate, env, macro_env)
-            }
-        }
-        _ => Err(EvalError::WrongArgCount {
-            name: "if".into(),
-            expected: "2 or 3 arguments".into(),
-            got: args.len(),
-        }),
-    }
-}
-
-fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
-    match args {
-        [datum] => quote_to_value(datum),
-        _ => Err(EvalError::WrongArgCount {
-            name: "quote".into(),
-            expected: "exactly 1 argument".into(),
-            got: args.len(),
-        }),
-    }
-}
-
-fn quote_to_value(expr: &Expr) -> Result<Value, EvalError> {
-    match expr {
-        Expr::Number(value, _) => Ok(Value::Number(*value)),
-        Expr::Boolean(value, _) => Ok(Value::Boolean(*value)),
-        Expr::String(value, _) => Ok(Value::String(value.clone())),
-        Expr::Char(value, _) => Ok(Value::Char(*value)),
-        Expr::Symbol(name, _) => Ok(Value::Symbol(name.clone())),
-        Expr::CapturedSymbol(name, _, _) => Ok(Value::Symbol(name.clone())),
-        Expr::List(items, _) => {
-            let mut values = Vec::with_capacity(items.len());
-            for item in items {
-                values.push(quote_to_value(item)?);
-            }
-            Ok(Value::List(values))
-        }
-    }
-}
-
-fn eval_lambda(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
-    let Some((params_expr, body)) = args.split_first() else {
-        return Err(EvalError::SyntaxError {
-            message: "lambda requires a parameter list and body".into(),
-        });
-    };
-
-    if body.is_empty() {
-        return Err(EvalError::SyntaxError {
-            message: "lambda requires a body".into(),
-        });
-    }
-
-    let (params, rest_param) = parse_param_list(params_expr)?;
-    Ok(single_clause_procedure(
-        params,
-        rest_param,
-        body.to_vec(),
-        env,
-        macro_env,
-    ))
-}
-
-fn eval_case_lambda(
-    args: &[Expr],
+fn eval_owned_list_step<'a>(
+    expr: &OwnedExprRef,
+    items: &[Expr],
+    position: SourcePos,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<Value, EvalError> {
-    if args.is_empty() {
+) -> Result<EvalStep<'a>, EvalError> {
+    let Some(head) = items.first() else {
         return Err(EvalError::SyntaxError {
-            message: "case-lambda requires at least one clause".into(),
+            message: "cannot evaluate empty list".into(),
         });
-    }
-
-    let mut clauses = Vec::with_capacity(args.len());
-    for clause in args {
-        let Expr::List(items, _) = clause else {
-            return Err(EvalError::SyntaxError {
-                message: "case-lambda clauses must be lists".into(),
-            });
-        };
-
-        let Some((params_expr, body)) = items.split_first() else {
-            return Err(EvalError::SyntaxError {
-                message: "case-lambda clause cannot be empty".into(),
-            });
-        };
-
-        if body.is_empty() {
-            return Err(EvalError::SyntaxError {
-                message: "case-lambda clause requires a body".into(),
-            });
-        }
-
-        let (params, rest_param) = parse_param_list(params_expr)?;
-        clauses.push(ProcedureClause::new(params, rest_param, body.to_vec()));
-    }
-
-    Ok(make_procedure(clauses, env, macro_env))
-}
-
-fn eval_set(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
-    match args {
-        [Expr::Symbol(name, position), value_expr] => {
-            let value = eval_expr(value_expr, env, macro_env)?;
-            if env_set(env, name, value) {
-                Ok(Value::Void)
-            } else {
-                Err(EvalError::UnboundVariable { name: name.clone() }.with_position(*position))
-            }
-        }
-        [Expr::CapturedSymbol(_, binding, _), value_expr] => {
-            let value = eval_expr(value_expr, env, macro_env)?;
-            *binding.borrow_mut() = value;
-            Ok(Value::Void)
-        }
-        [_, _] => Err(EvalError::SyntaxError {
-            message: "set! target must be a symbol".into(),
-        }),
-        _ => Err(EvalError::WrongArgCount {
-            name: "set!".into(),
-            expected: "exactly 2 arguments".into(),
-            got: args.len(),
-        }),
-    }
-}
-
-fn parse_param_list(params_expr: &Expr) -> Result<(Vec<String>, Option<String>), EvalError> {
-    match params_expr {
-        Expr::List(items, _) => parse_param_list_items(items),
-        Expr::Symbol(name, _) if name != "." => Ok((Vec::new(), Some(name.clone()))),
-        _ => Err(EvalError::SyntaxError {
-            message: "parameter list must be a symbol or list of symbols".into(),
-        }),
-    }
-}
-
-fn parse_param_list_items(items: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
-    let dot_index = items
-        .iter()
-        .position(|item| matches!(item, Expr::Symbol(name, _) if name == "."));
-
-    let Some(dot_index) = dot_index else {
-        return Ok((parse_required_param_names(items)?, None));
     };
 
-    if items[dot_index + 1..]
-        .iter()
-        .any(|item| matches!(item, Expr::Symbol(name, _) if name == "."))
-        || dot_index + 2 != items.len()
+    let head_position = head.position();
+
+    if let Expr::Symbol(name, _) = head {
+        match name.as_str() {
+            "define" => {
+                return special_forms::eval_define(&items[1..], env, macro_env)
+                    .map(EvalStep::Value)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "define-syntax" => {
+                return macros::eval_define_syntax(&items[1..], env, macro_env)
+                    .map(EvalStep::Value)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "if" => {
+                return special_forms::eval_owned_if(expr, env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "quote" => {
+                return special_forms::eval_quote(&items[1..])
+                    .map(EvalStep::Value)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "lambda" => {
+                return special_forms::eval_lambda(&items[1..], env, macro_env)
+                    .map(EvalStep::Value)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "case-lambda" => {
+                return special_forms::eval_case_lambda(&items[1..], env, macro_env)
+                    .map(EvalStep::Value)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "define-record-type" => {
+                return eval_define_record_type(&items[1..], env)
+                    .map(EvalStep::Value)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "set!" => {
+                return special_forms::eval_set(&items[1..], env, macro_env)
+                    .map(EvalStep::Value)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "and" => {
+                return special_forms::eval_owned_and(expr, env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "or" => {
+                return special_forms::eval_owned_or(expr, env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "begin" => {
+                return special_forms::eval_owned_begin(expr, env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "cond" => {
+                return special_forms::eval_owned_cond(expr, env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "let" => {
+                return special_forms::eval_owned_let(expr, env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "letrec" => {
+                return special_forms::eval_owned_letrec(expr, env, macro_env, false)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "letrec*" => {
+                return special_forms::eval_owned_letrec(expr, env, macro_env, true)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "case" => {
+                return special_forms::eval_owned_case(expr, env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "do" => {
+                return special_forms::eval_do(&items[1..], env, macro_env)
+                    .map(EvalStep::Value)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(expanded) = macros::expand_macro_call(items, position, macro_env)
+        .map_err(|err| err.with_position(head_position))?
     {
-        return Err(EvalError::SyntaxError {
-            message: "invalid dotted parameter list".into(),
-        });
+        return eval_expr(&expanded, env, macro_env).map(EvalStep::Value);
     }
 
-    let params = parse_required_param_names(&items[..dot_index])?;
-    let rest_param = parse_param_name(&items[dot_index + 1])?;
-    Ok((params, Some(rest_param)))
-}
-
-fn parse_required_param_names(items: &[Expr]) -> Result<Vec<String>, EvalError> {
-    let mut params = Vec::with_capacity(items.len());
-    for item in items {
-        params.push(parse_param_name(item)?);
-    }
-    Ok(params)
-}
-
-fn parse_param_name(item: &Expr) -> Result<String, EvalError> {
-    match item {
-        Expr::Symbol(name, _) if name != "." => Ok(name.clone()),
-        _ => Err(EvalError::SyntaxError {
-            message: "parameter names must be symbols".into(),
-        }),
-    }
-}
-
-fn apply_callable(callable: Value, args: &[Value]) -> Result<Value, EvalError> {
-    match callable {
-        Value::Procedure(procedure) => apply_procedure(&procedure, args),
-        Value::NativeProcedure(procedure) => procedure.apply(args),
-        Value::Builtin(builtin) => builtin.apply(args),
-        other => Err(EvalError::NotCallable {
-            found: other.type_name().into(),
-        }),
-    }
-}
-
-fn apply_procedure(procedure: &Procedure, args: &[Value]) -> Result<Value, EvalError> {
-    let clause = procedure
-        .clauses
-        .iter()
-        .find(|clause| clause.matches_arity(args.len()))
-        .ok_or_else(|| EvalError::WrongArgCount {
-            name: if procedure.clauses.len() > 1 {
-                "case-lambda".into()
-            } else {
-                "lambda".into()
-            },
-            expected: procedure_expected_arity(procedure),
-            got: args.len(),
-        })?;
-
-    apply_procedure_clause(clause, &procedure.env, &procedure.macro_env, args)
-}
-
-fn procedure_expected_arity(procedure: &Procedure) -> String {
-    if let [clause] = procedure.clauses.as_slice() {
-        return clause.expected_arity();
-    }
-
-    let mut arities = Vec::with_capacity(procedure.clauses.len());
-    for clause in &procedure.clauses {
-        let expected = clause.expected_arity();
-        if !arities.contains(&expected) {
-            arities.push(expected);
-        }
-    }
-
-    format!("one of {}", arities.join(", "))
-}
-
-fn apply_procedure_clause(
-    clause: &ProcedureClause,
-    env: &EnvRef,
-    macro_env: &MacroEnvRef,
-    args: &[Value],
-) -> Result<Value, EvalError> {
-    let required = clause.params.len();
-    let call_env = Environment::new(Some(Rc::clone(env)));
-    for (param, arg) in clause.params.iter().zip(args.iter().take(required)) {
-        env_define(&call_env, param.clone(), arg.clone());
-    }
-    if let Some(rest_param) = &clause.rest_param {
-        env_define(
-            &call_env,
-            rest_param.clone(),
-            Value::List(args[required..].to_vec()),
-        );
-    }
-
-    let call_macro_env = MacroEnvironment::new(Some(Rc::clone(macro_env)));
-    eval_sequence(&clause.body, &call_env, &call_macro_env)
-}
-
-fn eval_and(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
-    let mut last = Value::Boolean(true);
-
-    for expr in args {
-        let value = eval_expr(expr, env, macro_env)?;
-        if !value.is_truthy() {
-            return Ok(value);
-        }
-        last = value;
-    }
-
-    Ok(last)
-}
-
-fn eval_or(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
-    for expr in args {
-        let value = eval_expr(expr, env, macro_env)?;
-        if value.is_truthy() {
-            return Ok(value);
-        }
-    }
-
-    Ok(Value::Boolean(false))
-}
-
-fn eval_begin(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
-    eval_sequence(args, env, macro_env)
-}
-
-fn eval_cond(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
-    for (index, clause) in args.iter().enumerate() {
-        let Expr::List(items, _) = clause else {
-            return Err(EvalError::SyntaxError {
-                message: "cond clauses must be lists".into(),
-            });
-        };
-
-        let Some((test, body)) = items.split_first() else {
-            return Err(EvalError::SyntaxError {
-                message: "cond clause cannot be empty".into(),
-            });
-        };
-
-        if matches!(test, Expr::Symbol(symbol, _) if symbol == "else") {
-            if index + 1 != args.len() {
-                return Err(EvalError::SyntaxError {
-                    message: "else clause must be last".into(),
-                });
-            }
-
-            return if body.is_empty() {
-                Ok(Value::Void)
-            } else {
-                eval_sequence(body, env, macro_env)
-            };
-        }
-
-        let test_value = eval_expr(test, env, macro_env)?;
-        if test_value.is_truthy() {
-            return if body.is_empty() {
-                Ok(test_value)
-            } else {
-                eval_sequence(body, env, macro_env)
-            };
-        }
-    }
-
-    Ok(Value::Void)
-}
-
-fn eval_let(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
-    match args {
-        [Expr::List(bindings, _), body @ ..] => eval_plain_let(bindings, body, env, macro_env),
-        [Expr::Symbol(name, _), Expr::List(bindings, _), body @ ..] => {
-            eval_named_let(name, bindings, body, env, macro_env)
-        }
-        _ => Err(EvalError::SyntaxError {
-            message: "invalid let".into(),
-        }),
-    }
-}
-
-fn eval_letrec(
-    args: &[Expr],
-    env: &EnvRef,
-    macro_env: &MacroEnvRef,
-    sequential: bool,
-) -> Result<Value, EvalError> {
-    let [Expr::List(bindings, _), body @ ..] = args else {
-        return Err(EvalError::SyntaxError {
-            message: if sequential {
-                "invalid letrec*".into()
-            } else {
-                "invalid letrec".into()
-            },
-        });
+    let callable = match head {
+        Expr::Symbol(name, position) => env_lookup(env, name).ok_or_else(|| {
+            EvalError::UnknownOperator { name: name.clone() }.with_position(*position)
+        })?,
+        _ => eval_expr(head, env, macro_env)?,
     };
 
-    if body.is_empty() {
-        return Err(EvalError::SyntaxError {
-            message: if sequential {
-                "letrec* requires a body".into()
-            } else {
-                "letrec requires a body".into()
-            },
-        });
+    let mut args = Vec::with_capacity(items.len().saturating_sub(1));
+    for expr in &items[1..] {
+        args.push(eval_expr(expr, env, macro_env)?);
     }
 
-    let bindings = parse_binding_exprs(bindings, if sequential { "letrec*" } else { "letrec" })?;
-    let let_env = Environment::new(Some(Rc::clone(env)));
-    let let_macro_env = MacroEnvironment::new(Some(Rc::clone(macro_env)));
-
-    for (name, _) in &bindings {
-        env_define(&let_env, name.clone(), Value::Uninitialized);
-    }
-
-    if sequential {
-        for (name, value_expr) in &bindings {
-            let value = eval_expr(value_expr, &let_env, &let_macro_env)?;
-            env_set(&let_env, name, value);
-        }
-    } else {
-        let mut values = Vec::with_capacity(bindings.len());
-        for (_, value_expr) in &bindings {
-            values.push(eval_expr(value_expr, &let_env, &let_macro_env)?);
-        }
-
-        for ((name, _), value) in bindings.iter().zip(values.into_iter()) {
-            env_set(&let_env, name, value);
-        }
-    }
-
-    eval_sequence(body, &let_env, &let_macro_env)
-}
-
-fn eval_case(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
-    let Some((key_expr, clauses)) = args.split_first() else {
-        return Err(EvalError::WrongArgCount {
-            name: "case".into(),
-            expected: "at least 1 argument".into(),
-            got: 0,
-        });
-    };
-
-    let key = eval_expr(key_expr, env, macro_env)?;
-
-    for (index, clause) in clauses.iter().enumerate() {
-        let Expr::List(items, _) = clause else {
-            return Err(EvalError::SyntaxError {
-                message: "case clauses must be lists".into(),
-            });
-        };
-
-        let Some((datums, body)) = items.split_first() else {
-            return Err(EvalError::SyntaxError {
-                message: "case clause cannot be empty".into(),
-            });
-        };
-
-        if matches!(datums, Expr::Symbol(symbol, _) if symbol == "else") {
-            if index + 1 != clauses.len() {
-                return Err(EvalError::SyntaxError {
-                    message: "else clause must be last".into(),
-                });
-            }
-
-            return if body.is_empty() {
-                Ok(Value::Void)
-            } else {
-                eval_sequence(body, env, macro_env)
-            };
-        }
-
-        let Expr::List(datums, _) = datums else {
-            return Err(EvalError::SyntaxError {
-                message: "case clause datums must be in a list".into(),
-            });
-        };
-
-        for datum in datums {
-            let datum = quote_to_value(datum)?;
-            if values_eqv(&key, &datum) {
-                return if body.is_empty() {
-                    Ok(Value::Void)
-                } else {
-                    eval_sequence(body, env, macro_env)
-                };
-            }
-        }
-    }
-
-    Ok(Value::Void)
-}
-
-fn eval_do(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
-    let [Expr::List(bindings, _), Expr::List(test_clause, _), body @ ..] = args else {
-        return Err(EvalError::SyntaxError {
-            message: "invalid do".into(),
-        });
-    };
-
-    let Some((test_expr, result_exprs)) = test_clause.split_first() else {
-        return Err(EvalError::SyntaxError {
-            message: "do test clause cannot be empty".into(),
-        });
-    };
-
-    let bindings = parse_do_bindings(bindings)?;
-    let do_env = Environment::new(Some(Rc::clone(env)));
-    let do_macro_env = MacroEnvironment::new(Some(Rc::clone(macro_env)));
-
-    for binding in &bindings {
-        let value = eval_expr(binding.init_expr, env, macro_env)?;
-        env_define(&do_env, binding.name.clone(), value);
-    }
-
-    loop {
-        if eval_expr(test_expr, &do_env, &do_macro_env)?.is_truthy() {
-            return if result_exprs.is_empty() {
-                Ok(Value::Void)
-            } else {
-                eval_sequence(result_exprs, &do_env, &do_macro_env)
-            };
-        }
-
-        if !body.is_empty() {
-            eval_sequence(body, &do_env, &do_macro_env)?;
-        }
-
-        let mut updates = Vec::with_capacity(bindings.len());
-        for binding in &bindings {
-            let value = if let Some(step_expr) = binding.step_expr {
-                eval_expr(step_expr, &do_env, &do_macro_env)?
-            } else {
-                env_lookup(&do_env, &binding.name).ok_or_else(|| EvalError::UnboundVariable {
-                    name: binding.name.clone(),
-                })?
-            };
-            updates.push((binding.name.clone(), value));
-        }
-
-        for (name, value) in updates {
-            env_set(&do_env, &name, value);
-        }
-    }
-}
-
-fn eval_plain_let(
-    bindings: &[Expr],
-    body: &[Expr],
-    env: &EnvRef,
-    macro_env: &MacroEnvRef,
-) -> Result<Value, EvalError> {
-    if body.is_empty() {
-        return Err(EvalError::SyntaxError {
-            message: "let requires a body".into(),
-        });
-    }
-
-    let bindings = parse_let_bindings(bindings, env, macro_env)?;
-    let let_env = Environment::new(Some(Rc::clone(env)));
-    for (name, value) in bindings {
-        env_define(&let_env, name, value);
-    }
-
-    let let_macro_env = MacroEnvironment::new(Some(Rc::clone(macro_env)));
-    eval_sequence(body, &let_env, &let_macro_env)
-}
-
-fn eval_named_let(
-    name: &str,
-    bindings: &[Expr],
-    body: &[Expr],
-    env: &EnvRef,
-    macro_env: &MacroEnvRef,
-) -> Result<Value, EvalError> {
-    if body.is_empty() {
-        return Err(EvalError::SyntaxError {
-            message: "let requires a body".into(),
-        });
-    }
-
-    let bindings = parse_let_bindings(bindings, env, macro_env)?;
-    let params = bindings
-        .iter()
-        .map(|(param, _)| param.clone())
-        .collect::<Vec<_>>();
-    let args = bindings
-        .into_iter()
-        .map(|(_, value)| value)
-        .collect::<Vec<_>>();
-
-    let let_env = Environment::new(Some(Rc::clone(env)));
-    let procedure = single_clause_procedure(params, None, body.to_vec(), &let_env, macro_env);
-    env_define(&let_env, name.to_string(), procedure.clone());
-
-    apply_callable(procedure, &args)
-}
-
-fn parse_let_bindings(
-    bindings: &[Expr],
-    env: &EnvRef,
-    macro_env: &MacroEnvRef,
-) -> Result<Vec<(String, Value)>, EvalError> {
-    let mut parsed = Vec::with_capacity(bindings.len());
-
-    for binding in bindings {
-        let Expr::List(items, _) = binding else {
-            return Err(EvalError::SyntaxError {
-                message: "let bindings must be lists".into(),
-            });
-        };
-
-        let [Expr::Symbol(name, _), value_expr] = items.as_slice() else {
-            return Err(EvalError::SyntaxError {
-                message: "let bindings must be (name value) pairs".into(),
-            });
-        };
-
-        parsed.push((name.clone(), eval_expr(value_expr, env, macro_env)?));
-    }
-
-    Ok(parsed)
-}
-
-fn parse_binding_exprs<'a>(
-    bindings: &'a [Expr],
-    form_name: &str,
-) -> Result<Vec<(String, &'a Expr)>, EvalError> {
-    let mut parsed = Vec::with_capacity(bindings.len());
-
-    for binding in bindings {
-        let Expr::List(items, _) = binding else {
-            return Err(EvalError::SyntaxError {
-                message: format!("{form_name} bindings must be lists"),
-            });
-        };
-
-        let [Expr::Symbol(name, _), value_expr] = items.as_slice() else {
-            return Err(EvalError::SyntaxError {
-                message: format!("{form_name} bindings must be (name value) pairs"),
-            });
-        };
-
-        parsed.push((name.clone(), value_expr));
-    }
-
-    Ok(parsed)
-}
-
-struct DoBinding<'a> {
-    name: String,
-    init_expr: &'a Expr,
-    step_expr: Option<&'a Expr>,
-}
-
-fn parse_do_bindings(bindings: &[Expr]) -> Result<Vec<DoBinding<'_>>, EvalError> {
-    let mut parsed = Vec::with_capacity(bindings.len());
-
-    for binding in bindings {
-        let Expr::List(items, _) = binding else {
-            return Err(EvalError::SyntaxError {
-                message: "do bindings must be lists".into(),
-            });
-        };
-
-        match items.as_slice() {
-            [Expr::Symbol(name, _), init_expr] => parsed.push(DoBinding {
-                name: name.clone(),
-                init_expr,
-                step_expr: None,
-            }),
-            [Expr::Symbol(name, _), init_expr, step_expr] => parsed.push(DoBinding {
-                name: name.clone(),
-                init_expr,
-                step_expr: Some(step_expr),
-            }),
-            _ => {
-                return Err(EvalError::SyntaxError {
-                    message: "do bindings must be (name init [step])".into(),
-                });
-            }
-        }
-    }
-
-    Ok(parsed)
+    special_forms::apply_callable_result(callable, &args)
+        .map_err(|err| err.with_position(head_position))
 }
 
 /// Evaluate one or more Scheme expressions and return the string
