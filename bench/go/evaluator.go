@@ -79,6 +79,19 @@ func (v *LambdaVal) String() string  { return "#<procedure>" }
 func (v *BuiltinVal) String() string      { return "#<builtin:" + v.Name + ">" }
 func (v *SyntaxRulesVal) String() string   { return "#<syntax>" }
 
+// Record types
+type RecordTypeDesc struct {
+	Name   string
+	Fields []string
+}
+
+type RecordVal struct {
+	Type   *RecordTypeDesc
+	Fields map[string]Value
+}
+
+func (v *RecordVal) String() string { return "#<record:" + v.Type.Name + ">" }
+
 var gensymCounter int
 
 func gensym(base string) string {
@@ -582,6 +595,8 @@ func evalListInEnv(list *ListExpr, env *Env) (Value, error) {
 			return evalCond(list.Items[1:], env)
 		case "define-syntax":
 			return evalDefineSyntax(list, env)
+		case "define-record-type":
+			return evalDefineRecordType(list, env)
 		}
 	}
 
@@ -971,6 +986,112 @@ func evalDefineSyntax(list *ListExpr, env *Env) (Value, error) {
 	return &VoidVal{}, nil
 }
 
+// (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+func evalDefineRecordType(list *ListExpr, env *Env) (Value, error) {
+	if len(list.Items) < 4 {
+		return nil, errAt(list, "define-record-type: too few arguments")
+	}
+
+	// 1. Type name
+	_, ok := list.Items[1].(*AtomExpr)
+	if !ok {
+		return nil, errAt(list, "define-record-type: expected type name")
+	}
+	typeName := list.Items[1].(*AtomExpr).Token
+
+	// 2. Constructor: (constructor-name field ...)
+	ctorList, ok := list.Items[2].(*ListExpr)
+	if !ok || len(ctorList.Items) < 1 {
+		return nil, errAt(list, "define-record-type: expected constructor")
+	}
+	ctorNameAtom, ok := ctorList.Items[0].(*AtomExpr)
+	if !ok {
+		return nil, errAt(list, "define-record-type: expected constructor name")
+	}
+	ctorName := ctorNameAtom.Token
+	var ctorFields []string
+	for _, item := range ctorList.Items[1:] {
+		a, ok := item.(*AtomExpr)
+		if !ok {
+			return nil, errAt(list, "define-record-type: expected field name in constructor")
+		}
+		ctorFields = append(ctorFields, a.Token)
+	}
+
+	// 3. Predicate name
+	predAtom, ok := list.Items[3].(*AtomExpr)
+	if !ok {
+		return nil, errAt(list, "define-record-type: expected predicate name")
+	}
+	predName := predAtom.Token
+
+	// 4. Field specs: (field accessor) ...
+	var allFields []string
+	type fieldSpec struct {
+		name     string
+		accessor string
+	}
+	var specs []fieldSpec
+	for _, item := range list.Items[4:] {
+		fList, ok := item.(*ListExpr)
+		if !ok || len(fList.Items) < 2 {
+			return nil, errAt(list, "define-record-type: bad field spec")
+		}
+		fName, ok := fList.Items[0].(*AtomExpr)
+		if !ok {
+			return nil, errAt(list, "define-record-type: expected field name")
+		}
+		fAccessor, ok := fList.Items[1].(*AtomExpr)
+		if !ok {
+			return nil, errAt(list, "define-record-type: expected accessor name")
+		}
+		allFields = append(allFields, fName.Token)
+		specs = append(specs, fieldSpec{name: fName.Token, accessor: fAccessor.Token})
+	}
+
+	// Create the type descriptor
+	rtd := &RecordTypeDesc{Name: typeName, Fields: allFields}
+
+	// Define constructor
+	env.set(ctorName, &BuiltinVal{Name: ctorName, Fn: func(args []Value) (Value, error) {
+		if len(args) != len(ctorFields) {
+			return nil, &EvalError{Message: fmt.Sprintf("%s: expected %d arguments, got %d", ctorName, len(ctorFields), len(args))}
+		}
+		fields := make(map[string]Value)
+		for i, f := range ctorFields {
+			fields[f] = args[i]
+		}
+		return &RecordVal{Type: rtd, Fields: fields}, nil
+	}})
+
+	// Define predicate
+	env.set(predName, &BuiltinVal{Name: predName, Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: predName + ": expected 1 argument"}
+		}
+		rec, ok := args[0].(*RecordVal)
+		return &BoolVal{Val: ok && rec.Type == rtd}, nil
+	}})
+
+	// Define accessors
+	for _, spec := range specs {
+		fieldName := spec.name
+		accName := spec.accessor
+		env.set(accName, &BuiltinVal{Name: accName, Fn: func(args []Value) (Value, error) {
+			if len(args) != 1 {
+				return nil, &EvalError{Message: accName + ": expected 1 argument"}
+			}
+			rec, ok := args[0].(*RecordVal)
+			if !ok || rec.Type != rtd {
+				return nil, &EvalError{Message: accName + ": not a " + typeName}
+			}
+			return rec.Fields[fieldName], nil
+		}})
+	}
+
+	return &VoidVal{}, nil
+}
+
 type patternBindings struct {
 	singles map[string]Expr
 	lists   map[string][]Expr
@@ -1139,7 +1260,7 @@ func collectEllipsisVars(tmpl Expr, bindings *patternBindings) []string {
 
 func isSpecialForm(name string) bool {
 	switch name {
-	case "if", "let", "begin", "set!", "define", "lambda", "and", "or", "cond", "quote", "define-syntax", "syntax-rules":
+	case "if", "let", "begin", "set!", "define", "lambda", "and", "or", "cond", "quote", "define-syntax", "syntax-rules", "define-record-type":
 		return true
 	}
 	return false
