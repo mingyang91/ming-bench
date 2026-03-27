@@ -93,6 +93,37 @@ public class Evaluator {
     // Trampoline sentinel for tail call optimization
     record TailCall(Object expr, Env env) {}
 
+    // First-class continuation captured by call/cc
+    static class Continuation {
+        boolean inExtent = true;
+        // For body-level replay:
+        List<?> capturedBody;   // the body list containing call/cc
+        int capturedBodyIndex;  // index in the body where call/cc was
+        int topLevelExprIndex;  // which top-level expression
+    }
+
+    // Thrown when a continuation is invoked within its dynamic extent (escape)
+    static class ContinuationEscape extends RuntimeException {
+        final Continuation cont;
+        final Object value;
+        ContinuationEscape(Continuation cont, Object value) {
+            super(null, null, true, false);
+            this.cont = cont;
+            this.value = value;
+        }
+    }
+
+    // Thrown when a continuation is invoked outside its dynamic extent (reentrant)
+    static class ContinuationResume extends RuntimeException {
+        final Continuation cont;
+        final Object value;
+        ContinuationResume(Continuation cont, Object value) {
+            super(null, null, true, false);
+            this.cont = cont;
+            this.value = value;
+        }
+    }
+
     // Resolve a TailCall chain to a final value
     private Object resolve(Object result) throws EvalError {
         while (result instanceof TailCall tc) {
@@ -151,12 +182,14 @@ public class Evaluator {
         "cddr", "cadr", "caar", "cdar", "caddr", "cdddr", "cadadr",
         "gcd", "lcm", "truncate", "round",
         "make-string", "string",
-        "string>?", "string<=?", "string>=?"
+        "string>?", "string<=?", "string>=?",
+        "call/cc", "call-with-current-continuation"
     };
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "define", "set!", "if", "quote", "lambda", "case-lambda", "and", "or", "begin", "let", "cond", "define-syntax", "define-record-type",
-        "letrec", "letrec*", "case", "do", "let*", "when", "unless"
+        "letrec", "letrec*", "case", "do", "let*", "when", "unless",
+        "call/cc", "call-with-current-continuation"
     );
 
     record RecordType(String typeName, List<String> fields) {}
@@ -167,6 +200,9 @@ public class Evaluator {
     private final Env globalEnv;
     private StringBuilder outputBuffer;
     private int gensymCounter = 0;
+    private Continuation lastCapturedCont = null;
+    private boolean hasPendingCallccValue = false;
+    private Object pendingCallccValue = null;
 
     public Evaluator() {
         globalEnv = new Env(null);
@@ -178,10 +214,33 @@ public class Evaluator {
     public String evalStr(String input) throws EvalError {
         List<Token> tokens = tokenize(input);
         int[] pos = {0};
-        Object result = null;
+        List<Object> exprs = new ArrayList<>();
         while (pos[0] < tokens.size()) {
-            Object expr = parse(tokens, pos);
-            result = eval(expr, globalEnv);
+            exprs.add(parse(tokens, pos));
+        }
+        Object result = null;
+        int startIdx = 0;
+        outer:
+        while (true) {
+            try {
+                for (int i = startIdx; i < exprs.size(); i++) {
+                    result = eval(exprs.get(i), globalEnv);
+                    if (lastCapturedCont != null) {
+                        lastCapturedCont.topLevelExprIndex = i;
+                        if (lastCapturedCont.capturedBody == null) {
+                            lastCapturedCont.capturedBody = exprs;
+                            lastCapturedCont.capturedBodyIndex = i;
+                        }
+                        lastCapturedCont = null;
+                    }
+                }
+                break;
+            } catch (ContinuationResume cr) {
+                hasPendingCallccValue = true;
+                pendingCallccValue = cr.value;
+                startIdx = cr.cont.topLevelExprIndex;
+                continue outer;
+            }
         }
         if (result == null) {
             throw new EvalError("no expression");
@@ -193,10 +252,33 @@ public class Evaluator {
         outputBuffer = new StringBuilder();
         List<Token> tokens = tokenize(input);
         int[] pos = {0};
-        Object result = null;
+        List<Object> exprs = new ArrayList<>();
         while (pos[0] < tokens.size()) {
-            Object expr = parse(tokens, pos);
-            result = eval(expr, globalEnv);
+            exprs.add(parse(tokens, pos));
+        }
+        Object result = null;
+        int startIdx = 0;
+        outer:
+        while (true) {
+            try {
+                for (int i = startIdx; i < exprs.size(); i++) {
+                    result = eval(exprs.get(i), globalEnv);
+                    if (lastCapturedCont != null) {
+                        lastCapturedCont.topLevelExprIndex = i;
+                        if (lastCapturedCont.capturedBody == null) {
+                            lastCapturedCont.capturedBody = exprs;
+                            lastCapturedCont.capturedBodyIndex = i;
+                        }
+                        lastCapturedCont = null;
+                    }
+                }
+                break;
+            } catch (ContinuationResume cr) {
+                hasPendingCallccValue = true;
+                pendingCallccValue = cr.value;
+                startIdx = cr.cont.topLevelExprIndex;
+                continue outer;
+            }
         }
         String output = outputBuffer.toString();
         outputBuffer = null;
@@ -598,8 +680,32 @@ public class Evaluator {
                             Object val = eval(binding.get(1), env);
                             letEnv.define(name, val);
                         }
+                        boolean contCapturedInLet = false;
                         for (int i = 2; i < list.size() - 1; i++) {
                             eval(list.get(i), letEnv);
+                            if (lastCapturedCont != null && lastCapturedCont.capturedBody == null) {
+                                lastCapturedCont.capturedBody = list;
+                                lastCapturedCont.capturedBodyIndex = i;
+                                contCapturedInLet = true;
+                            }
+                        }
+                        if (contCapturedInLet) {
+                            // Stay in scope to catch ContinuationResume from the tail expression
+                            while (true) {
+                                try {
+                                    return resolve(eval(list.getLast(), letEnv));
+                                } catch (ContinuationResume cr) {
+                                    if (cr.cont.capturedBody == list) {
+                                        hasPendingCallccValue = true;
+                                        pendingCallccValue = cr.value;
+                                        for (int j = cr.cont.capturedBodyIndex; j < list.size() - 1; j++) {
+                                            eval(list.get(j), letEnv);
+                                        }
+                                        continue;
+                                    }
+                                    throw cr;
+                                }
+                            }
                         }
                         return new TailCall(list.getLast(), letEnv);
                     }
@@ -867,6 +973,17 @@ public class Evaluator {
                         }
                         return null;
                     }
+                    case "call/cc", "call-with-current-continuation" -> {
+                        if (hasPendingCallccValue) {
+                            Object v = pendingCallccValue;
+                            hasPendingCallccValue = false;
+                            pendingCallccValue = null;
+                            return v;
+                        }
+                        if (list.size() != 2) throw new EvalError("call/cc: expected 1 argument");
+                        Object func = eval(list.get(1), env);
+                        return doCallCC(func);
+                    }
                 }
             }
             // Function application
@@ -883,7 +1000,36 @@ public class Evaluator {
         throw new EvalError("cannot eval: " + expr);
     }
 
+    private Object doCallCC(Object func) throws EvalError {
+        Continuation cont = new Continuation();
+        lastCapturedCont = cont;
+        try {
+            cont.inExtent = true;
+            Object result = resolve(apply(func, List.of(cont)));
+            cont.inExtent = false;
+            // Reset capturedBody so the OUTER body loop sets it to the correct enclosing body
+            cont.capturedBody = null;
+            return result;
+        } catch (ContinuationEscape ce) {
+            if (ce.cont == cont) {
+                cont.inExtent = false;
+                lastCapturedCont = null; // escape: no reentrant use needed
+                return ce.value;
+            }
+            throw ce;
+        }
+    }
+
     private Object apply(Object proc, List<Object> args) throws EvalError {
+        if (proc instanceof Continuation cont) {
+            if (args.size() != 1) throw new EvalError("continuation: expected 1 argument");
+            Object value = args.get(0);
+            if (cont.inExtent) {
+                throw new ContinuationEscape(cont, value);
+            } else {
+                throw new ContinuationResume(cont, value);
+            }
+        }
         if (proc instanceof Lambda lambda) {
             int nParams = lambda.params().size();
             if (lambda.restParam() != null) {
@@ -908,6 +1054,10 @@ public class Evaluator {
             }
             for (int i = 0; i < lambda.body().size() - 1; i++) {
                 eval(lambda.body().get(i), callEnv);
+                if (lastCapturedCont != null && lastCapturedCont.capturedBody == null) {
+                    lastCapturedCont.capturedBody = lambda.body();
+                    lastCapturedCont.capturedBodyIndex = i;
+                }
             }
             return new TailCall(lambda.body().getLast(), callEnv);
         }
@@ -923,7 +1073,18 @@ public class Evaluator {
             throw new EvalError("case-lambda: no matching clause for " + args.size() + " arguments");
         }
         if (proc instanceof Builtin b) {
-            return applyBuiltin(b.name(), args);
+            String name = b.name();
+            if (name.equals("call/cc") || name.equals("call-with-current-continuation")) {
+                if (args.size() != 1) throw new EvalError("call/cc: expected 1 argument");
+                if (hasPendingCallccValue) {
+                    Object v = pendingCallccValue;
+                    hasPendingCallccValue = false;
+                    pendingCallccValue = null;
+                    return v;
+                }
+                return doCallCC(args.get(0));
+            }
+            return applyBuiltin(name, args);
         }
         throw new EvalError("not a procedure: " + schemeToString(proc));
     }
@@ -1787,7 +1948,7 @@ public class Evaluator {
             case "procedure?" -> {
                 requireArgs(op, args, 1);
                 Object a = args.get(0);
-                yield (a instanceof Lambda || a instanceof CaseLambda || a instanceof Builtin) ? Boolean.TRUE : Boolean.FALSE;
+                yield (a instanceof Lambda || a instanceof CaseLambda || a instanceof Builtin || a instanceof Continuation) ? Boolean.TRUE : Boolean.FALSE;
             }
             default -> {
                 // Check for record type operations
@@ -2164,6 +2325,7 @@ public class Evaluator {
         if (val instanceof SchemeRecord sr) return "#<record:" + sr.typeName + ">";
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof CaseLambda) return "#<procedure>";
+        if (val instanceof Continuation) return "#<continuation>";
         if (val instanceof SyntaxRules) return "#<macro>";
         return val.toString();
     }
