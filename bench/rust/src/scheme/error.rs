@@ -34,10 +34,27 @@ pub enum EvalError {
     },
     #[error("{name} expects numeric arguments")]
     ExpectedNumber { name: String },
+    #[error("{name} expects string arguments")]
+    ExpectedString { name: String },
+    #[error("{name} expects symbol arguments")]
+    ExpectedSymbol { name: String },
     #[error("{name} expects a list")]
     ExpectedList { name: String },
     #[error("{name} expects a non-empty list")]
     ExpectedPair { name: String },
+    #[error("{name} index {index} out of bounds for length {len}")]
+    IndexOutOfBounds {
+        name: String,
+        index: i64,
+        len: usize,
+    },
+    #[error("{name} range [{start}, {end}) out of bounds for length {len}")]
+    InvalidRange {
+        name: String,
+        start: i64,
+        end: i64,
+        len: usize,
+    },
     #[error("division by zero")]
     DivisionByZero,
     #[error("{pos}: {source}")]

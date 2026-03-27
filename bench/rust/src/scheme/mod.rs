@@ -32,6 +32,7 @@ enum Value {
     Boolean(bool),
     String(String),
     Symbol(String),
+    Char(char),
     List(Vec<Value>),
     Procedure(Rc<Procedure>),
     Void,
@@ -58,9 +59,18 @@ impl Value {
             Self::Boolean(false) => "#f".to_owned(),
             Self::String(value) => render_string(value),
             Self::Symbol(value) => value.clone(),
+            Self::Char(value) => render_char(*value),
             Self::List(values) => render_list(values),
             Self::Procedure(_) => "#<procedure>".to_owned(),
             Self::Void => "#<void>".to_owned(),
+        }
+    }
+
+    fn render_display(&self) -> String {
+        match self {
+            Self::String(value) => value.clone(),
+            Self::Char(value) => value.to_string(),
+            _ => self.render(),
         }
     }
 }
@@ -88,6 +98,18 @@ enum Builtin {
     StringPred,
     NumberPred,
     BooleanPred,
+    Display,
+    Write,
+    Newline,
+    StringAppend,
+    StringLength,
+    Substring,
+    StringToNumber,
+    NumberToString,
+    SymbolToString,
+    StringToSymbol,
+    StringRef,
+    CharPred,
 }
 
 #[derive(Clone)]
@@ -109,13 +131,20 @@ type EnvRef = Rc<Environment>;
 struct Environment {
     parent: Option<EnvRef>,
     bindings: RefCell<HashMap<String, Value>>,
+    output: Rc<RefCell<String>>,
 }
 
 impl Environment {
     fn new(parent: Option<EnvRef>) -> EnvRef {
+        let output = parent.as_ref().map_or_else(
+            || Rc::new(RefCell::new(String::new())),
+            |env| env.output.clone(),
+        );
+
         Rc::new(Self {
             parent,
             bindings: RefCell::new(HashMap::new()),
+            output,
         })
     }
 
@@ -163,6 +192,14 @@ fn render_list(values: &[Value]) -> String {
 
     rendered.push(')');
     rendered
+}
+
+fn render_char(value: char) -> String {
+    match value {
+        ' ' => "#\\space".to_owned(),
+        '\n' => "#\\newline".to_owned(),
+        _ => format!("#\\{value}"),
+    }
 }
 
 struct Parser<'a> {
@@ -381,6 +418,18 @@ fn root_env() -> EnvRef {
         ("string?", Builtin::StringPred),
         ("number?", Builtin::NumberPred),
         ("boolean?", Builtin::BooleanPred),
+        ("display", Builtin::Display),
+        ("write", Builtin::Write),
+        ("newline", Builtin::Newline),
+        ("string-append", Builtin::StringAppend),
+        ("string-length", Builtin::StringLength),
+        ("substring", Builtin::Substring),
+        ("string->number", Builtin::StringToNumber),
+        ("number->string", Builtin::NumberToString),
+        ("symbol->string", Builtin::SymbolToString),
+        ("string->symbol", Builtin::StringToSymbol),
+        ("string-ref", Builtin::StringRef),
+        ("char?", Builtin::CharPred),
     ] {
         env.define(name, Value::Procedure(Rc::new(Procedure::Builtin(builtin))));
     }
@@ -459,6 +508,18 @@ fn apply_builtin(builtin: Builtin, args: &[Expr], env: &EnvRef) -> Result<Value,
         Builtin::StringPred => eval_string_pred(&values),
         Builtin::NumberPred => eval_number_pred(&values),
         Builtin::BooleanPred => eval_boolean_pred(&values),
+        Builtin::Display => eval_display(&values, env),
+        Builtin::Write => eval_write(&values, env),
+        Builtin::Newline => eval_newline(&values, env),
+        Builtin::StringAppend => eval_string_append(&values),
+        Builtin::StringLength => eval_string_length(&values),
+        Builtin::Substring => eval_substring(&values),
+        Builtin::StringToNumber => eval_string_to_number(&values),
+        Builtin::NumberToString => eval_number_to_string(&values),
+        Builtin::SymbolToString => eval_symbol_to_string(&values),
+        Builtin::StringToSymbol => eval_string_to_symbol(&values),
+        Builtin::StringRef => eval_string_ref(&values),
+        Builtin::CharPred => eval_char_pred(&values),
     }
 }
 
@@ -954,6 +1015,191 @@ fn eval_boolean_pred(args: &[Value]) -> Result<Value, EvalError> {
     eval_type_predicate(args, "boolean?", |value| matches!(value, Value::Boolean(_)))
 }
 
+fn eval_display(args: &[Value], env: &EnvRef) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "display".to_owned(),
+            expected: "exactly 1 argument".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    env.output.borrow_mut().push_str(&args[0].render_display());
+    Ok(Value::Void)
+}
+
+fn eval_write(args: &[Value], env: &EnvRef) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "write".to_owned(),
+            expected: "exactly 1 argument".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    env.output.borrow_mut().push_str(&args[0].render());
+    Ok(Value::Void)
+}
+
+fn eval_newline(args: &[Value], env: &EnvRef) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "newline".to_owned(),
+            expected: "exactly 0 arguments".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    env.output.borrow_mut().push('\n');
+    Ok(Value::Void)
+}
+
+fn eval_string_append(args: &[Value]) -> Result<Value, EvalError> {
+    let mut combined = String::new();
+
+    for value in args {
+        combined.push_str(expect_string("string-append", value)?);
+    }
+
+    Ok(Value::String(combined))
+}
+
+fn eval_string_length(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "string-length".to_owned(),
+            expected: "exactly 1 argument".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    let value = expect_string("string-length", &args[0])?;
+    Ok(Value::Integer(value.chars().count() as i64))
+}
+
+fn eval_substring(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::WrongArgCount {
+            name: "substring".to_owned(),
+            expected: "exactly 3 arguments".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    let string = expect_string("substring", &args[0])?;
+    let start = args[1].as_integer("substring")?;
+    let end = args[2].as_integer("substring")?;
+    let chars = string.chars().collect::<Vec<_>>();
+    let len = chars.len();
+
+    if start < 0 || end < start || end as usize > len {
+        return Err(EvalError::InvalidRange {
+            name: "substring".to_owned(),
+            start,
+            end,
+            len,
+        });
+    }
+
+    Ok(Value::String(
+        chars[start as usize..end as usize].iter().collect(),
+    ))
+}
+
+fn eval_string_to_number(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "string->number".to_owned(),
+            expected: "exactly 1 argument".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    let value = expect_string("string->number", &args[0])?;
+    Ok(match value.parse::<i64>() {
+        Ok(number) => Value::Integer(number),
+        Err(_) => Value::Boolean(false),
+    })
+}
+
+fn eval_number_to_string(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "number->string".to_owned(),
+            expected: "exactly 1 argument".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::String(
+        args[0].as_integer("number->string")?.to_string(),
+    ))
+}
+
+fn eval_symbol_to_string(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "symbol->string".to_owned(),
+            expected: "exactly 1 argument".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::String(
+        expect_symbol_value("symbol->string", &args[0])?.to_owned(),
+    ))
+}
+
+fn eval_string_to_symbol(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "string->symbol".to_owned(),
+            expected: "exactly 1 argument".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::Symbol(
+        expect_string("string->symbol", &args[0])?.to_owned(),
+    ))
+}
+
+fn eval_string_ref(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "string-ref".to_owned(),
+            expected: "exactly 2 arguments".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    let string = expect_string("string-ref", &args[0])?;
+    let index = args[1].as_integer("string-ref")?;
+    let len = string.chars().count();
+
+    if index < 0 {
+        return Err(EvalError::IndexOutOfBounds {
+            name: "string-ref".to_owned(),
+            index,
+            len,
+        });
+    }
+
+    let Some(ch) = string.chars().nth(index as usize) else {
+        return Err(EvalError::IndexOutOfBounds {
+            name: "string-ref".to_owned(),
+            index,
+            len,
+        });
+    };
+
+    Ok(Value::Char(ch))
+}
+
+fn eval_char_pred(args: &[Value]) -> Result<Value, EvalError> {
+    eval_type_predicate(args, "char?", |value| matches!(value, Value::Char(_)))
+}
+
 fn eval_and(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     let mut last = Value::Boolean(true);
 
@@ -998,6 +1244,24 @@ where
     Ok(Value::Boolean(predicate(&args[0])))
 }
 
+fn expect_string<'a>(name: &str, value: &'a Value) -> Result<&'a str, EvalError> {
+    match value {
+        Value::String(value) => Ok(value),
+        _ => Err(EvalError::ExpectedString {
+            name: name.to_owned(),
+        }),
+    }
+}
+
+fn expect_symbol_value<'a>(name: &str, value: &'a Value) -> Result<&'a str, EvalError> {
+    match value {
+        Value::Symbol(value) => Ok(value),
+        _ => Err(EvalError::ExpectedSymbol {
+            name: name.to_owned(),
+        }),
+    }
+}
+
 fn expect_list<'a>(name: &str, value: &'a Value) -> Result<&'a [Value], EvalError> {
     match value {
         Value::List(items) => Ok(items),
@@ -1025,19 +1289,26 @@ fn expect_pair<'a>(name: &str, value: &'a Value) -> Result<&'a [Value], EvalErro
 /// use ming::scheme::eval_str;
 /// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
 /// ```
-pub fn eval_str(input: &str) -> Result<String, EvalError> {
+fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
     let mut parser = Parser::new(input);
     let exprs = parser.parse_program()?;
     let env = root_env();
     let last = eval_sequence(&exprs, &env)
         .map_err(|err| err.with_position(SourcePos { line: 1, col: 1 }))?;
+    let output = env.output.borrow().clone();
+    Ok((last, output))
+}
+
+pub fn eval_str(input: &str) -> Result<String, EvalError> {
+    let (last, _) = eval_program(input)?;
     Ok(last.render())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    Ok((eval_str(input)?, String::new()))
+    let (last, output) = eval_program(input)?;
+    Ok((last.render(), output))
 }
 
 #[cfg(test)]
