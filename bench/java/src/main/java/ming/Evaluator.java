@@ -481,6 +481,13 @@ public class Evaluator {
                 List<Object> raiseExpr = List.of("raise", var);
                 clauses.add(List.of("else", raiseExpr));
             }
+            // TCO: if top of kont is GuardAfterFrame, pop it and its handler
+            if (!kont.isEmpty() && kont.get(kont.size() - 1) instanceof GuardAfterFrame) {
+                kont.remove(kont.size() - 1);
+                if (!exceptionHandlers.isEmpty()) {
+                    exceptionHandlers.remove(exceptionHandlers.size() - 1);
+                }
+            }
             GuardHandler gh = new GuardHandler(kont, windStack, clauses, var, env, exceptionHandlers);
             exceptionHandlers.add(gh);
             kont.add(new GuardAfterFrame());
@@ -859,7 +866,11 @@ public class Evaluator {
             // Fall through to apply proc
         }
         if (proc instanceof Continuation cont) {
-            throw new ContinuationInvoked(cont, args.isEmpty() ? Boolean.FALSE : args.get(0));
+            Object value;
+            if (args.isEmpty()) value = Boolean.FALSE;
+            else if (args.size() == 1) value = args.get(0);
+            else value = new MultipleValues(new ArrayList<>(args));
+            throw new ContinuationInvoked(cont, value);
         }
         if (proc instanceof Lambda lambda) {
             Env callEnv = bindLambdaArgs(lambda, args);
@@ -1177,7 +1188,7 @@ public class Evaluator {
                         try { hb.put(e.getValue(), macro.defEnv.lookup(e.getKey(), new SchemeParser.Pos(0, 0))); }
                         catch (EvalError ignored) {}
                     }
-                    if (!hb.isEmpty()) { evalEnv = new Env(useEnv); for (var e : hb.entrySet()) evalEnv.define(e.getKey(), e.getValue()); }
+                    if (!hb.isEmpty()) { for (var e : hb.entrySet()) useEnv.define(e.getKey(), e.getValue()); }
                 }
                 return new Object[]{expanded, evalEnv};
             }
