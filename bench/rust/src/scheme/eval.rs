@@ -197,7 +197,26 @@ fn transform_cont_for_capture(k: &Rc<Cont>) -> Rc<Cont> {
     }
 }
 
-type Handlers = Vec<Value>;
+// Persistent (Rc-shared) handler stack — O(1) clone for continuation capture.
+#[derive(Clone, Debug)]
+struct HandlerStack(Option<Rc<(Value, HandlerStack)>>);
+
+impl HandlerStack {
+    fn new() -> Self { HandlerStack(None) }
+    fn push(&mut self, v: Value) {
+        let tail = std::mem::replace(self, HandlerStack(None));
+        *self = HandlerStack(Some(Rc::new((v, tail))));
+    }
+    fn pop(&mut self) -> Option<Value> {
+        let node = self.0.take()?;
+        match Rc::try_unwrap(node) {
+            Ok((val, tail)) => { *self = tail; Some(val) }
+            Err(rc) => { let (val, tail) = &*rc; let v = val.clone(); *self = tail.clone(); Some(v) }
+        }
+    }
+}
+
+type Handlers = HandlerStack;
 type CapturedContData = (Rc<Cont>, Winders, Handlers);
 
 // Helper: wrap Rc<Cont> + winders + handlers into Value::Continuation
@@ -380,11 +399,15 @@ fn apply_cek(
             Ok(CekAction::Value(apply_record_proc(*type_id, kind, args)?))
         }
         Value::Continuation(_) => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity("continuation requires 1 argument".into()));
+            if args.is_empty() {
+                return Err(EvalError::Arity("continuation requires at least 1 argument".into()));
             }
             let (target_cont, target_winders, target_handlers) = value_to_cont(func);
-            let target_val = args[0].clone();
+            let target_val = if args.len() == 1 {
+                args[0].clone()
+            } else {
+                Value::Values(args.to_vec())
+            };
 
             let common = winder_common_prefix(winders, &target_winders);
 
@@ -479,7 +502,7 @@ fn cek_eval(
     let mut env = init_env;
     let mut kont = init_kont;
     let mut winders: Winders = Vec::new();
-    let mut handlers: Handlers = Vec::new();
+    let mut handlers: Handlers = HandlerStack::new();
 
     loop {
         // ===== EVAL PHASE: reduce ctrl to a value =====
