@@ -465,15 +465,22 @@ pub(super) struct Environment {
     macros: RefCell<HashMap<String, MacroRef>>,
     syntax_context: RefCell<Option<SyntaxContextRef>>,
     step_budget: RefCell<Option<StepBudgetRef>>,
+    macro_gensym_counter: Rc<RefCell<u64>>,
 }
 
 impl Environment {
     pub(super) fn new(parent: Option<EnvRef>) -> EnvRef {
+        let syntax_context = parent.as_ref().and_then(|parent| parent.syntax_context());
+        let step_budget = parent.as_ref().and_then(|parent| parent.step_budget());
+        let macro_gensym_counter = parent.as_ref().map_or_else(
+            || Rc::new(RefCell::new(0)),
+            |parent| parent.macro_gensym_counter.clone(),
+        );
+
         Rc::new(Self {
-            syntax_context: RefCell::new(
-                parent.as_ref().and_then(|parent| parent.syntax_context()),
-            ),
-            step_budget: RefCell::new(parent.as_ref().and_then(|parent| parent.step_budget())),
+            syntax_context: RefCell::new(syntax_context),
+            step_budget: RefCell::new(step_budget),
+            macro_gensym_counter,
             parent,
             bindings: RefCell::new(HashMap::new()),
             macros: RefCell::new(HashMap::new()),
@@ -565,6 +572,13 @@ impl Environment {
 
     pub(super) fn syntax_context(&self) -> Option<SyntaxContextRef> {
         self.syntax_context.borrow().clone()
+    }
+
+    pub(super) fn fresh_macro_identifier(&self, name: &str) -> String {
+        let mut counter = self.macro_gensym_counter.borrow_mut();
+        let suffix = *counter;
+        *counter += 1;
+        format!("__ming_macro_{suffix}_{name}")
     }
 }
 

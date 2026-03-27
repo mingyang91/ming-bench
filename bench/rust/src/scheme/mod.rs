@@ -56,7 +56,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
         eval_program_machine(&exprs, builtins::default_env(), &mut output)?,
         exprs.last().map(Expr::pos),
     )?;
-    Ok((value.render(), output))
+    Ok((value.display(), output))
 }
 
 #[cfg(test)]

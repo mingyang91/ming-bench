@@ -6,9 +6,6 @@ use crate::scheme::builtins::apply_procedure_with_syntax_context;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static MACRO_GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn define_syntax(
     args: &[Expr],
@@ -875,7 +872,7 @@ fn ensure_hygienic_free_name(context: &mut MacroExpansionContext, name: &str) ->
         return existing.clone();
     }
 
-    let fresh = fresh_macro_identifier(name);
+    let fresh = fresh_macro_identifier(context, name);
     if let Some(binding) = context.def_env.lookup_binding(name) {
         context.macro_env.define_alias(fresh.clone(), binding);
     }
@@ -1002,7 +999,7 @@ fn expand_macro_let(
 
         let expanded_value =
             expand_macro_template_at(value_expr, context, scope, repetition_index)?;
-        let renamed = fresh_macro_identifier(name);
+        let renamed = fresh_macro_identifier(context, name);
         body_scope.insert(name.clone(), renamed.clone());
         expanded_bindings.push(Expr::List {
             items: vec![
@@ -1090,7 +1087,7 @@ fn expand_macro_lambda(
         return Ok(None);
     }
 
-    let (expanded_params, body_scope) = rename_macro_params(params_expr, scope)?;
+    let (expanded_params, body_scope) = rename_macro_params(context, params_expr, scope)?;
     let mut expanded_items = vec![head.clone(), expanded_params];
     for expr in body {
         expanded_items.push(expand_macro_template_at(
@@ -1148,7 +1145,7 @@ fn expand_macro_case_lambda(
             .with_position(pos.line, pos.col));
         }
 
-        let (expanded_params, body_scope) = rename_macro_params(params_expr, scope)?;
+        let (expanded_params, body_scope) = rename_macro_params(context, params_expr, scope)?;
         let mut expanded_clause = vec![expanded_params];
         for expr in body {
             expanded_clause.push(expand_macro_template_at(
@@ -1172,12 +1169,13 @@ fn expand_macro_case_lambda(
 }
 
 fn rename_macro_params(
+    context: &MacroExpansionContext,
     params_expr: &Expr,
     scope: &HashMap<String, String>,
 ) -> Result<(Expr, HashMap<String, String>), EvalError> {
     match params_expr {
         Expr::Symbol { name, pos } => {
-            let renamed = fresh_macro_identifier(name);
+            let renamed = fresh_macro_identifier(context, name);
             let mut body_scope = scope.clone();
             body_scope.insert(name.clone(), renamed.clone());
             Ok((
@@ -1200,7 +1198,7 @@ fn rename_macro_params(
                         });
                     }
                     Expr::Symbol { name, pos } => {
-                        let renamed = fresh_macro_identifier(name);
+                        let renamed = fresh_macro_identifier(context, name);
                         body_scope.insert(name.clone(), renamed.clone());
                         renamed_items.push(Expr::Symbol {
                             name: renamed,
@@ -1303,7 +1301,6 @@ fn is_ellipsis(expr: &Expr) -> bool {
     matches!(expr, Expr::Symbol { name, .. } if name == "...")
 }
 
-fn fresh_macro_identifier(name: &str) -> String {
-    let suffix = MACRO_GENSYM_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("__ming_macro_{suffix}_{name}")
+fn fresh_macro_identifier(context: &MacroExpansionContext, name: &str) -> String {
+    context.macro_env.fresh_macro_identifier(name)
 }

@@ -13,14 +13,18 @@ fn bench_level() -> u32 {
 
 #[test]
 fn test_l27_step_limit_normal() {
-    if bench_level() > 0 && bench_level() < 27 { return; }
+    if bench_level() > 0 && bench_level() < 27 {
+        return;
+    }
     let result = eval_str_with_limit("(+ 1 2)", 1000);
     assert_eq!(result, Ok("3".into()));
 }
 
 #[test]
 fn test_l27_step_limit_loop_within_budget() {
-    if bench_level() > 0 && bench_level() < 27 { return; }
+    if bench_level() > 0 && bench_level() < 27 {
+        return;
+    }
     let result = eval_str_with_limit(
         "(let loop ((n 50)) (if (= n 0) 'done (loop (- n 1))))",
         10000,
@@ -30,24 +34,33 @@ fn test_l27_step_limit_loop_within_budget() {
 
 #[test]
 fn test_l27_step_limit_infinite_loop() {
-    if bench_level() > 0 && bench_level() < 27 { return; }
+    if bench_level() > 0 && bench_level() < 27 {
+        return;
+    }
     let result = eval_str_with_limit("(let loop () (loop))", 1000);
     assert!(result.is_err(), "infinite loop should hit step limit");
 }
 
 #[test]
 fn test_l27_step_limit_exceeded() {
-    if bench_level() > 0 && bench_level() < 27 { return; }
+    if bench_level() > 0 && bench_level() < 27 {
+        return;
+    }
     let result = eval_str_with_limit(
         "(let loop ((n 1000)) (if (= n 0) 'done (loop (- n 1))))",
         50,
     );
-    assert!(result.is_err(), "loop of 1000 iters should exceed 50-step budget");
+    assert!(
+        result.is_err(),
+        "loop of 1000 iters should exceed 50-step budget"
+    );
 }
 
 #[test]
 fn test_l27_step_limit_factorial() {
-    if bench_level() > 0 && bench_level() < 27 { return; }
+    if bench_level() > 0 && bench_level() < 27 {
+        return;
+    }
     let result = eval_str_with_limit(
         "(define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))) (fact 10)",
         10000,
@@ -57,7 +70,9 @@ fn test_l27_step_limit_factorial() {
 
 #[test]
 fn test_l27_normal_eval_unaffected() {
-    if bench_level() > 0 && bench_level() < 27 { return; }
+    if bench_level() > 0 && bench_level() < 27 {
+        return;
+    }
     // Normal eval_str still works without limit
     let result = eval_str("(let loop ((n 100000)) (if (= n 0) 'done (loop (- n 1))))");
     assert_eq!(result, Ok("done".into()));
