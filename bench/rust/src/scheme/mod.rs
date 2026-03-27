@@ -56,6 +56,11 @@ enum MachineState {
         value: Value,
         cont: ContinuationRef,
     },
+    Raise {
+        value: Value,
+        pos: Position,
+        cont: ContinuationRef,
+    },
 }
 
 fn eval_program_machine(
@@ -78,6 +83,7 @@ fn eval_program_machine(
                 None => return Ok(value),
                 Some(continuation) => resume_machine(continuation, value, output)?,
             },
+            MachineState::Raise { value, pos, cont } => raise_machine(value, pos, cont)?,
         };
     }
 }
@@ -139,6 +145,7 @@ fn eval_list_machine(
             }),
             "begin" => Ok(schedule_program_machine(args, env, cont)),
             "cond" => schedule_cond_machine(args, head_pos, env, cont),
+            "guard" => eval_guard_machine(args, head_pos, env, cont),
             "let" => eval_let_machine(args, head_pos, env, cont),
             "lambda" => Ok(MachineState::Return {
                 value: with_position(eval_lambda(args, env), head_pos)?,
@@ -214,6 +221,43 @@ fn apply_machine(
             value: with_position(func(&args, output), pos)?,
             cont,
         }),
+        Procedure::Raise { name } => {
+            let [value_arg] = args.as_slice() else {
+                return Err(EvalError::WrongArgCount {
+                    name,
+                    expected: "exactly 1",
+                    got: args.len(),
+                }
+                .with_position(pos.line, pos.col));
+            };
+
+            Ok(MachineState::Raise {
+                value: value_arg.value.clone(),
+                pos,
+                cont,
+            })
+        }
+        Procedure::WithExceptionHandler { name } => {
+            let [handler_arg, thunk_arg] = args.as_slice() else {
+                return Err(EvalError::WrongArgCount {
+                    name,
+                    expected: "exactly 2",
+                    got: args.len(),
+                }
+                .with_position(pos.line, pos.col));
+            };
+
+            Ok(call_thunk_machine(
+                thunk_arg.value.clone(),
+                pos,
+                push_frame(
+                    Frame::ExceptionHandlerMarker {
+                        handler: handler_arg.value.clone(),
+                    },
+                    cont,
+                ),
+            ))
+        }
         Procedure::ContinuationCapture { name } => {
             let [procedure_arg] = args.as_slice() else {
                 return Err(EvalError::WrongArgCount {
@@ -279,6 +323,30 @@ fn apply_machine(
                 saved_cont.clone(),
                 value_arg.value.clone(),
             ))
+        }
+        Procedure::GuardHandler {
+            variable,
+            clauses,
+            env,
+        } => {
+            let [exception_arg] = args.as_slice() else {
+                return Err(EvalError::WrongArgCount {
+                    name: "guard",
+                    expected: "exactly 1",
+                    got: args.len(),
+                }
+                .with_position(pos.line, pos.col));
+            };
+
+            let guard_env = Environment::new(Some(env.clone()));
+            guard_env.define(variable.clone(), exception_arg.value.clone());
+            schedule_guard_clauses_machine(
+                exception_arg.value.clone(),
+                clauses,
+                pos,
+                guard_env,
+                cont,
+            )
         }
         Procedure::Lambda { params, body, env } => {
             let call_env = with_position(
@@ -460,6 +528,43 @@ fn resume_machine(
                 value: Value::Void,
                 cont: next,
             })
+        }
+        Frame::ExceptionHandlerMarker { .. } => Ok(MachineState::Return { value, cont: next }),
+        Frame::ApplyExceptionHandler { handler, raise_pos } => Ok(MachineState::Apply {
+            procedure: handler.clone(),
+            args: vec![EvaluatedArg {
+                value,
+                pos: *raise_pos,
+            }],
+            pos: *raise_pos,
+            cont: next,
+        }),
+        Frame::UncaughtException { pos } => Err(EvalError::UncaughtException {
+            value: value.render(),
+        }
+        .with_position(pos.line, pos.col)),
+        Frame::GuardClause {
+            exception,
+            raise_pos,
+            body,
+            remaining,
+            env,
+        } => {
+            if value.is_truthy() {
+                if body.is_empty() {
+                    Ok(MachineState::Return { value, cont: next })
+                } else {
+                    Ok(schedule_program_machine(body, env.clone(), next))
+                }
+            } else {
+                schedule_guard_clauses_machine(
+                    exception.clone(),
+                    remaining,
+                    *raise_pos,
+                    env.clone(),
+                    next,
+                )
+            }
         }
         Frame::DynamicWindEnter { wind, body } => Ok(call_thunk_machine(
             body.clone(),
@@ -645,6 +750,107 @@ fn eval_if_machine(
         }
         .with_position(head_pos.line, head_pos.col)),
     }
+}
+
+fn eval_guard_machine(
+    args: &[Expr],
+    head_pos: Position,
+    env: EnvRef,
+    cont: ContinuationRef,
+) -> Result<MachineState, EvalError> {
+    let Some((spec_expr, body)) = args.split_first() else {
+        return Err(EvalError::WrongArgCountAtLeast {
+            name: "guard",
+            min: 1,
+            got: 0,
+        }
+        .with_position(head_pos.line, head_pos.col));
+    };
+
+    let Expr::List {
+        items: spec_items, ..
+    } = spec_expr
+    else {
+        return Err(EvalError::ParseError {
+            message: "guard requires a (variable clause ...) spec".to_string(),
+        }
+        .with_position(spec_expr.pos().line, spec_expr.pos().col));
+    };
+
+    let Some((Expr::Symbol { name, .. }, clauses)) = spec_items.split_first() else {
+        return Err(EvalError::ParseError {
+            message: "guard requires an exception variable".to_string(),
+        }
+        .with_position(spec_expr.pos().line, spec_expr.pos().col));
+    };
+
+    let handler = Value::Procedure(Rc::new(Procedure::GuardHandler {
+        variable: name.clone(),
+        clauses: clauses.to_vec(),
+        env: env.clone(),
+    }));
+
+    Ok(schedule_program_machine(
+        body,
+        env,
+        push_frame(Frame::ExceptionHandlerMarker { handler }, cont),
+    ))
+}
+
+fn schedule_guard_clauses_machine(
+    exception: Value,
+    clauses: &[Expr],
+    raise_pos: Position,
+    env: EnvRef,
+    cont: ContinuationRef,
+) -> Result<MachineState, EvalError> {
+    let Some((clause, remaining)) = clauses.split_first() else {
+        return Ok(MachineState::Raise {
+            value: exception,
+            pos: raise_pos,
+            cont,
+        });
+    };
+
+    let Expr::List { items, pos } = clause else {
+        return Err(EvalError::ParseError {
+            message: "guard clauses must be lists".to_string(),
+        }
+        .with_position(raise_pos.line, raise_pos.col));
+    };
+
+    let Some((test, body)) = items.split_first() else {
+        return Err(EvalError::ParseError {
+            message: "guard clauses cannot be empty".to_string(),
+        }
+        .with_position(pos.line, pos.col));
+    };
+
+    if matches!(test, Expr::Symbol { name, .. } if name == "else") {
+        return Ok(if body.is_empty() {
+            MachineState::Return {
+                value: Value::Void,
+                cont,
+            }
+        } else {
+            schedule_program_machine(body, env, cont)
+        });
+    }
+
+    Ok(MachineState::Eval {
+        expr: test.clone(),
+        env: env.clone(),
+        cont: push_frame(
+            Frame::GuardClause {
+                exception,
+                raise_pos,
+                body: body.to_vec(),
+                remaining: remaining.to_vec(),
+                env,
+            },
+            cont,
+        ),
+    })
 }
 
 fn schedule_cond_machine(
@@ -915,6 +1121,25 @@ fn call_thunk_machine(procedure: Value, pos: Position, cont: ContinuationRef) ->
     }
 }
 
+fn raise_machine(
+    value: Value,
+    pos: Position,
+    cont: ContinuationRef,
+) -> Result<MachineState, EvalError> {
+    let target = match find_exception_handler(&cont) {
+        Some((handler, handler_cont)) => push_frame(
+            Frame::ApplyExceptionHandler {
+                handler,
+                raise_pos: pos,
+            },
+            handler_cont,
+        ),
+        None => push_frame(Frame::UncaughtException { pos }, None),
+    };
+
+    Ok(schedule_continuation_jump_machine(cont, target, value))
+}
+
 fn schedule_continuation_jump_machine(
     current: ContinuationRef,
     target: ContinuationRef,
@@ -951,6 +1176,17 @@ fn schedule_continuation_jump_machine(
     }
 
     schedule_wind_transfer_machine(steps, value, target)
+}
+
+fn find_exception_handler(cont: &ContinuationRef) -> Option<(Value, ContinuationRef)> {
+    let mut current = cont.clone();
+    while let Some(continuation) = current {
+        if let Frame::ExceptionHandlerMarker { handler } = &continuation.frame {
+            return Some((handler.clone(), continuation.next.clone()));
+        }
+        current = continuation.next.clone();
+    }
+    None
 }
 
 fn schedule_wind_transfer_machine(

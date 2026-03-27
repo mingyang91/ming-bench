@@ -790,6 +790,7 @@ fn is_special_form_keyword(name: &str) -> bool {
             | "quote"
             | "begin"
             | "cond"
+            | "guard"
             | "let"
             | "lambda"
             | "case-lambda"

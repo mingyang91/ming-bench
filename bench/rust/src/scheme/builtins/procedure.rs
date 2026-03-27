@@ -45,6 +45,42 @@ pub(crate) fn apply_procedure(
             Procedure::Builtin { func, .. } => {
                 return with_call_position(func(&current_args, output), call_pos);
             }
+            Procedure::Raise { name } => {
+                let [value_arg] = current_args.as_slice() else {
+                    return with_call_position(
+                        Err(EvalError::WrongArgCount {
+                            name,
+                            expected: "exactly 1",
+                            got: current_args.len(),
+                        }),
+                        call_pos,
+                    );
+                };
+
+                return with_call_position(
+                    Err(EvalError::UncaughtException {
+                        value: value_arg.value.render(),
+                    }),
+                    call_pos,
+                );
+            }
+            Procedure::WithExceptionHandler { name } => {
+                let [_, thunk_arg] = current_args.as_slice() else {
+                    return with_call_position(
+                        Err(EvalError::WrongArgCount {
+                            name,
+                            expected: "exactly 2",
+                            got: current_args.len(),
+                        }),
+                        call_pos,
+                    );
+                };
+
+                return with_call_position(
+                    apply_procedure(thunk_arg.value.clone(), &[], output),
+                    call_pos,
+                );
+            }
             Procedure::ContinuationCapture { name } => {
                 let [procedure_arg] = current_args.as_slice() else {
                     return with_call_position(
@@ -151,6 +187,14 @@ pub(crate) fn apply_procedure(
                         call_pos = Some(pos);
                     }
                 }
+            }
+            Procedure::GuardHandler { .. } => {
+                return with_call_position(
+                    Err(EvalError::ParseError {
+                        message: "guard handlers require the machine evaluator".to_string(),
+                    }),
+                    call_pos,
+                );
             }
             Procedure::RecordConstructor {
                 record_type,

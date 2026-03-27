@@ -20,6 +20,16 @@ use std::{cell::RefCell, cmp::Ordering, rc::Rc};
 
 pub(super) fn default_env() -> EnvRef {
     let env = Environment::new(None);
+    env.define(
+        "raise",
+        Value::Procedure(Rc::new(Procedure::Raise { name: "raise" })),
+    );
+    env.define(
+        "with-exception-handler",
+        Value::Procedure(Rc::new(Procedure::WithExceptionHandler {
+            name: "with-exception-handler",
+        })),
+    );
     for name in ["call/cc", "call-with-current-continuation"] {
         env.define(
             name,

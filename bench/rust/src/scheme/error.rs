@@ -63,6 +63,9 @@ pub enum EvalError {
 
     #[error("cannot mutate immutable string")]
     ImmutableString,
+
+    #[error("uncaught exception: {value}")]
+    UncaughtException { value: String },
 }
 
 impl EvalError {

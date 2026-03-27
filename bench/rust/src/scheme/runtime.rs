@@ -141,6 +141,23 @@ pub(super) enum Frame {
         pos: Position,
         env: EnvRef,
     },
+    ExceptionHandlerMarker {
+        handler: Value,
+    },
+    ApplyExceptionHandler {
+        handler: Value,
+        raise_pos: Position,
+    },
+    UncaughtException {
+        pos: Position,
+    },
+    GuardClause {
+        exception: Value,
+        raise_pos: Position,
+        body: Vec<Expr>,
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
     DynamicWindEnter {
         wind: Rc<DynamicWind>,
         body: Value,
@@ -267,6 +284,12 @@ pub(super) enum Procedure {
         name: &'static str,
         func: BuiltinFn,
     },
+    Raise {
+        name: &'static str,
+    },
+    WithExceptionHandler {
+        name: &'static str,
+    },
     ContinuationCapture {
         name: &'static str,
     },
@@ -275,6 +298,11 @@ pub(super) enum Procedure {
     },
     Continuation {
         cont: ContinuationRef,
+    },
+    GuardHandler {
+        variable: String,
+        clauses: Vec<Expr>,
+        env: EnvRef,
     },
     Lambda {
         params: LambdaParams,
@@ -336,9 +364,12 @@ impl fmt::Debug for Procedure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Builtin { name, .. } => write!(f, "#<builtin:{name}>"),
+            Self::Raise { name } => write!(f, "#<builtin:{name}>"),
+            Self::WithExceptionHandler { name } => write!(f, "#<builtin:{name}>"),
             Self::ContinuationCapture { name } => write!(f, "#<builtin:{name}>"),
             Self::DynamicWind { name } => write!(f, "#<builtin:{name}>"),
             Self::Continuation { .. } => f.write_str("#<continuation>"),
+            Self::GuardHandler { .. } => f.write_str("#<guard-handler>"),
             Self::Lambda { .. } => f.write_str("#<lambda>"),
             Self::CaseLambda { .. } => f.write_str("#<case-lambda>"),
             Self::RecordConstructor { name, .. } => write!(f, "#<record-constructor:{name}>"),
