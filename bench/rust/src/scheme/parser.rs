@@ -92,7 +92,7 @@ impl<'a> Parser<'a> {
             match self.input[self.pos] {
                 b'"' => {
                     self.pos += 1;
-                    return Ok(Value::String(s));
+                    return Ok(Value::String(s, false));
                 }
                 b'\\' => {
                     self.pos += 1;

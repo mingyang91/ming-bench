@@ -24,7 +24,7 @@ pub enum Value {
     Rational(i64, i64), // numerator, denominator (always simplified, den > 0)
     Float(f64),
     Boolean(bool),
-    String(std::string::String),
+    String(std::string::String, bool), // (content, mutable)
     Symbol(std::string::String),
     List(Vec<Value>),
     Lambda {
@@ -62,7 +62,7 @@ impl PartialEq for Value {
             (Value::Rational(an, ad), Value::Rational(bn, bd)) => an == bn && ad == bd,
             (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
-            (Value::String(a), Value::String(b)) => a == b,
+            (Value::String(a, _), Value::String(b, _)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
@@ -110,7 +110,7 @@ impl Value {
             }
             Value::Boolean(true) => "#t".into(),
             Value::Boolean(false) => "#f".into(),
-            Value::String(s) => format!("\"{}\"", s),
+            Value::String(s, _) => format!("\"{}\"", s),
             Value::Symbol(s) => s.clone(),
             Value::List(elems) => {
                 let inner: Vec<std::string::String> =
@@ -150,7 +150,7 @@ impl Value {
     /// Display representation (no quotes on strings, chars as raw)
     pub fn to_display_repr(&self) -> std::string::String {
         match self {
-            Value::String(s) => s.clone(),
+            Value::String(s, _) => s.clone(),
             Value::Char(c) => c.to_string(),
             Value::Rational(_, _) | Value::Float(_) => self.to_display(),
             Value::List(elems) => {
