@@ -20,4 +20,6 @@ pub enum EvalError {
         line: usize,
         col: usize,
     },
+    #[error("unhandled exception: {0}")]
+    Raised(String),
 }

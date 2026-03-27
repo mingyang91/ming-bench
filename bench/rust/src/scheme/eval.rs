@@ -141,6 +141,22 @@ pub(crate) enum Cont {
         final_val: Value,
         final_cont: Rc<Cont>,
         final_winders: Winders,
+        final_handlers: Handlers,
+    },
+    /// raise: argument evaluated, now invoke handler
+    RaiseVal {
+        next: Rc<Cont>,
+    },
+    /// guard: exception delivered (via continuation), test clauses
+    Guard {
+        var: String,
+        clauses: Vec<Value>,
+        env: Rc<RefCell<Env>>,
+        next: Rc<Cont>,
+    },
+    /// Pop exception handler after thunk/body completes normally
+    PopHandler {
+        next: Rc<Cont>,
     },
 }
 
@@ -176,17 +192,18 @@ fn transform_cont_for_capture(k: &Rc<Cont>) -> Rc<Cont> {
     }
 }
 
-type CapturedContData = (Rc<Cont>, Winders);
+type Handlers = Vec<Value>;
+type CapturedContData = (Rc<Cont>, Winders, Handlers);
 
-// Helper: wrap Rc<Cont> + winders into Value::Continuation
-fn cont_to_value(k: &Rc<Cont>, winders: &Winders) -> Value {
-    let data: CapturedContData = (Rc::clone(k), winders.clone());
+// Helper: wrap Rc<Cont> + winders + handlers into Value::Continuation
+fn cont_to_value(k: &Rc<Cont>, winders: &Winders, handlers: &Handlers) -> Value {
+    let data: CapturedContData = (Rc::clone(k), winders.clone(), handlers.clone());
     let boxed: Rc<dyn std::any::Any> = Rc::new(data);
     Value::Continuation(ContData(boxed))
 }
 
-// Helper: extract Rc<Cont> + winders from Value::Continuation
-fn value_to_cont(v: &Value) -> (Rc<Cont>, Winders) {
+// Helper: extract Rc<Cont> + winders + handlers from Value::Continuation
+fn value_to_cont(v: &Value) -> (Rc<Cont>, Winders, Handlers) {
     match v {
         Value::Continuation(cd) => {
             cd.0.downcast_ref::<CapturedContData>().expect("invalid continuation data").clone()
@@ -317,6 +334,7 @@ fn apply_cek(
     env: &mut Rc<RefCell<Env>>,
     kont: &mut Rc<Cont>,
     winders: &mut Winders,
+    handlers: &mut Handlers,
 ) -> Result<CekAction, EvalError> {
     match func {
         Value::Lambda { params, rest_param, body, env: lenv } => {
@@ -360,7 +378,7 @@ fn apply_cek(
             if args.len() != 1 {
                 return Err(EvalError::Arity("continuation requires 1 argument".into()));
             }
-            let (target_cont, target_winders) = value_to_cont(func);
+            let (target_cont, target_winders, target_handlers) = value_to_cont(func);
             let target_val = args[0].clone();
 
             let common = winder_common_prefix(winders, &target_winders);
@@ -378,6 +396,7 @@ fn apply_cek(
             if thunks.is_empty() {
                 *kont = target_cont;
                 *winders = target_winders;
+                *handlers = target_handlers;
                 Ok(CekAction::Value(target_val))
             } else {
                 let first = thunks.remove(0);
@@ -386,8 +405,9 @@ fn apply_cek(
                     final_val: target_val,
                     final_cont: target_cont,
                     final_winders: target_winders,
+                    final_handlers: target_handlers,
                 });
-                apply_cek(&first, &[], out, ctrl, env, kont, winders)
+                apply_cek(&first, &[], out, ctrl, env, kont, winders, handlers)
             }
         }
         Value::Symbol(op) => {
@@ -400,15 +420,15 @@ fn apply_cek(
                 let tail = value_to_vec(last)?;
                 let mut full: Vec<Value> = args[1..args.len() - 1].to_vec();
                 full.extend(tail);
-                return apply_cek(inner, &full, out, ctrl, env, kont, winders);
+                return apply_cek(inner, &full, out, ctrl, env, kont, winders, handlers);
             }
             if op == "call/cc" || op == "call-with-current-continuation" {
                 // First-class call/cc: (apply call/cc (list f)) or similar
                 if args.len() != 1 {
                     return Err(EvalError::Arity("call/cc requires 1 argument".into()));
                 }
-                let continuation = cont_to_value(kont, winders);
-                return apply_cek(&args[0], &[continuation], out, ctrl, env, kont, winders);
+                let continuation = cont_to_value(kont, winders, handlers);
+                return apply_cek(&args[0], &[continuation], out, ctrl, env, kont, winders, handlers);
             }
             Ok(CekAction::Value(apply_builtin(op, args, out)?))
         }
@@ -453,6 +473,7 @@ fn cek_eval(
     let mut env = init_env;
     let mut kont = init_kont;
     let mut winders: Winders = Vec::new();
+    let mut handlers: Handlers = Vec::new();
 
     loop {
         // ===== EVAL PHASE: reduce ctrl to a value =====
@@ -675,7 +696,71 @@ fn cek_eval(
                                     out_thunk,
                                     next: kont,
                                 });
-                                match apply_cek(&in_thunk, &[], out, &mut ctrl, &mut env, &mut kont, &mut winders)? {
+                                match apply_cek(&in_thunk, &[], out, &mut ctrl, &mut env, &mut kont, &mut winders, &mut handlers)? {
+                                    CekAction::Value(v) => break v,
+                                    CekAction::Eval => continue,
+                                }
+                            }
+
+                            // ---- raise ----
+                            "raise" if env.borrow().get("raise").is_err() => {
+                                if elems.len() != 2 { return Err(EvalError::Arity("raise requires 1 argument".into())); }
+                                kont = Rc::new(Cont::RaiseVal { next: kont });
+                                ctrl = elems.swap_remove(1);
+                                continue;
+                            }
+
+                            // ---- guard ----
+                            "guard" => {
+                                if elems.len() < 3 { return Err(EvalError::Arity("guard requires clauses and body".into())); }
+                                let header = match &elems[1] {
+                                    Value::List(parts) if !parts.is_empty() => parts.clone(),
+                                    _ => return Err(EvalError::Type("guard: expected (var clause ...) ".into())),
+                                };
+                                let var = match &header[0] {
+                                    Value::Symbol(s) => s.clone(),
+                                    _ => return Err(EvalError::Type("guard: expected symbol".into())),
+                                };
+                                let clauses: Vec<Value> = header[1..].to_vec();
+                                let body: Vec<Value> = elems[2..].to_vec();
+
+                                // Guard frame: receives exception value, tests clauses
+                                let guard_frame = Rc::new(Cont::Guard {
+                                    var,
+                                    clauses,
+                                    env: Rc::clone(&env),
+                                    next: Rc::clone(&kont),
+                                });
+
+                                // Capture continuation at Guard frame as exception handler
+                                let captured = cont_to_value(&guard_frame, &winders, &handlers);
+                                handlers.push(captured);
+
+                                // PopHandler delivers normal return directly to kont (skipping Guard)
+                                kont = Rc::new(Cont::PopHandler { next: kont });
+
+                                // Evaluate body
+                                if body.len() > 1 {
+                                    kont = Rc::new(Cont::Seq {
+                                        remaining: body[1..].to_vec(),
+                                        env: Rc::clone(&env),
+                                        next: kont,
+                                    });
+                                }
+                                ctrl = body[0].clone();
+                                continue;
+                            }
+
+                            // ---- with-exception-handler ----
+                            "with-exception-handler" if env.borrow().get("with-exception-handler").is_err() => {
+                                if elems.len() != 3 {
+                                    return Err(EvalError::Arity("with-exception-handler requires 2 arguments".into()));
+                                }
+                                let handler = eval(&elems[1], &env, out)?;
+                                let thunk = eval(&elems[2], &env, out)?;
+                                handlers.push(handler);
+                                kont = Rc::new(Cont::PopHandler { next: kont });
+                                match apply_cek(&thunk, &[], out, &mut ctrl, &mut env, &mut kont, &mut winders, &mut handlers)? {
                                     CekAction::Value(v) => break v,
                                     CekAction::Eval => continue,
                                 }
@@ -729,7 +814,7 @@ fn cek_eval(
                                 break apply_builtin(op, &args, out)?;
                             }
                             other => {
-                                match apply_cek(&other, &args, out, &mut ctrl, &mut env, &mut kont, &mut winders)? {
+                                match apply_cek(&other, &args, out, &mut ctrl, &mut env, &mut kont, &mut winders, &mut handlers)? {
                                     CekAction::Value(v) => break v,
                                     CekAction::Eval => continue,
                                 }
@@ -766,7 +851,7 @@ fn cek_eval(
                         let func = ev.remove(0);
                         let args = ev;
                         kont = Rc::clone(next);
-                        match apply_cek(&func, &args, out, &mut ctrl, &mut env, &mut kont, &mut winders)? {
+                        match apply_cek(&func, &args, out, &mut ctrl, &mut env, &mut kont, &mut winders, &mut handlers)? {
                             CekAction::Value(v) => { val = v; continue; }
                             CekAction::Eval => { break; }
                         }
@@ -1036,9 +1121,9 @@ fn cek_eval(
                 Cont::CallCC { next } => {
                     let proc = std::mem::replace(&mut val, Value::Void);
                     let transformed = transform_cont_for_capture(next);
-                    let captured = cont_to_value(&transformed, &winders);
+                    let captured = cont_to_value(&transformed, &winders, &handlers);
                     kont = Rc::clone(next);
-                    match apply_cek(&proc, &[captured], out, &mut ctrl, &mut env, &mut kont, &mut winders)? {
+                    match apply_cek(&proc, &[captured], out, &mut ctrl, &mut env, &mut kont, &mut winders, &mut handlers)? {
                         CekAction::Value(v) => { val = v; continue; }
                         CekAction::Eval => { break; }
                     }
@@ -1060,7 +1145,7 @@ fn cek_eval(
                         args.push(eval(expr, renv, out)?);
                     }
                     kont = Rc::clone(next);
-                    match apply_cek(&func_val, &args, out, &mut ctrl, &mut env, &mut kont, &mut winders)? {
+                    match apply_cek(&func_val, &args, out, &mut ctrl, &mut env, &mut kont, &mut winders, &mut handlers)? {
                         CekAction::Value(v) => { val = v; continue; }
                         CekAction::Eval => { break; }
                     }
@@ -1075,7 +1160,7 @@ fn cek_eval(
                         out_thunk: out_thunk.clone(),
                         next: Rc::clone(next),
                     });
-                    match apply_cek(&body_thunk, &[], out, &mut ctrl, &mut env, &mut kont, &mut winders)? {
+                    match apply_cek(&body_thunk, &[], out, &mut ctrl, &mut env, &mut kont, &mut winders, &mut handlers)? {
                         CekAction::Value(v) => { val = v; continue; }
                         CekAction::Eval => { break; }
                     }
@@ -1090,7 +1175,7 @@ fn cek_eval(
                         body_val,
                         next: Rc::clone(next),
                     });
-                    match apply_cek(&out_thunk, &[], out, &mut ctrl, &mut env, &mut kont, &mut winders)? {
+                    match apply_cek(&out_thunk, &[], out, &mut ctrl, &mut env, &mut kont, &mut winders, &mut handlers)? {
                         CekAction::Value(v) => { val = v; continue; }
                         CekAction::Eval => { break; }
                     }
@@ -1104,9 +1189,10 @@ fn cek_eval(
                 }
 
                 // --- DynWindDoThunks: chain of thunks for unwind/rewind ---
-                Cont::DynWindDoThunks { thunks, final_val, final_cont, final_winders } => {
+                Cont::DynWindDoThunks { thunks, final_val, final_cont, final_winders, final_handlers } => {
                     if thunks.is_empty() {
                         winders = final_winders.clone();
+                        handlers = final_handlers.clone();
                         val = final_val.clone();
                         kont = Rc::clone(final_cont);
                         continue;
@@ -1118,11 +1204,88 @@ fn cek_eval(
                         final_val: final_val.clone(),
                         final_cont: Rc::clone(final_cont),
                         final_winders: final_winders.clone(),
+                        final_handlers: final_handlers.clone(),
                     });
-                    match apply_cek(&next_thunk, &[], out, &mut ctrl, &mut env, &mut kont, &mut winders)? {
+                    match apply_cek(&next_thunk, &[], out, &mut ctrl, &mut env, &mut kont, &mut winders, &mut handlers)? {
                         CekAction::Value(v) => { val = v; continue; }
                         CekAction::Eval => { break; }
                     }
+                }
+
+                // --- RaiseVal: argument evaluated, invoke exception handler ---
+                Cont::RaiseVal { next } => {
+                    let exn = std::mem::replace(&mut val, Value::Void);
+                    kont = Rc::clone(next);
+                    if let Some(handler) = handlers.pop() {
+                        match apply_cek(&handler, &[exn], out, &mut ctrl, &mut env, &mut kont, &mut winders, &mut handlers)? {
+                            CekAction::Value(v) => { val = v; continue; }
+                            CekAction::Eval => { break; }
+                        }
+                    } else {
+                        return Err(EvalError::Raised(format!("{}", exn)));
+                    }
+                }
+
+                // --- Guard: exception delivered via continuation, test clauses ---
+                Cont::Guard { var, clauses, env: genv, next } => {
+                    let exn = std::mem::replace(&mut val, Value::Void);
+                    let guard_env = Env::with_parent(genv);
+                    guard_env.borrow_mut().set(var.clone(), exn.clone());
+
+                    // Find matching clause
+                    let mut found_eval = false;
+                    let mut found_val = false;
+                    for clause in clauses {
+                        let parts = match clause {
+                            Value::List(parts) if !parts.is_empty() => parts,
+                            _ => return Err(EvalError::Type("guard: invalid clause".into())),
+                        };
+                        let is_else = matches!(&parts[0], Value::Symbol(s) if s == "else");
+                        let test_true = if is_else {
+                            true
+                        } else {
+                            eval(&parts[0], &guard_env, out)?.is_truthy()
+                        };
+                        if test_true {
+                            let body = if is_else { &parts[1..] } else { &parts[1..] };
+                            kont = Rc::clone(next);
+                            if body.is_empty() {
+                                val = if is_else { Value::Void } else { Value::Boolean(true) };
+                                found_val = true;
+                            } else {
+                                if body.len() > 1 {
+                                    kont = Rc::new(Cont::Seq {
+                                        remaining: body[1..].to_vec(),
+                                        env: Rc::clone(&guard_env),
+                                        next: kont,
+                                    });
+                                }
+                                ctrl = body[0].clone();
+                                env = Rc::clone(&guard_env);
+                                found_eval = true;
+                            }
+                            break;
+                        }
+                    }
+                    if found_eval { break; }
+                    if found_val { continue; }
+                    // No clause matched, re-raise
+                    kont = Rc::clone(next);
+                    if let Some(handler) = handlers.pop() {
+                        match apply_cek(&handler, &[exn], out, &mut ctrl, &mut env, &mut kont, &mut winders, &mut handlers)? {
+                            CekAction::Value(v) => { val = v; continue; }
+                            CekAction::Eval => { break; }
+                        }
+                    } else {
+                        return Err(EvalError::Raised(format!("{}", exn)));
+                    }
+                }
+
+                // --- PopHandler: pop exception handler, deliver value ---
+                Cont::PopHandler { next } => {
+                    handlers.pop();
+                    kont = Rc::clone(next);
+                    continue;
                 }
             }
         }
