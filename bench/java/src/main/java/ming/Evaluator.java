@@ -1,5 +1,7 @@
 package ming;
 
+import static ming.Numbers.*;
+
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -93,6 +95,26 @@ public class Evaluator {
 
     private record BuiltinProc(String name, Builtin fn) {}
 
+    // --- Record Type ---
+
+    private static class RecordType {
+        final String name;
+        final List<String> fieldNames;
+        RecordType(String name, List<String> fieldNames) {
+            this.name = name;
+            this.fieldNames = fieldNames;
+        }
+    }
+
+    private static class SchemeRecord {
+        final RecordType type;
+        final Object[] fields;
+        SchemeRecord(RecordType type, Object[] fields) {
+            this.type = type;
+            this.fields = fields;
+        }
+    }
+
     // --- Syntax Rules Macro ---
 
     private static class SyntaxRulesMacro {
@@ -110,7 +132,7 @@ public class Evaluator {
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "if", "begin", "let", "set!", "define", "quote", "lambda",
-        "and", "or", "cond", "define-syntax", "syntax-rules"
+        "and", "or", "cond", "define-syntax", "syntax-rules", "define-record-type"
     );
 
     private int gensymCounter = 0;
@@ -667,98 +689,6 @@ public class Evaluator {
         }));
     }
 
-    // --- Number parsing and numeric tower ---
-
-    private static Object parseNumber(String tok) {
-        // Try integer
-        try { return Long.parseLong(tok); } catch (NumberFormatException ignored) {}
-        // Try rational a/b
-        int slash = tok.indexOf('/');
-        if (slash > 0 && slash < tok.length() - 1) {
-            try {
-                long num = Long.parseLong(tok.substring(0, slash));
-                long den = Long.parseLong(tok.substring(slash + 1));
-                if (den == 0) return null;
-                Rational r = new Rational(num, den);
-                return r.isInteger() ? r.toLong() : r;
-            } catch (NumberFormatException ignored) {}
-        }
-        // Try float
-        try {
-            if (tok.contains(".") || tok.contains("e") || tok.contains("E")) {
-                return Double.parseDouble(tok);
-            }
-        } catch (NumberFormatException ignored) {}
-        return null;
-    }
-
-    private static boolean isNumber(Object val) {
-        return val instanceof Long || val instanceof Rational || val instanceof Double;
-    }
-
-    private static double toDouble(Object val) throws EvalError {
-        if (val instanceof Long l) return l.doubleValue();
-        if (val instanceof Rational r) return r.toDouble();
-        if (val instanceof Double d) return d;
-        throw new EvalError("expected number, got: " + val);
-    }
-
-    // Arithmetic helpers that preserve exactness
-    private static Object addNum(Object a, Object b) throws EvalError {
-        if (a instanceof Double || b instanceof Double) return toDouble(a) + toDouble(b);
-        long an, ad, bn, bd;
-        if (a instanceof Long l) { an = l; ad = 1; } else { Rational r = (Rational) a; an = r.num; ad = r.den; }
-        if (b instanceof Long l) { bn = l; bd = 1; } else { Rational r = (Rational) b; bn = r.num; bd = r.den; }
-        Rational result = new Rational(an * bd + bn * ad, ad * bd);
-        return result.isInteger() ? result.toLong() : result;
-    }
-
-    private static Object subNum(Object a, Object b) throws EvalError {
-        if (a instanceof Double || b instanceof Double) return toDouble(a) - toDouble(b);
-        long an, ad, bn, bd;
-        if (a instanceof Long l) { an = l; ad = 1; } else { Rational r = (Rational) a; an = r.num; ad = r.den; }
-        if (b instanceof Long l) { bn = l; bd = 1; } else { Rational r = (Rational) b; bn = r.num; bd = r.den; }
-        Rational result = new Rational(an * bd - bn * ad, ad * bd);
-        return result.isInteger() ? result.toLong() : result;
-    }
-
-    private static Object mulNum(Object a, Object b) throws EvalError {
-        if (a instanceof Double || b instanceof Double) return toDouble(a) * toDouble(b);
-        long an, ad, bn, bd;
-        if (a instanceof Long l) { an = l; ad = 1; } else { Rational r = (Rational) a; an = r.num; ad = r.den; }
-        if (b instanceof Long l) { bn = l; bd = 1; } else { Rational r = (Rational) b; bn = r.num; bd = r.den; }
-        Rational result = new Rational(an * bn, ad * bd);
-        return result.isInteger() ? result.toLong() : result;
-    }
-
-    private static Object divNum(Object a, Object b) throws EvalError {
-        if (a instanceof Double || b instanceof Double) {
-            double dv = toDouble(b);
-            if (dv == 0) throw new EvalError("division by zero");
-            return toDouble(a) / dv;
-        }
-        long an, ad, bn, bd;
-        if (a instanceof Long l) { an = l; ad = 1; } else { Rational r = (Rational) a; an = r.num; ad = r.den; }
-        if (b instanceof Long l) { bn = l; bd = 1; } else { Rational r = (Rational) b; bn = r.num; bd = r.den; }
-        if (bn == 0) throw new EvalError("division by zero");
-        Rational result = new Rational(an * bd, ad * bn);
-        return result.isInteger() ? result.toLong() : result;
-    }
-
-    private static Object negateNum(Object a) throws EvalError {
-        if (a instanceof Long l) return -l;
-        if (a instanceof Double d) return -d;
-        if (a instanceof Rational r) return new Rational(-r.num, r.den);
-        throw new EvalError("expected number, got: " + a);
-    }
-
-    private static double numCompare(Object val) throws EvalError {
-        return toDouble(val);
-    }
-
-    private static void requireNumber(Object val, String context) throws EvalError {
-        if (!isNumber(val)) throw new EvalError(context + ": expected number, got: " + val);
-    }
 
     // --- Tokenizer ---
 
@@ -1165,6 +1095,9 @@ public class Evaluator {
                         env.define(macroName, new SyntaxRulesMacro(macroName, macroLiterals, macroRules, env));
                         return Boolean.FALSE;
                     }
+                    case "define-record-type" -> {
+                        return evalDefineRecordType(list, env, posStr);
+                    }
                 }
                 // Check for macro invocation
                 Object macroVal = null;
@@ -1224,6 +1157,71 @@ public class Evaluator {
             return bp.fn.apply(args);
         }
         throw new EvalError("not a procedure: " + schemeToString(proc));
+    }
+
+    private Object evalDefineRecordType(List<?> list, Env env, String posStr) throws EvalError {
+        if (list.size() < 4) throw new EvalError("define-record-type: too few arguments" + posStr);
+        Object typeNameObj = list.get(1);
+        if (typeNameObj instanceof Located loc) typeNameObj = loc.expr;
+        String typeName = (String) typeNameObj;
+
+        Object ctorObj = list.get(2);
+        if (ctorObj instanceof Located loc) ctorObj = loc.expr;
+        List<?> ctorSpec = (List<?>) ctorObj;
+        Object ctorNameObj = ctorSpec.get(0);
+        if (ctorNameObj instanceof Located loc) ctorNameObj = loc.expr;
+        String ctorName = (String) ctorNameObj;
+        List<String> ctorFields = new ArrayList<>();
+        for (int ci = 1; ci < ctorSpec.size(); ci++) {
+            Object cf = ctorSpec.get(ci);
+            if (cf instanceof Located loc) cf = loc.expr;
+            ctorFields.add((String) cf);
+        }
+
+        Object predObj = list.get(3);
+        if (predObj instanceof Located loc) predObj = loc.expr;
+        String predName = (String) predObj;
+
+        Map<String, Integer> fieldIndex = new HashMap<>();
+        for (int fi = 0; fi < ctorFields.size(); fi++) {
+            fieldIndex.put(ctorFields.get(fi), fi);
+        }
+        Map<String, Integer> accessorMap = new HashMap<>();
+        for (int fi = 4; fi < list.size(); fi++) {
+            Object fspec = list.get(fi);
+            if (fspec instanceof Located loc) fspec = loc.expr;
+            List<?> fieldSpec = (List<?>) fspec;
+            Object fnObj = fieldSpec.get(0);
+            if (fnObj instanceof Located loc) fnObj = loc.expr;
+            String fieldName = (String) fnObj;
+            Object accObj = fieldSpec.get(1);
+            if (accObj instanceof Located loc) accObj = loc.expr;
+            String accName = (String) accObj;
+            accessorMap.put(accName, fieldIndex.get(fieldName));
+        }
+
+        RecordType rt = new RecordType(typeName, ctorFields);
+
+        env.define(ctorName, new BuiltinProc(ctorName, args -> {
+            if (args.size() != ctorFields.size())
+                throw new EvalError(ctorName + ": expected " + ctorFields.size() + " arguments, got " + args.size());
+            return new SchemeRecord(rt, args.toArray());
+        }));
+        env.define(predName, new BuiltinProc(predName, args -> {
+            if (args.size() != 1) throw new EvalError(predName + ": expected 1 argument");
+            return args.get(0) instanceof SchemeRecord sr && sr.type == rt;
+        }));
+        for (var entry : accessorMap.entrySet()) {
+            String accName = entry.getKey();
+            int idx = entry.getValue();
+            env.define(accName, new BuiltinProc(accName, args -> {
+                if (args.size() != 1) throw new EvalError(accName + ": expected 1 argument");
+                if (!(args.get(0) instanceof SchemeRecord sr) || sr.type != rt)
+                    throw new EvalError(accName + ": not a " + typeName);
+                return sr.fields[idx];
+            }));
+        }
+        return Boolean.FALSE;
     }
 
     // Helper to unwrap Located in quoteValue
@@ -1399,12 +1397,6 @@ public class Evaluator {
         return !(val instanceof Boolean b && !b);
     }
 
-    private static long asLong(Object val) throws EvalError {
-        if (val instanceof Long l) return l;
-        if (val instanceof Rational r && r.isInteger()) return r.toLong();
-        throw new EvalError("expected integer, got: " + val);
-    }
-
     private String schemeToString(Object val) {
         if (val instanceof Long l) return l.toString();
         if (val instanceof Rational r) return r.toString();
@@ -1437,6 +1429,7 @@ public class Evaluator {
             if (c.value() == '\t') return "#\\tab";
             return "#\\" + c.value();
         }
+        if (val instanceof SchemeRecord) return "#<record>";
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof BuiltinProc) return "#<procedure>";
         if (val instanceof SyntaxRulesMacro) return "#<macro>";
