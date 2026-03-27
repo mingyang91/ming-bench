@@ -442,9 +442,10 @@ fn apply_cek(
 }
 
 // ---------------------------------------------------------------------------
-// Fast-path helper: does an expression tree contain a literal call/cc?
-// Stops descending into lambda/case-lambda/quote (those create closures,
-// not immediate call/cc usage).
+// Fast-path helper: could an expression invoke a continuation?
+// Any function call `(f ...)` might transitively invoke a captured
+// continuation, so we must use the slow (continuation-aware) path for
+// those.  Only lambda/case-lambda/quote are known safe.
 // ---------------------------------------------------------------------------
 
 fn may_contain_callcc(expr: &Value) -> bool {
@@ -454,11 +455,11 @@ fn may_contain_callcc(expr: &Value) -> bool {
             if let Value::Symbol(s) = &elems[0] {
                 match s.as_str() {
                     "lambda" | "case-lambda" | "quote" => return false,
-                    "call/cc" | "call-with-current-continuation" => return true,
                     _ => {}
                 }
             }
-            elems.iter().any(|e| may_contain_callcc(e))
+            // Any function call could invoke a continuation — use slow path
+            true
         }
         _ => false,
     }
