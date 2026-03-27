@@ -350,6 +350,7 @@ type interpreter struct {
 	global           *environment
 	gensymCounter    int
 	immutableStrings bool
+	currentWinds     []*dynamicWind
 }
 
 func newInterpreter() *interpreter {
@@ -422,7 +423,7 @@ func installBuiltins(env *environment) {
 		"cons", "car", "cdr", "set-car!", "set-cdr!", "null?", "list", "length", "append", "reverse",
 		"vector", "make-vector", "vector?", "vector-length", "vector-ref", "vector-set!", "vector->list", "list->vector",
 		"string?", "number?", "integer?", "rational?", "exact?", "inexact?", "boolean?", "pair?", "symbol?", "procedure?",
-		"apply", "eqv?", "eq?", "equal?", "call/cc", "call-with-current-continuation",
+		"apply", "eqv?", "eq?", "equal?", "call/cc", "call-with-current-continuation", "dynamic-wind",
 		"display", "write", "newline", "error",
 		"string-append", "string-length", "substring", "make-string", "string",
 		"string->number", "number->string", "exact->inexact", "inexact->exact", "numerator", "denominator",
@@ -1411,6 +1412,14 @@ func applyProcedure(i *interpreter, operator any, args []any, pos position, tail
 	}
 }
 
+func isCallableValue(value any) bool {
+	if _, ok := value.(*continuationProcedure); ok {
+		return true
+	}
+	_, ok := value.(callable)
+	return ok
+}
+
 func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, error) {
 	if isCxrProcedureName(name) {
 		return applyCxr(name, args, pos)
@@ -1423,6 +1432,25 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 			return nil, err
 		}
 		return applyProcedure(i, args[0], callArgs, pos, false)
+
+	case "dynamic-wind":
+		if len(args) != 3 {
+			return nil, newEvalError(pos, "%s expects exactly 3 arguments", name)
+		}
+		if !isCallableValue(args[0]) || !isCallableValue(args[1]) || !isCallableValue(args[2]) {
+			return nil, newEvalError(pos, "attempt to call non-procedure")
+		}
+		if _, err := applyProcedure(i, args[0], nil, pos, false); err != nil {
+			return nil, err
+		}
+		result, err := applyProcedure(i, args[1], nil, pos, false)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := applyProcedure(i, args[2], nil, pos, false); err != nil {
+			return nil, err
+		}
+		return result, nil
 
 	case "eqv?":
 		if len(args) != 2 {

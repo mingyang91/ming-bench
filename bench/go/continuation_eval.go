@@ -148,8 +148,44 @@ type forEachContinuationFrame struct {
 	pos       position
 }
 
+type dynamicWind struct {
+	before any
+	after  any
+	pos    position
+}
+
+type dynamicWindAfterBeforeFrame struct {
+	wind *dynamicWind
+	body any
+	pos  position
+}
+
+type dynamicWindAfterBodyFrame struct {
+	wind *dynamicWind
+	pos  position
+}
+
+type dynamicWindAfterAfterFrame struct {
+	result any
+}
+
+type continuationSwitchState struct {
+	exiting    []*dynamicWind
+	entering   []*dynamicWind
+	targetStack []continuationFrame
+	targetWinds []*dynamicWind
+	targetValue any
+}
+
+type continuationSwitchFrame struct {
+	state    *continuationSwitchState
+	entering bool
+	wind     *dynamicWind
+}
+
 type continuationProcedure struct {
 	stack []continuationFrame
+	winds []*dynamicWind
 }
 
 func continuationsEnabledAtCurrentLevel() bool {
@@ -184,6 +220,10 @@ func cloneContinuationStack(stack []continuationFrame) []continuationFrame {
 	return append([]continuationFrame(nil), stack...)
 }
 
+func cloneDynamicWinds(winds []*dynamicWind) []*dynamicWind {
+	return append([]*dynamicWind(nil), winds...)
+}
+
 func appendAnyValue(values []any, value any) []any {
 	next := make([]any, len(values)+1)
 	copy(next, values)
@@ -200,6 +240,106 @@ func prependAnyValue(values []any, value any) []any {
 
 func (p *continuationProcedure) cloneStack() []continuationFrame {
 	return cloneContinuationStack(p.stack)
+}
+
+func sharedDynamicWindPrefixLen(left []*dynamicWind, right []*dynamicWind) int {
+	limit := len(left)
+	if len(right) < limit {
+		limit = len(right)
+	}
+
+	index := 0
+	for index < limit && left[index] == right[index] {
+		index++
+	}
+	return index
+}
+
+func (i *interpreter) popCurrentWind(expected *dynamicWind) error {
+	if len(i.currentWinds) == 0 || i.currentWinds[len(i.currentWinds)-1] != expected {
+		return newEvalError(expected.pos, "internal error: dynamic-wind stack mismatch")
+	}
+	i.currentWinds = i.currentWinds[:len(i.currentWinds)-1]
+	return nil
+}
+
+func (i *interpreter) startDynamicWind(before any, body any, after any, pos position, stack []continuationFrame) (continuationControl, []continuationFrame, error) {
+	if !isCallableValue(before) || !isCallableValue(body) || !isCallableValue(after) {
+		return continuationControl{}, nil, newEvalError(pos, "attempt to call non-procedure")
+	}
+
+	wind := &dynamicWind{
+		before: before,
+		after:  after,
+		pos:    pos,
+	}
+
+	stack = append(stack, dynamicWindAfterBeforeFrame{
+		wind: wind,
+		body: body,
+		pos:  pos,
+	})
+	return i.applyContinuationProcedure(before, nil, pos, stack)
+}
+
+func (i *interpreter) startContinuationSwitch(procedure *continuationProcedure, value any) (continuationControl, []continuationFrame, error) {
+	targetStack := procedure.cloneStack()
+	targetWinds := cloneDynamicWinds(procedure.winds)
+	commonPrefix := sharedDynamicWindPrefixLen(i.currentWinds, targetWinds)
+
+	exiting := make([]*dynamicWind, 0, len(i.currentWinds)-commonPrefix)
+	for index := len(i.currentWinds) - 1; index >= commonPrefix; index-- {
+		exiting = append(exiting, i.currentWinds[index])
+	}
+
+	entering := cloneDynamicWinds(targetWinds[commonPrefix:])
+	if len(exiting) == 0 && len(entering) == 0 {
+		i.currentWinds = targetWinds
+		return newValueControl(value), targetStack, nil
+	}
+
+	state := &continuationSwitchState{
+		exiting:     exiting,
+		entering:    entering,
+		targetStack: targetStack,
+		targetWinds: targetWinds,
+		targetValue: value,
+	}
+
+	return i.advanceContinuationSwitch(state)
+}
+
+func (i *interpreter) advanceContinuationSwitch(state *continuationSwitchState) (continuationControl, []continuationFrame, error) {
+	if len(state.exiting) > 0 {
+		wind := state.exiting[0]
+		state.exiting = state.exiting[1:]
+
+		if err := i.popCurrentWind(wind); err != nil {
+			return continuationControl{}, nil, err
+		}
+
+		stack := []continuationFrame{
+			continuationSwitchFrame{state: state},
+		}
+		return i.applyContinuationProcedure(wind.after, nil, wind.pos, stack)
+	}
+
+	if len(state.entering) > 0 {
+		wind := state.entering[0]
+		state.entering = state.entering[1:]
+
+		stack := []continuationFrame{
+			continuationSwitchFrame{
+				state:    state,
+				entering: true,
+				wind:     wind,
+			},
+		}
+		return i.applyContinuationProcedure(wind.before, nil, wind.pos, stack)
+	}
+
+	i.currentWinds = cloneDynamicWinds(state.targetWinds)
+	return newValueControl(state.targetValue), state.targetStack, nil
 }
 
 func (i *interpreter) evalProgramWithContinuations(expressions []expr) (any, error) {
@@ -708,6 +848,31 @@ func (i *interpreter) resumeContinuationFrame(frame continuationFrame, value any
 		frame.slot.value = value
 		return newValueControl(voidValue{}), stack, nil
 
+	case dynamicWindAfterBeforeFrame:
+		i.currentWinds = append(i.currentWinds, frame.wind)
+		stack = append(stack, dynamicWindAfterBodyFrame{
+			wind: frame.wind,
+			pos:  frame.pos,
+		})
+		return i.applyContinuationProcedure(frame.body, nil, frame.pos, stack)
+
+	case dynamicWindAfterBodyFrame:
+		if err := i.popCurrentWind(frame.wind); err != nil {
+			return continuationControl{}, nil, err
+		}
+
+		stack = append(stack, dynamicWindAfterAfterFrame{result: value})
+		return i.applyContinuationProcedure(frame.wind.after, nil, frame.pos, stack)
+
+	case dynamicWindAfterAfterFrame:
+		return newValueControl(frame.result), stack, nil
+
+	case continuationSwitchFrame:
+		if frame.entering {
+			i.currentWinds = append(i.currentWinds, frame.wind)
+		}
+		return i.advanceContinuationSwitch(frame.state)
+
 	case ifContinuationFrame:
 		if isTruthy(value) {
 			return newExpressionControl(frame.thenExpr, frame.env), stack, nil
@@ -1022,7 +1187,7 @@ func (i *interpreter) applyContinuationProcedure(operator any, args []any, pos p
 		if len(args) != 1 {
 			return continuationControl{}, nil, newEvalError(pos, "continuation expects exactly 1 argument")
 		}
-		return newValueControl(args[0]), procedure.cloneStack(), nil
+		return i.startContinuationSwitch(procedure, args[0])
 
 	case *lambdaProcedure:
 		if !procedure.matchesArity(len(args)) && !procedure.hasRest {
@@ -1052,11 +1217,19 @@ func (i *interpreter) applyContinuationProcedure(operator any, args []any, pos p
 
 	case *builtinProcedure:
 		switch procedure.name {
+		case "dynamic-wind":
+			if len(args) != 3 {
+				return continuationControl{}, nil, newEvalError(pos, "dynamic-wind expects exactly 3 arguments")
+			}
+			return i.startDynamicWind(args[0], args[1], args[2], pos, stack)
 		case "call/cc", "call-with-current-continuation":
 			if len(args) != 1 {
 				return continuationControl{}, nil, newEvalError(pos, "call/cc expects exactly 1 argument")
 			}
-			continuation := &continuationProcedure{stack: cloneContinuationStack(stack)}
+			continuation := &continuationProcedure{
+				stack: cloneContinuationStack(stack),
+				winds: cloneDynamicWinds(i.currentWinds),
+			}
 			return i.applyContinuationProcedure(args[0], []any{continuation}, pos, stack)
 		case "apply":
 			callArgs, err := expandApplyArgs(args, pos, procedure.name)
