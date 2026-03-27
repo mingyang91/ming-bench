@@ -754,7 +754,7 @@ fn cek_step_val(val: Value, k: Rc<Kont>, _output: &mut String, winders: &mut Vec
         Kont::GuardBody { body, env, next } => {
             cek_seq(body, env.clone(), next.clone())
         }
-        Kont::CWV { consumer, next } => {
+        Kont::Cwv { consumer, next } => {
             let args = match val {
                 Value::Values(vals) => vals,
                 other => vec![other],
@@ -858,7 +858,7 @@ fn cek_step_apply(func: Value, args: Vec<Value>, k: Rc<Kont>, output: &mut Strin
                 Ok((Ctrl::Apply(thunk, vec![]), Rc::new(Kont::PopHandler { next: k })))
             } else if name == "values" {
                 if args.len() == 1 {
-                    Ok((Ctrl::Val(args.into_iter().next().unwrap()), k))
+                    Ok((Ctrl::Val(args.into_iter().next().expect("values: len checked == 1")), k))
                 } else {
                     Ok((Ctrl::Val(Value::Values(args)), k))
                 }
@@ -868,7 +868,7 @@ fn cek_step_apply(func: Value, args: Vec<Value>, k: Rc<Kont>, output: &mut Strin
                 }
                 let producer = args[0].clone();
                 let consumer = args[1].clone();
-                Ok((Ctrl::Apply(producer, vec![]), Rc::new(Kont::CWV { consumer, next: k })))
+                Ok((Ctrl::Apply(producer, vec![]), Rc::new(Kont::Cwv { consumer, next: k })))
             } else if name == "apply" {
                 if args.len() < 2 {
                     return Err(EvalError::Arity("apply requires at least 2 arguments".into()));

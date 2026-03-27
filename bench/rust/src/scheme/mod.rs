@@ -1426,7 +1426,7 @@ pub(crate) enum Kont {
     RaiseReturn,
     GuardTest { exn: Value, body: Vec<Expr>, rest_clauses: Vec<Expr>, guard_env: Env, guard_k: Rc<Kont>, guard_winders: Vec<Rc<(Value, Value)>> },
     GuardBody { body: Vec<Expr>, env: Env, next: Rc<Kont> },
-    CWV { consumer: Value, next: Rc<Kont> },
+    Cwv { consumer: Value, next: Rc<Kont> },
 }
 
 impl fmt::Debug for Kont {
