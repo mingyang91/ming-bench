@@ -4,6 +4,7 @@ const EMPTY_LIST = { kind: 'empty-list' };
 const VOID = { kind: 'void' };
 const UNINITIALIZED = Symbol('uninitialized');
 const STRING_IMMUTABILITY_LEVEL = 15;
+let currentWindFrames = [];
 const CORE_SYNTAX = new Set([
     'and',
     'begin',
@@ -702,6 +703,7 @@ function createBuiltins(output, macroEnv) {
             output.write(formatDisplayValue(args[0]));
             return VOID;
         }),
+        builtin('dynamic-wind', (args, position, k) => dynamicWindBuiltin(args, position, macroEnv, k)),
         builtin('eq?', (args) => {
             assertExactArity('eq?', args, 2);
             return eqValues(args[0], args[1]);
@@ -940,7 +942,15 @@ export function evalStrWithOutput(input) {
     const output = new OutputBuffer();
     const macroEnv = new MacroEnv();
     const env = createGlobalEnv(output, macroEnv);
-    const lastValue = evalSequence(program, env, macroEnv);
+    const previousWindFrames = currentWindFrames;
+    currentWindFrames = [];
+    let lastValue;
+    try {
+        lastValue = evalSequence(program, env, macroEnv);
+    }
+    finally {
+        currentWindFrames = previousWindFrames;
+    }
     return {
         result: formatValue(lastValue),
         output: output.toString(),
@@ -1655,7 +1665,7 @@ function applyProcedure(proc, args, position, macroEnv, k) {
     }
     if (proc.kind === 'continuation') {
         assertExactArity('continuation', args, 1);
-        return proc.resume(args[0]);
+        return resumeContinuation(proc, args[0], macroEnv);
     }
     if (proc.kind === 'lambda') {
         return applyProcedureClause(proc.name ?? 'lambda', proc.env, { params: proc.params, body: proc.body }, args, macroEnv, k);
@@ -1689,10 +1699,69 @@ function callCcBuiltin(args, position, k) {
     return {
         kind: 'apply-step',
         proc,
-        args: [{ kind: 'continuation', resume: k }],
+        args: [{ kind: 'continuation', resume: k, windStack: currentWindFrames.slice() }],
         position,
         k,
     };
+}
+function dynamicWindBuiltin(args, position, macroEnv, k) {
+    assertExactArity('dynamic-wind', args, 3);
+    const before = expectProcedureValue('dynamic-wind', args[0]);
+    const body = expectProcedureValue('dynamic-wind', args[1]);
+    const after = expectProcedureValue('dynamic-wind', args[2]);
+    const frame = { before, after, position };
+    return invokeWindThunk(before, position, currentWindFrames.slice(), macroEnv, () => {
+        const outerWindFrames = currentWindFrames.slice();
+        currentWindFrames = [...outerWindFrames, frame];
+        return applyProcedure(body, [], position, macroEnv, (value) => {
+            currentWindFrames = outerWindFrames;
+            return invokeWindThunk(after, position, outerWindFrames, macroEnv, () => k(value));
+        });
+    });
+}
+function invokeWindThunk(proc, position, windFrames, macroEnv, k) {
+    currentWindFrames = windFrames;
+    return applyProcedure(proc, [], position, macroEnv, () => {
+        currentWindFrames = windFrames;
+        return k();
+    });
+}
+function resumeContinuation(proc, value, macroEnv) {
+    return transitionWindFrames(proc.windStack, macroEnv, () => proc.resume(value));
+}
+function transitionWindFrames(targetWindFrames, macroEnv, next) {
+    const sharedLength = commonWindPrefixLength(currentWindFrames, targetWindFrames);
+    return unwindWindFrames(currentWindFrames.slice(), sharedLength, macroEnv, () => rewindWindFrames(targetWindFrames, sharedLength, macroEnv, next));
+}
+function unwindWindFrames(windFrames, sharedLength, macroEnv, next) {
+    if (windFrames.length === sharedLength) {
+        currentWindFrames = windFrames;
+        return next();
+    }
+    const frame = windFrames[windFrames.length - 1];
+    const remainingWindFrames = windFrames.slice(0, -1);
+    currentWindFrames = remainingWindFrames;
+    return invokeWindThunk(frame.after, frame.position, remainingWindFrames, macroEnv, () => unwindWindFrames(remainingWindFrames, sharedLength, macroEnv, next));
+}
+function rewindWindFrames(targetWindFrames, index, macroEnv, next) {
+    if (index === targetWindFrames.length) {
+        currentWindFrames = targetWindFrames.slice();
+        return next();
+    }
+    const prefixWindFrames = targetWindFrames.slice(0, index);
+    const frame = targetWindFrames[index];
+    return invokeWindThunk(frame.before, frame.position, prefixWindFrames, macroEnv, () => {
+        currentWindFrames = targetWindFrames.slice(0, index + 1);
+        return rewindWindFrames(targetWindFrames, index + 1, macroEnv, next);
+    });
+}
+function commonWindPrefixLength(left, right) {
+    const limit = Math.min(left.length, right.length);
+    let index = 0;
+    while (index < limit && left[index] === right[index]) {
+        index += 1;
+    }
+    return index;
 }
 function applyBuiltin(args, position, macroEnv, k) {
     assertAtLeastArity('apply', args, 2);
@@ -1888,6 +1957,12 @@ function expectNumbers(name, args) {
 function expectNumberValue(name, value) {
     if (!num.isNumericValue(value)) {
         throw new EvalError(`${name} expects a number`);
+    }
+    return value;
+}
+function expectProcedureValue(name, value) {
+    if (!isProcedure(value)) {
+        throw new EvalError(`${name} expects a procedure`);
     }
     return value;
 }

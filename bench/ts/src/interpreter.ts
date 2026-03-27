@@ -70,9 +70,15 @@ type CaseLambdaProc = {
   clauses: ProcedureClause[];
   env: Env;
 };
+type WindFrame = {
+  before: ProcedureValue;
+  after: ProcedureValue;
+  position: SourcePosition;
+};
 type ContinuationValue = {
   kind: 'continuation';
   resume: ContinuationFn;
+  windStack: WindFrame[];
 };
 type RecordFieldSpec = {
   name: string;
@@ -120,6 +126,7 @@ const EMPTY_LIST: EmptyList = { kind: 'empty-list' };
 const VOID: VoidValue = { kind: 'void' };
 const UNINITIALIZED = Symbol('uninitialized');
 const STRING_IMMUTABILITY_LEVEL = 15;
+let currentWindFrames: WindFrame[] = [];
 const CORE_SYNTAX = new Set([
   'and',
   'begin',
@@ -973,6 +980,7 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
       output.write(formatDisplayValue(args[0]!));
       return VOID;
     }),
+    builtin('dynamic-wind', (args, position, k) => dynamicWindBuiltin(args, position, macroEnv, k)),
     builtin('eq?', (args) => {
       assertExactArity('eq?', args, 2);
       return eqValues(args[0]!, args[1]!);
@@ -1229,7 +1237,15 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   const output = new OutputBuffer();
   const macroEnv = new MacroEnv();
   const env = createGlobalEnv(output, macroEnv);
-  const lastValue = evalSequence(program, env, macroEnv);
+  const previousWindFrames = currentWindFrames;
+  currentWindFrames = [];
+
+  let lastValue: Value;
+  try {
+    lastValue = evalSequence(program, env, macroEnv);
+  } finally {
+    currentWindFrames = previousWindFrames;
+  }
 
   return {
     result: formatValue(lastValue),
@@ -2174,7 +2190,7 @@ function applyProcedure(
 
   if (proc.kind === 'continuation') {
     assertExactArity('continuation', args, 1);
-    return proc.resume(args[0]!);
+    return resumeContinuation(proc, args[0]!, macroEnv);
   }
 
   if (proc.kind === 'lambda') {
@@ -2228,10 +2244,108 @@ function callCcBuiltin(args: Value[], position: SourcePosition, k: ContinuationF
   return {
     kind: 'apply-step',
     proc,
-    args: [{ kind: 'continuation', resume: k }],
+    args: [{ kind: 'continuation', resume: k, windStack: currentWindFrames.slice() }],
     position,
     k,
   };
+}
+
+function dynamicWindBuiltin(
+  args: Value[],
+  position: SourcePosition,
+  macroEnv: MacroEnv,
+  k: ContinuationFn,
+): MachineStep {
+  assertExactArity('dynamic-wind', args, 3);
+
+  const before = expectProcedureValue('dynamic-wind', args[0]!);
+  const body = expectProcedureValue('dynamic-wind', args[1]!);
+  const after = expectProcedureValue('dynamic-wind', args[2]!);
+  const frame: WindFrame = { before, after, position };
+
+  return invokeWindThunk(before, position, currentWindFrames.slice(), macroEnv, () => {
+    const outerWindFrames = currentWindFrames.slice();
+    currentWindFrames = [...outerWindFrames, frame];
+
+    return applyProcedure(body, [], position, macroEnv, (value) => {
+      currentWindFrames = outerWindFrames;
+      return invokeWindThunk(after, position, outerWindFrames, macroEnv, () => k(value));
+    });
+  });
+}
+
+function invokeWindThunk(
+  proc: ProcedureValue,
+  position: SourcePosition,
+  windFrames: WindFrame[],
+  macroEnv: MacroEnv,
+  k: () => MachineStep,
+): MachineStep {
+  currentWindFrames = windFrames;
+  return applyProcedure(proc, [], position, macroEnv, () => {
+    currentWindFrames = windFrames;
+    return k();
+  });
+}
+
+function resumeContinuation(proc: ContinuationValue, value: Value, macroEnv: MacroEnv): MachineStep {
+  return transitionWindFrames(proc.windStack, macroEnv, () => proc.resume(value));
+}
+
+function transitionWindFrames(targetWindFrames: WindFrame[], macroEnv: MacroEnv, next: () => MachineStep): MachineStep {
+  const sharedLength = commonWindPrefixLength(currentWindFrames, targetWindFrames);
+  return unwindWindFrames(currentWindFrames.slice(), sharedLength, macroEnv, () =>
+    rewindWindFrames(targetWindFrames, sharedLength, macroEnv, next),
+  );
+}
+
+function unwindWindFrames(
+  windFrames: WindFrame[],
+  sharedLength: number,
+  macroEnv: MacroEnv,
+  next: () => MachineStep,
+): MachineStep {
+  if (windFrames.length === sharedLength) {
+    currentWindFrames = windFrames;
+    return next();
+  }
+
+  const frame = windFrames[windFrames.length - 1]!;
+  const remainingWindFrames = windFrames.slice(0, -1);
+  currentWindFrames = remainingWindFrames;
+  return invokeWindThunk(frame.after, frame.position, remainingWindFrames, macroEnv, () =>
+    unwindWindFrames(remainingWindFrames, sharedLength, macroEnv, next),
+  );
+}
+
+function rewindWindFrames(
+  targetWindFrames: WindFrame[],
+  index: number,
+  macroEnv: MacroEnv,
+  next: () => MachineStep,
+): MachineStep {
+  if (index === targetWindFrames.length) {
+    currentWindFrames = targetWindFrames.slice();
+    return next();
+  }
+
+  const prefixWindFrames = targetWindFrames.slice(0, index);
+  const frame = targetWindFrames[index]!;
+  return invokeWindThunk(frame.before, frame.position, prefixWindFrames, macroEnv, () => {
+    currentWindFrames = targetWindFrames.slice(0, index + 1);
+    return rewindWindFrames(targetWindFrames, index + 1, macroEnv, next);
+  });
+}
+
+function commonWindPrefixLength(left: readonly WindFrame[], right: readonly WindFrame[]): number {
+  const limit = Math.min(left.length, right.length);
+  let index = 0;
+
+  while (index < limit && left[index] === right[index]) {
+    index += 1;
+  }
+
+  return index;
 }
 
 function applyBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
@@ -2504,6 +2618,14 @@ function expectNumbers(name: string, args: Value[]): num.NumericValue[] {
 function expectNumberValue(name: string, value: Value): num.NumericValue {
   if (!num.isNumericValue(value)) {
     throw new EvalError(`${name} expects a number`);
+  }
+
+  return value;
+}
+
+function expectProcedureValue(name: string, value: Value): ProcedureValue {
+  if (!isProcedure(value)) {
+    throw new EvalError(`${name} expects a procedure`);
   }
 
   return value;
