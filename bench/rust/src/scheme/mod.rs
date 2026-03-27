@@ -284,6 +284,8 @@ struct EvalState {
     output: String,
     next_hygiene_id: usize,
     next_wind_id: usize,
+    next_invocation_id: usize,
+    latest_continuations: HashMap<usize, Rc<CapturedContinuation>>,
 }
 
 enum EvalStep {
@@ -311,10 +313,14 @@ struct CapturedContinuation {
     frames: Vec<MachineFrame>,
     winds: Vec<DynamicWindFrame>,
     name: Option<String>,
+    invocation_id: Option<usize>,
 }
 
 #[derive(Clone)]
 enum MachineFrame {
+    CallBoundary {
+        previous_invocation_id: Option<usize>,
+    },
     Sequence {
         remaining: Vec<Expr>,
         env: Rc<Environment>,
@@ -1952,17 +1958,14 @@ fn expand_lambda_template(
         expand_parameter_bindings(&elements[1], bindings, definition_env, scope, path, state)?;
     let body_scope = extend_scope(scope, &parameter_scope);
     let mut expanded = vec![head, params_expr];
-
-    for body_template in &elements[2..] {
-        expanded.push(expand_template(
-            body_template,
-            bindings,
-            definition_env,
-            &body_scope,
-            path,
-            state,
-        )?);
-    }
+    expanded.extend(expand_body_templates(
+        &elements[2..],
+        bindings,
+        definition_env,
+        &body_scope,
+        path,
+        state,
+    )?);
 
     Ok(Expr::List(expanded, template.pos()))
 }
@@ -1987,6 +1990,47 @@ fn expand_let_template(
         ));
     }
 
+    if matches!(&elements[1], Expr::Symbol(_, _) | Expr::ResolvedSymbol(_)) {
+        if elements.len() < 4 || !matches!(&elements[2], Expr::List(_, _)) {
+            return Ok(Expr::List(
+                expand_template_sequence(elements, bindings, definition_env, scope, path, state)?,
+                template.pos(),
+            ));
+        }
+
+        let head = expand_template(&elements[0], bindings, definition_env, scope, path, state)?;
+        let mut loop_scope = HashMap::new();
+        let expanded_loop_name = if let Some(loop_name) = symbol_name(&elements[1]) {
+            if !bindings.contains_key(loop_name) {
+                let binding_key = fresh_binding_key(loop_name, state);
+                loop_scope.insert(loop_name.to_string(), binding_key.clone());
+                Expr::ResolvedSymbol(ResolvedSymbol {
+                    name: loop_name.to_string(),
+                    pos: elements[1].pos(),
+                    binding: SymbolBinding::Lexical(binding_key),
+                })
+            } else {
+                expand_template(&elements[1], bindings, definition_env, scope, path, state)?
+            }
+        } else {
+            expand_template(&elements[1], bindings, definition_env, scope, path, state)?
+        };
+        let (binding_expr, binding_scope) =
+            expand_let_bindings(&elements[2], bindings, definition_env, scope, path, state)?;
+        let body_scope = extend_scope(&extend_scope(scope, &loop_scope), &binding_scope);
+        let mut expanded = vec![head, expanded_loop_name, binding_expr];
+        expanded.extend(expand_body_templates(
+            &elements[3..],
+            bindings,
+            definition_env,
+            &body_scope,
+            path,
+            state,
+        )?);
+
+        return Ok(Expr::List(expanded, template.pos()));
+    }
+
     if !matches!(&elements[1], Expr::List(_, _)) {
         return Ok(Expr::List(
             expand_template_sequence(elements, bindings, definition_env, scope, path, state)?,
@@ -1999,17 +2043,14 @@ fn expand_let_template(
         expand_let_bindings(&elements[1], bindings, definition_env, scope, path, state)?;
     let body_scope = extend_scope(scope, &binding_scope);
     let mut expanded = vec![head, binding_expr];
-
-    for body_template in &elements[2..] {
-        expanded.push(expand_template(
-            body_template,
-            bindings,
-            definition_env,
-            &body_scope,
-            path,
-            state,
-        )?);
-    }
+    expanded.extend(expand_body_templates(
+        &elements[2..],
+        bindings,
+        definition_env,
+        &body_scope,
+        path,
+        state,
+    )?);
 
     Ok(Expr::List(expanded, template.pos()))
 }
@@ -2036,9 +2077,75 @@ fn expand_define_template(
 
     let head = expand_template(&elements[0], bindings, definition_env, scope, path, state)?;
 
+    if let Expr::List(target_elements, _) = &elements[1] {
+        if !target_elements.is_empty() {
+            let name_template = &target_elements[0];
+            let mut definition_bindings = HashMap::new();
+            let expanded_name = if let Some(function_name) = symbol_name(name_template) {
+                if !bindings.contains_key(function_name) {
+                    let binding_key = scope
+                        .get(function_name)
+                        .cloned()
+                        .unwrap_or_else(|| fresh_binding_key(function_name, state));
+                    definition_bindings.insert(function_name.to_string(), binding_key.clone());
+                    Expr::ResolvedSymbol(ResolvedSymbol {
+                        name: function_name.to_string(),
+                        pos: name_template.pos(),
+                        binding: SymbolBinding::Lexical(binding_key),
+                    })
+                } else {
+                    expand_template(name_template, bindings, definition_env, scope, path, state)?
+                }
+            } else {
+                expand_template(name_template, bindings, definition_env, scope, path, state)?
+            };
+
+            let (params_expr, parameter_scope) = expand_parameter_bindings(
+                &Expr::List(target_elements[1..].to_vec(), elements[1].pos()),
+                bindings,
+                definition_env,
+                scope,
+                path,
+                state,
+            )?;
+            let params_list = match params_expr {
+                Expr::List(elements, _) => elements,
+                _ => unreachable!("function define parameters expand to a list"),
+            };
+            let body_scope = extend_scope(
+                &extend_scope(scope, &definition_bindings),
+                &parameter_scope,
+            );
+            let mut expanded = vec![
+                head,
+                Expr::List(
+                    {
+                        let mut signature = vec![expanded_name];
+                        signature.extend(params_list);
+                        signature
+                    },
+                    elements[1].pos(),
+                ),
+            ];
+            expanded.extend(expand_body_templates(
+                &elements[2..],
+                bindings,
+                definition_env,
+                &body_scope,
+                path,
+                state,
+            )?);
+
+            return Ok(Expr::List(expanded, template.pos()));
+        }
+    }
+
     if let Some(target_name) = symbol_name(&elements[1]) {
         if !bindings.contains_key(target_name) {
-            let binding_key = fresh_binding_key(target_name, state);
+            let binding_key = scope
+                .get(target_name)
+                .cloned()
+                .unwrap_or_else(|| fresh_binding_key(target_name, state));
             let definition_scope = extend_scope(
                 scope,
                 &HashMap::from([(target_name.to_string(), binding_key.clone())]),
@@ -2225,6 +2332,63 @@ fn expand_let_bindings(
     }
 
     Ok((Expr::List(expanded, template.pos()), binding_scope))
+}
+
+fn expand_body_templates(
+    templates: &[Expr],
+    bindings: &PatternBindings,
+    definition_env: &Rc<Environment>,
+    scope: &HashMap<String, String>,
+    path: &[usize],
+    state: &mut EvalState,
+) -> EvalResult<Vec<Expr>> {
+    let mut body_scope = scope.clone();
+    let mut expanded = Vec::with_capacity(templates.len());
+
+    for template in templates {
+        let definition_scope = introduced_definition_bindings(template, bindings, state);
+        if !definition_scope.is_empty() {
+            body_scope = extend_scope(&body_scope, &definition_scope);
+        }
+        expanded.push(expand_template(
+            template,
+            bindings,
+            definition_env,
+            &body_scope,
+            path,
+            state,
+        )?);
+    }
+
+    Ok(expanded)
+}
+
+fn introduced_definition_bindings(
+    template: &Expr,
+    bindings: &PatternBindings,
+    state: &mut EvalState,
+) -> HashMap<String, String> {
+    let elements = match template {
+        Expr::List(elements, _) if elements.len() >= 3 => elements,
+        _ => return HashMap::new(),
+    };
+
+    if !matches!(symbol_name(&elements[0]), Some("define")) {
+        return HashMap::new();
+    }
+
+    let target = match &elements[1] {
+        Expr::List(target_elements, _) if !target_elements.is_empty() => &target_elements[0],
+        other => other,
+    };
+
+    if let Some(name) = symbol_name(target) {
+        if !bindings.contains_key(name) {
+            return HashMap::from([(name.to_string(), fresh_binding_key(name, state))]);
+        }
+    }
+
+    HashMap::new()
 }
 
 fn expand_template_sequence(

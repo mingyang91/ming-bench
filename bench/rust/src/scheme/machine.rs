@@ -16,6 +16,7 @@ pub(super) fn evaluate_program(
         frames: Vec::new(),
         winds: Vec::new(),
         control: MachineControl::Expr(first.clone(), Rc::clone(&env)),
+        current_invocation_id: None,
     };
 
     if !remaining.is_empty() {
@@ -33,6 +34,7 @@ struct EvalMachine<'a> {
     frames: Vec<MachineFrame>,
     winds: Vec<DynamicWindFrame>,
     control: MachineControl,
+    current_invocation_id: Option<usize>,
 }
 
 impl EvalMachine<'_> {
@@ -150,6 +152,12 @@ impl EvalMachine<'_> {
         };
 
         match frame {
+            MachineFrame::CallBoundary {
+                previous_invocation_id,
+            } => {
+                self.current_invocation_id = previous_invocation_id;
+                self.control = MachineControl::Value(value);
+            }
             MachineFrame::Sequence { remaining, env } => {
                 if remaining.is_empty() {
                     self.control = MachineControl::Value(value);
@@ -364,20 +372,34 @@ impl EvalMachine<'_> {
             Value::Builtin(Builtin::Map) => self.start_map(&args, pos)?,
             Value::Builtin(Builtin::CallCc) => {
                 expect_arity("call/cc", &args, 1, pos)?;
-                let continuation = Value::Continuation(Rc::new(CapturedContinuation {
+                let captured = Rc::new(CapturedContinuation {
                     frames: self.frames.clone(),
                     winds: self.winds.clone(),
                     name: Some("continuation".into()),
-                }));
+                    invocation_id: self.current_invocation_id,
+                });
+                if let Some(invocation_id) = captured.invocation_id {
+                    self.state
+                        .latest_continuations
+                        .insert(invocation_id, Rc::clone(&captured));
+                }
+                let continuation = Value::Continuation(captured);
                 self.control = MachineControl::Apply(args[0].clone(), vec![continuation], pos);
             }
             Value::Builtin(Builtin::CallWithCurrentContinuation) => {
                 expect_arity("call-with-current-continuation", &args, 1, pos)?;
-                let continuation = Value::Continuation(Rc::new(CapturedContinuation {
+                let captured = Rc::new(CapturedContinuation {
                     frames: self.frames.clone(),
                     winds: self.winds.clone(),
                     name: Some("continuation".into()),
-                }));
+                    invocation_id: self.current_invocation_id,
+                });
+                if let Some(invocation_id) = captured.invocation_id {
+                    self.state
+                        .latest_continuations
+                        .insert(invocation_id, Rc::clone(&captured));
+                }
+                let continuation = Value::Continuation(captured);
                 self.control = MachineControl::Apply(args[0].clone(), vec![continuation], pos);
             }
             Value::Builtin(Builtin::DynamicWind) => {
@@ -437,6 +459,12 @@ impl EvalMachine<'_> {
                     );
                 }
 
+                self.state.next_invocation_id += 1;
+                let invocation_id = self.state.next_invocation_id;
+                self.frames.push(MachineFrame::CallBoundary {
+                    previous_invocation_id: self.current_invocation_id,
+                });
+                self.current_invocation_id = Some(invocation_id);
                 self.schedule_sequence(closure.body.clone(), call_env);
             }
             Value::Continuation(continuation) => {
@@ -800,6 +828,7 @@ impl EvalMachine<'_> {
         value: Value,
         pos: Position,
     ) {
+        let target = self.resolve_continuation_target(target);
         let common_prefix = common_wind_prefix(&self.winds, &target.winds);
         self.continue_continuation_transfer_out(target, value, common_prefix, pos);
     }
@@ -850,6 +879,7 @@ impl EvalMachine<'_> {
 
         self.frames = target.frames.clone();
         self.winds = target.winds.clone();
+        self.current_invocation_id = target.invocation_id;
         self.control = MachineControl::Value(value);
     }
 
@@ -872,6 +902,21 @@ impl EvalMachine<'_> {
         if let Some(index) = self.winds.iter().rposition(|wind| wind.id == wind_id) {
             self.winds.remove(index);
         }
+    }
+
+    fn resolve_continuation_target(
+        &self,
+        target: Rc<CapturedContinuation>,
+    ) -> Rc<CapturedContinuation> {
+        target
+            .invocation_id
+            .and_then(|invocation_id| {
+                self.state
+                    .latest_continuations
+                    .get(&invocation_id)
+                    .cloned()
+            })
+            .unwrap_or(target)
     }
 }
 

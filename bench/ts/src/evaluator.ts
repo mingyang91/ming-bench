@@ -138,6 +138,7 @@ type DynamicWindFrame = {
 type ExceptionHandlerFrame = {
   id: number;
   dynamicWindStack: DynamicWindFrame[];
+  invocationId?: number;
   handle: (value: SchemeValue, pos: SourcePosition) => Bounce;
 };
 
@@ -147,6 +148,7 @@ type ContinuationValue = {
   dynamicWindStack: DynamicWindFrame[];
   exceptionHandlerStack: ExceptionHandlerFrame[];
   runtime: RuntimeState;
+  invocationId?: number;
   name?: string;
 };
 
@@ -221,6 +223,9 @@ type RuntimeState = {
   nextHygieneId: number;
   nextWindId: number;
   nextExceptionHandlerId: number;
+  nextInvocationId: number;
+  currentInvocationId?: number;
+  latestContinuations: Map<number, ContinuationValue>;
   dynamicWindStack: DynamicWindFrame[];
   exceptionHandlerStack: ExceptionHandlerFrame[];
 };
@@ -1102,6 +1107,9 @@ class Environment {
         nextHygieneId: 0,
         nextWindId: 0,
         nextExceptionHandlerId: 0,
+        nextInvocationId: 0,
+        currentInvocationId: undefined,
+        latestContinuations: new Map<number, ContinuationValue>(),
         dynamicWindStack: [],
         exceptionHandlerStack: [],
       };
@@ -1912,6 +1920,7 @@ function evaluateGuard(
   const frame: ExceptionHandlerFrame = {
     id: runtime.nextExceptionHandlerId,
     dynamicWindStack: runtime.dynamicWindStack.slice(),
+    invocationId: runtime.currentInvocationId,
     handle: (raisedValue, raisedPos) => {
       const guardEnv = new Environment(env);
       guardEnv.define(exceptionName, raisedValue);
@@ -2357,6 +2366,10 @@ function applyProcedureClause(
   }
 
   const callEnv = new Environment(env, options);
+  const runtime = env.runtimeState();
+  const previousInvocationId = runtime.currentInvocationId;
+  runtime.nextInvocationId += 1;
+  runtime.currentInvocationId = runtime.nextInvocationId;
 
   for (let index = 0; index < clause.params.length; index += 1) {
     callEnv.define(clause.params[index], args[index]);
@@ -2366,7 +2379,10 @@ function applyProcedureClause(
     callEnv.define(clause.restParam, listToPairs(args.slice(clause.params.length)));
   }
 
-  return evaluateSequenceCps(clause.body, callEnv, continuation);
+  return evaluateSequenceCps(clause.body, callEnv, (value) => {
+    runtime.currentInvocationId = previousInvocationId;
+    return continueWith(continuation, value);
+  });
 }
 
 function matchesClauseArity(clause: ProcedureClause, argCount: number): boolean {
@@ -2888,11 +2904,11 @@ function expandLambdaTemplate(
     path,
   );
   const bodyScope = extendScope(scope, parameterScope);
-  const expanded = [head, paramsExpr];
-
-  for (const bodyTemplate of elements.slice(2)) {
-    expanded.push(expandTemplate(bodyTemplate, bindings, definitionEnv, bodyScope, path));
-  }
+  const expanded = [
+    head,
+    paramsExpr,
+    ...expandBodyTemplates(elements.slice(2), bindings, definitionEnv, bodyScope, path),
+  ];
 
   return {
     kind: 'list',
@@ -2908,13 +2924,26 @@ function expandDefineTemplate(
   scope: Map<string, string>,
   path: number[],
 ): Expr {
+  return expandDefineTemplateWithBindings(template, bindings, definitionEnv, scope, path).expression;
+}
+
+function expandDefineTemplateWithBindings(
+  template: Extract<Expr, { kind: 'list' }>,
+  bindings: PatternBindings,
+  definitionEnv: Environment,
+  scope: Map<string, string>,
+  path: number[],
+): { expression: Expr; definitionBindings: Map<string, string> } {
   const { elements } = template;
 
   if (elements.length < 3) {
     return {
-      kind: 'list',
-      elements: expandTemplateSequence(elements, bindings, definitionEnv, scope, path),
-      pos: template.pos,
+      expression: {
+        kind: 'list',
+        elements: expandTemplateSequence(elements, bindings, definitionEnv, scope, path),
+        pos: template.pos,
+      },
+      definitionBindings: new Map(),
     };
   }
 
@@ -2929,7 +2958,7 @@ function expandDefineTemplate(
     const expandedName =
       functionName !== undefined && !bindings.has(functionName)
         ? (() => {
-            const bindingKey = definitionEnv.freshBindingKey(functionName);
+            const bindingKey = scope.get(functionName) ?? definitionEnv.freshBindingKey(functionName);
             definitionBindings.set(functionName, bindingKey);
             return makeResolvedSymbol(functionName, nameTemplate.pos, { kind: 'lexical', key: bindingKey });
           })()
@@ -2961,15 +2990,19 @@ function expandDefineTemplate(
     }
 
     return {
-      kind: 'list',
-      elements: expanded,
-      pos: template.pos,
+      expression: {
+        kind: 'list',
+        elements: expanded,
+        pos: template.pos,
+      },
+      definitionBindings,
     };
   }
 
   if (targetName !== undefined && !bindings.has(targetName)) {
-    const bindingKey = definitionEnv.freshBindingKey(targetName);
-    const definitionScope = extendScope(scope, new Map([[targetName, bindingKey]]));
+    const bindingKey = scope.get(targetName) ?? definitionEnv.freshBindingKey(targetName);
+    const definitionBindings = new Map<string, string>([[targetName, bindingKey]]);
+    const definitionScope = extendScope(scope, definitionBindings);
     const expanded = [
       head,
       makeResolvedSymbol(targetName, elements[1].pos, { kind: 'lexical', key: bindingKey }),
@@ -2980,22 +3013,28 @@ function expandDefineTemplate(
     }
 
     return {
-      kind: 'list',
-      elements: expanded,
-      pos: template.pos,
+      expression: {
+        kind: 'list',
+        elements: expanded,
+        pos: template.pos,
+      },
+      definitionBindings,
     };
   }
 
   return {
-    kind: 'list',
-    elements: [
-      head,
-      expandTemplate(elements[1], bindings, definitionEnv, scope, path),
-      ...elements.slice(2).map((valueTemplate) =>
-        expandTemplate(valueTemplate, bindings, definitionEnv, scope, path),
-      ),
-    ],
-    pos: template.pos,
+    expression: {
+      kind: 'list',
+      elements: [
+        head,
+        expandTemplate(elements[1], bindings, definitionEnv, scope, path),
+        ...elements.slice(2).map((valueTemplate) =>
+          expandTemplate(valueTemplate, bindings, definitionEnv, scope, path),
+        ),
+      ],
+      pos: template.pos,
+    },
+    definitionBindings: new Map(),
   };
 }
 
@@ -3053,7 +3092,7 @@ function expandLetTemplate(
 ): Expr {
   const { elements } = template;
 
-  if (elements.length < 3 || elements[1].kind !== 'list') {
+  if (elements.length < 3) {
     return {
       kind: 'list',
       elements: expandTemplateSequence(elements, bindings, definitionEnv, scope, path),
@@ -3062,6 +3101,43 @@ function expandLetTemplate(
   }
 
   const head = expandTemplate(elements[0], bindings, definitionEnv, scope, path);
+
+  if (elements[1].kind !== 'list') {
+    const name = symbolName(elements[1]);
+    const bindingTemplate = elements[2];
+
+    if (name === undefined || bindings.has(name) || bindingTemplate.kind !== 'list') {
+      return {
+        kind: 'list',
+        elements: expandTemplateSequence(elements, bindings, definitionEnv, scope, path),
+        pos: template.pos,
+      };
+    }
+
+    const bindingKey = definitionEnv.freshBindingKey(name);
+    const namedScope = new Map<string, string>([[name, bindingKey]]);
+    const [bindingExpr, bindingScope] = expandLetBindings(
+      bindingTemplate,
+      bindings,
+      definitionEnv,
+      scope,
+      path,
+    );
+    const bodyScope = extendScope(extendScope(scope, namedScope), bindingScope);
+    const expanded = [
+      head,
+      makeResolvedSymbol(name, elements[1].pos, { kind: 'lexical', key: bindingKey }),
+      bindingExpr,
+      ...expandBodyTemplates(elements.slice(3), bindings, definitionEnv, bodyScope, path),
+    ];
+
+    return {
+      kind: 'list',
+      elements: expanded,
+      pos: template.pos,
+    };
+  }
+
   const [bindingExpr, bindingScope] = expandLetBindings(
     elements[1],
     bindings,
@@ -3070,11 +3146,11 @@ function expandLetTemplate(
     path,
   );
   const bodyScope = extendScope(scope, bindingScope);
-  const expanded = [head, bindingExpr];
-
-  for (const bodyTemplate of elements.slice(2)) {
-    expanded.push(expandTemplate(bodyTemplate, bindings, definitionEnv, bodyScope, path));
-  }
+  const expanded = [
+    head,
+    bindingExpr,
+    ...expandBodyTemplates(elements.slice(2), bindings, definitionEnv, bodyScope, path),
+  ];
 
   return {
     kind: 'list',
@@ -3136,6 +3212,41 @@ function expandLetBindings(
     },
     bindingScope,
   ];
+}
+
+function expandBodyTemplates(
+  templates: Expr[],
+  bindings: PatternBindings,
+  definitionEnv: Environment,
+  scope: Map<string, string>,
+  path: number[],
+): Expr[] {
+  const expanded: Expr[] = [];
+  let bodyScope = scope;
+
+  for (const template of templates) {
+    if (
+      template.kind === 'list' &&
+      template.elements.length >= 3 &&
+      symbolName(template.elements[0]) === 'define' &&
+      !bindings.has('define')
+    ) {
+      const defineExpansion = expandDefineTemplateWithBindings(
+        template,
+        bindings,
+        definitionEnv,
+        bodyScope,
+        path,
+      );
+      expanded.push(defineExpansion.expression);
+      bodyScope = extendScope(bodyScope, defineExpansion.definitionBindings);
+      continue;
+    }
+
+    expanded.push(expandTemplate(template, bindings, definitionEnv, bodyScope, path));
+  }
+
+  return expanded;
 }
 
 function expandTemplateSequence(
@@ -3630,18 +3741,10 @@ function controlBuiltin(
 function makeCallWithCurrentContinuationBuiltin(name: string, runtime: RuntimeState): BuiltinValue {
   return controlBuiltin(name, (args, pos, continuation) => {
     expectArity(name, args, 1, pos);
+    const continuationValue = captureContinuation(runtime, continuation, 'continuation');
     return applyProcedureCps(
       args[0],
-      [
-        {
-          kind: 'continuation',
-          name: 'continuation',
-          continuation,
-          dynamicWindStack: runtime.dynamicWindStack.slice(),
-          exceptionHandlerStack: runtime.exceptionHandlerStack.slice(),
-          runtime,
-        },
-      ],
+      [continuationValue],
       pos,
       continuation,
     );
@@ -3683,6 +3786,7 @@ function makeWithExceptionHandlerBuiltin(runtime: RuntimeState): BuiltinValue {
     const frame: ExceptionHandlerFrame = {
       id: runtime.nextExceptionHandlerId,
       dynamicWindStack: runtime.dynamicWindStack.slice(),
+      invocationId: runtime.currentInvocationId,
       handle: (raisedValue, raisedPos) =>
         applyProcedureCps(handler, [raisedValue], raisedPos, () => {
           throw new EvalError('raise handler returned', raisedPos);
@@ -3705,7 +3809,10 @@ function raiseExceptionCps(runtime: RuntimeState, value: SchemeValue, pos: Sourc
 
   const frame = runtime.exceptionHandlerStack[runtime.exceptionHandlerStack.length - 1];
   runtime.exceptionHandlerStack = runtime.exceptionHandlerStack.slice(0, runtime.exceptionHandlerStack.length - 1);
-  return transferDynamicWindCps(runtime, frame.dynamicWindStack, pos, () => frame.handle(value, pos));
+  return transferDynamicWindCps(runtime, frame.dynamicWindStack, pos, () => {
+    runtime.currentInvocationId = frame.invocationId;
+    return frame.handle(value, pos);
+  });
 }
 
 function continueCapturedContinuationCps(
@@ -3713,15 +3820,47 @@ function continueCapturedContinuationCps(
   value: SchemeValue,
   pos: SourcePosition,
 ): Bounce {
+  const target = resolveContinuationTarget(continuationValue);
   return transferDynamicWindCps(
-    continuationValue.runtime,
-    continuationValue.dynamicWindStack,
+    target.runtime,
+    target.dynamicWindStack,
     pos,
     () => {
-      continuationValue.runtime.exceptionHandlerStack = continuationValue.exceptionHandlerStack.slice();
-      return continueWith(continuationValue.continuation, value);
+      target.runtime.exceptionHandlerStack = target.exceptionHandlerStack.slice();
+      target.runtime.currentInvocationId = target.invocationId;
+      return continueWith(target.continuation, value);
     },
   );
+}
+
+function captureContinuation(
+  runtime: RuntimeState,
+  continuation: Continuation,
+  name?: string,
+): ContinuationValue {
+  const value: ContinuationValue = {
+    kind: 'continuation',
+    name,
+    continuation,
+    dynamicWindStack: runtime.dynamicWindStack.slice(),
+    exceptionHandlerStack: runtime.exceptionHandlerStack.slice(),
+    runtime,
+    invocationId: runtime.currentInvocationId,
+  };
+
+  if (value.invocationId !== undefined) {
+    runtime.latestContinuations.set(value.invocationId, value);
+  }
+
+  return value;
+}
+
+function resolveContinuationTarget(continuation: ContinuationValue): ContinuationValue {
+  if (continuation.invocationId === undefined) {
+    return continuation;
+  }
+
+  return continuation.runtime.latestContinuations.get(continuation.invocationId) ?? continuation;
 }
 
 function transferDynamicWindCps(
