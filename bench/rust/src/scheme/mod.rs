@@ -24,7 +24,8 @@ enum Value {
     Str(Rc<RefCell<String>>),
     Symbol(String),
     List(Vec<Value>),
-    Procedure(Vec<String>, Vec<Expr>, Env),
+    Procedure(Vec<String>, Option<String>, Vec<Expr>, Env),
+    Builtin(String),
 }
 
 fn make_str(s: String) -> Value {
@@ -49,6 +50,7 @@ impl fmt::Display for Value {
                 write!(f, ")")
             }
             Value::Procedure(..) => write!(f, "#<procedure>"),
+            Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
         }
     }
 }
@@ -292,7 +294,13 @@ fn eval_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, 
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
         ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::Str(s) => Ok(make_str(s.clone())),
-        ExprKind::Symbol(name) => env_lookup(env, name),
+        ExprKind::Symbol(name) => {
+            match env_lookup(env, name) {
+                Ok(v) => Ok(v),
+                Err(_) if is_builtin(name) => Ok(Value::Builtin(name.clone())),
+                Err(e) => Err(e),
+            }
+        }
         ExprKind::List(items) => {
             if items.is_empty() {
                 return Err(EvalError::Parse("empty application".into()));
@@ -336,8 +344,14 @@ fn eval_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, 
 
 fn apply_proc(func: &Value, args: &[Value], output: &mut String) -> Result<Value, EvalError> {
     match func {
-        Value::Procedure(params, body, closure_env) => {
-            if args.len() != params.len() {
+        Value::Procedure(params, rest, body, closure_env) => {
+            if let Some(_rest_name) = rest {
+                if args.len() < params.len() {
+                    return Err(EvalError::Arity(format!(
+                        "expected at least {} arguments, got {}", params.len(), args.len()
+                    )));
+                }
+            } else if args.len() != params.len() {
                 return Err(EvalError::Arity(format!(
                     "expected {} arguments, got {}", params.len(), args.len()
                 )));
@@ -347,6 +361,10 @@ fn apply_proc(func: &Value, args: &[Value], output: &mut String) -> Result<Value
             for (p, a) in params.iter().zip(args.iter()) {
                 frame.borrow_mut().insert(p.clone(), a.clone());
             }
+            if let Some(rest_name) = rest {
+                let rest_args = args[params.len()..].to_vec();
+                frame.borrow_mut().insert(rest_name.clone(), Value::List(rest_args));
+            }
             new_env.push(frame);
             let mut result = Value::Boolean(false);
             for expr in body {
@@ -354,6 +372,7 @@ fn apply_proc(func: &Value, args: &[Value], output: &mut String) -> Result<Value
             }
             Ok(result)
         }
+        Value::Builtin(name) => eval_builtin(name, args, output),
         _ => Err(EvalError::Type("not a procedure".into())),
     }
 }
@@ -367,6 +386,32 @@ fn expect_integer(v: &Value, context: &str) -> Result<i64, EvalError> {
         Value::Integer(n) => Ok(*n),
         _ => Err(EvalError::Type(format!("{context}: expected integer, got {v}"))),
     }
+}
+
+fn parse_params(items: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let mut params = Vec::new();
+    let mut rest = None;
+    let mut i = 0;
+    while i < items.len() {
+        match &items[i].kind {
+            ExprKind::Symbol(s) if s == "." => {
+                if i + 1 >= items.len() {
+                    return Err(EvalError::Parse("expected rest parameter after dot".into()));
+                }
+                match &items[i + 1].kind {
+                    ExprKind::Symbol(r) => rest = Some(r.clone()),
+                    _ => return Err(EvalError::Type("rest parameter must be a symbol".into())),
+                }
+                break;
+            }
+            ExprKind::Symbol(s) => {
+                params.push(s.clone());
+                i += 1;
+            }
+            _ => return Err(EvalError::Type("expected symbol as parameter".into())),
+        }
+    }
+    Ok((params, rest))
 }
 
 fn eval_define(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
@@ -390,12 +435,9 @@ fn eval_define(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Valu
                 ExprKind::Symbol(s) => s.clone(),
                 _ => return Err(EvalError::Type("define: expected symbol as function name".into())),
             };
-            let params: Vec<String> = sig[1..].iter().map(|e| match &e.kind {
-                ExprKind::Symbol(s) => Ok(s.clone()),
-                _ => Err(EvalError::Type("define: expected symbol as parameter".into())),
-            }).collect::<Result<_, _>>()?;
+            let (params, rest) = parse_params(&sig[1..])?;
             let body = args[1..].to_vec();
-            let proc = Value::Procedure(params, body, env.clone());
+            let proc = Value::Procedure(params, rest, body, env.clone());
             env_define(env, name, proc);
             Ok(Value::Boolean(false))
         }
@@ -439,17 +481,13 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity("lambda requires at least 2 arguments".into()));
     }
-    let params = match &args[0].kind {
-        ExprKind::List(items) => {
-            items.iter().map(|e| match &e.kind {
-                ExprKind::Symbol(s) => Ok(s.clone()),
-                _ => Err(EvalError::Type("lambda: expected symbol as parameter".into())),
-            }).collect::<Result<Vec<_>, _>>()?
-        }
+    let (params, rest) = match &args[0].kind {
+        ExprKind::List(items) => parse_params(items)?,
+        ExprKind::Symbol(s) => (vec![], Some(s.clone())),
         _ => return Err(EvalError::Type("lambda: expected parameter list".into())),
     };
     let body = args[1..].to_vec();
-    Ok(Value::Procedure(params, body, env.clone()))
+    Ok(Value::Procedure(params, rest, body, env.clone()))
 }
 
 fn eval_and(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
@@ -482,7 +520,8 @@ fn is_builtin(op: &str) -> bool {
         | "string-append" | "string-length" | "substring"
         | "string->number" | "number->string"
         | "symbol->string" | "string->symbol"
-        | "string-ref" | "string-copy" | "string-set!")
+        | "string-ref" | "string-copy" | "string-set!"
+        | "apply")
 }
 
 fn display_value(v: &Value) -> String {
@@ -498,6 +537,7 @@ fn display_value(v: &Value) -> String {
             s.push(')');
             s
         }
+        Value::Builtin(name) => format!("#<procedure:{name}>"),
         other => other.to_string(),
     }
 }
@@ -773,6 +813,19 @@ fn eval_builtin(op: &str, args: &[Value], output: &mut String) -> Result<Value, 
             *borrowed = chars.into_iter().collect();
             Ok(Value::Boolean(false))
         }
+        "apply" => {
+            if args.len() < 2 {
+                return Err(EvalError::Arity("apply requires at least 2 arguments".into()));
+            }
+            let func = &args[0];
+            let last = match &args[args.len() - 1] {
+                Value::List(items) => items.clone(),
+                _ => return Err(EvalError::Type("apply: last argument must be a list".into())),
+            };
+            let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+            all_args.extend(last);
+            apply_proc(func, &all_args, output)
+        }
         _ => Err(EvalError::UnboundVariable(op.to_string())),
     }
 }
@@ -809,7 +862,7 @@ fn eval_let(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, 
         let mut let_env = env.clone();
         let frame = new_frame();
         let_env.push(frame.clone());
-        let proc = Value::Procedure(params.clone(), body, let_env.clone());
+        let proc = Value::Procedure(params.clone(), None, body, let_env.clone());
         frame.borrow_mut().insert(name.clone(), proc);
         let func = env_lookup(&let_env, name)?;
         return apply_proc(&func, &inits, output);
