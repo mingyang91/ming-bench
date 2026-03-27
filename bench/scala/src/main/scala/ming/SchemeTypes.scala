@@ -53,6 +53,7 @@ private[ming] object Value:
 
   final case class VectorVal(instance: VectorInstance)                                          extends Value
   final case class BuiltinProc(name: String)                                                    extends Value
+  final class ContinuationVal(val snapshot: ContinuationSnapshot)                               extends Value
   final case class RecordConstructor(recordType: RecordType)                                    extends Value
   final case class RecordPredicate(recordType: RecordType)                                      extends Value
   final case class RecordAccessor(recordType: RecordType, fieldIndex: Int, name: String)        extends Value

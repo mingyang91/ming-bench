@@ -35,7 +35,8 @@ private[ming] object SchemeRenderer:
       case Value.VectorVal(instance) =>
         renderVector(instance, displayStrings, displayChars, path)
       case Value.BuiltinProc(_) | Value.RecordConstructor(_) | Value.RecordPredicate(_) |
-          Value.RecordAccessor(_, _, _) | Value.CaseClosure(_, _, _) | Value.Closure(_, _, _, _, _) =>
+          Value.RecordAccessor(_, _, _) | _: Value.ContinuationVal | Value.CaseClosure(_, _, _) |
+          Value.Closure(_, _, _, _, _) =>
         "#<procedure>"
       case Value.RecordVal(instance) =>
         s"#<record ${instance.recordType.typeName}>"

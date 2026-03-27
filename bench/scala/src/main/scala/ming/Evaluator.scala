@@ -21,7 +21,5 @@ object Evaluator:
 
     val globalEnv = Env.topLevel()
     val context   = new EvalContext
-    val result = expressions.foldLeft[Value](Value.Void) { (_, expr) =>
-      ExpressionEvaluator.eval(expr, globalEnv, context)
-    }
+    val result    = ExpressionEvaluator.evalSequence(expressions, globalEnv, context)
     (result, context.capturedOutput)

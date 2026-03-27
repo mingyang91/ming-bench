@@ -20,7 +20,9 @@ private[ming] object Builtins:
     "equal?",
     "map",
     "for-each",
-    "apply"
+    "apply",
+    "call/cc",
+    "call-with-current-continuation"
   )
 
   private val builtinNames =

@@ -12,7 +12,8 @@ private[ming] object ValueSemantics:
   def isProcedure(value: Value): Boolean =
     value match
       case Value.BuiltinProc(_) | Value.RecordConstructor(_) | Value.RecordPredicate(_) |
-          Value.RecordAccessor(_, _, _) | Value.CaseClosure(_, _, _) | Value.Closure(_, _, _, _, _) =>
+          Value.RecordAccessor(_, _, _) | _: Value.ContinuationVal | Value.CaseClosure(_, _, _) |
+          Value.Closure(_, _, _, _, _) =>
         true
       case _ =>
         false
@@ -29,7 +30,8 @@ private[ming] object ValueSemantics:
       case _: Value.PairVal   => "pair"
       case Value.VectorVal(_) => "vector"
       case Value.BuiltinProc(_) | Value.RecordConstructor(_) | Value.RecordPredicate(_) |
-          Value.RecordAccessor(_, _, _) | Value.CaseClosure(_, _, _) | Value.Closure(_, _, _, _, _) =>
+          Value.RecordAccessor(_, _, _) | _: Value.ContinuationVal | Value.CaseClosure(_, _, _) |
+          Value.Closure(_, _, _, _, _) =>
         "procedure"
       case Value.RecordVal(_) => "record"
       case Value.Void         => "void"
@@ -64,6 +66,8 @@ private[ming] object ValueSemantics:
           case (Value.EmptyList, Value.EmptyList)              => true
           case (Value.BuiltinProc(left), Value.BuiltinProc(right)) =>
             left == right
+          case (leftCont: Value.ContinuationVal, rightCont: Value.ContinuationVal) =>
+            leftCont eq rightCont
           case (Value.Void, Value.Void) => true
           case (Value.StringVal(left), Value.StringVal(right)) =>
             left eq right
