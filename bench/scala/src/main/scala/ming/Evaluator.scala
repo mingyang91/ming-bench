@@ -42,6 +42,8 @@ object Evaluator:
   private def evalList(items: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
     items match
       case Nil => throw EvalError.at(pos, "cannot evaluate empty list")
+      case Expr.Symbol("define-syntax", formPos) :: args =>
+        evalDefineSyntax(args, env, formPos)
       case Expr.Symbol("define", formPos) :: args =>
         evalDefine(args, env, formPos, context)
       case Expr.Symbol("if", formPos) :: args =>
@@ -62,8 +64,19 @@ object Evaluator:
         evalAnd(args, env, Value.BoolVal(true), context)
       case Expr.Symbol("or", _) :: args =>
         evalOr(args, env, context)
+      case Expr.Symbol(name, _) :: _ if env.lookupSyntax(name).isDefined =>
+        val expanded = env.lookupSyntax(name).get.expand(Expr.ListExpr(items, pos))
+        eval(expanded, env, context)
       case head :: args =>
         applyProcedure(eval(head, env, context), args, env, head.pos, context)
+
+  private def evalDefineSyntax(args: List[Expr], env: Env, pos: SourcePos): Value =
+    args match
+      case Expr.Symbol(name, _) :: transformerExpr :: Nil =>
+        env.defineSyntax(name, SchemeMacros.parseSyntaxRules(name, transformerExpr, env, pos))
+        Value.Void
+      case _ =>
+        throw EvalError.at(pos, "invalid define-syntax")
 
   private def evalDefine(args: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
     args match
