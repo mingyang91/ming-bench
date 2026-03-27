@@ -133,27 +133,50 @@ func (v *PairVal) String() string {
 	buf.WriteByte('(')
 	cur := Value(v)
 	first := true
+	seen := make(map[*PairVal]bool)
+	seen[v] = true
 	for {
 		p, ok := cur.(*PairVal)
 		if !ok {
 			break
 		}
 		if !first {
+			if seen[p] {
+				buf.WriteString(" ...")
+				break
+			}
 			buf.WriteByte(' ')
 		}
 		first = false
+		seen[p] = true
 		buf.WriteString(p.Car.String())
 		cur = p.Cdr
 	}
 	if _, ok := cur.(*NilVal); !ok {
-		buf.WriteString(" . ")
-		buf.WriteString(cur.String())
+		if p, ok := cur.(*PairVal); ok && seen[p] {
+			// already handled above
+		} else {
+			buf.WriteString(" . ")
+			buf.WriteString(cur.String())
+		}
 	}
 	buf.WriteByte(')')
 	return buf.String()
 }
 
 // --------------- Numeric helpers ---------------
+
+func toInt(v Value) int64 {
+	switch n := v.(type) {
+	case *IntVal:
+		return n.Val
+	case *RatVal:
+		return n.Num / n.Den
+	case *FloatVal:
+		return int64(n.Val)
+	}
+	return 0
+}
 
 func gcdInt(a, b int64) int64 {
 	if a < 0 {
@@ -668,6 +691,8 @@ func evalListInEnv(list *ListExpr, env *Env) (Value, error) {
 			return evalDefineRecordType(list, env)
 		case "case-lambda":
 			return evalCaseLambda(list, env)
+		case "let*":
+			return evalLetStar(list, env)
 		case "letrec":
 			return evalLetrec(list, env)
 		case "letrec*":
@@ -1035,6 +1060,44 @@ func evalLet(list *ListExpr, env *Env) (Value, error) {
 		lambda := &LambdaVal{Params: names, Body: body, Env: letEnv}
 		letEnv.set(loopName, lambda)
 	}
+	if len(body) == 0 {
+		return &VoidVal{}, nil
+	}
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := evalInEnv(bodyExpr, letEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &tailCallVal{expr: body[len(body)-1], env: letEnv}, nil
+}
+
+func evalLetStar(list *ListExpr, env *Env) (Value, error) {
+	args := list.Items[1:]
+	if len(args) < 2 {
+		return nil, errAt(list, "let* requires bindings and body")
+	}
+	bindList, ok := args[0].(*ListExpr)
+	if !ok {
+		return nil, errAt(list, "let*: expected binding list")
+	}
+	letEnv := newEnv(env)
+	for _, item := range bindList.Items {
+		pair, ok := item.(*ListExpr)
+		if !ok || len(pair.Items) != 2 {
+			return nil, errAt(list, "let*: bad binding")
+		}
+		nameAtom, ok := pair.Items[0].(*AtomExpr)
+		if !ok {
+			return nil, errAt(list, "let*: expected symbol in binding")
+		}
+		v, err := evalInEnv(pair.Items[1], letEnv)
+		if err != nil {
+			return nil, err
+		}
+		letEnv.set(nameAtom.Token, v)
+	}
+	body := args[1:]
 	if len(body) == 0 {
 		return &VoidVal{}, nil
 	}
@@ -1753,6 +1816,9 @@ func valuesEqual(a, b Value) bool {
 		bv, ok := b.(*PairVal)
 		if !ok {
 			return false
+		}
+		if av == bv {
+			return true
 		}
 		return valuesEqual(av.Car, bv.Car) && valuesEqual(av.Cdr, bv.Cdr)
 	case *VectorVal:
@@ -2620,16 +2686,26 @@ func makeBuiltinEnv(outBuf *strings.Builder) *Env {
 		if len(args) != 1 {
 			return nil, &EvalError{Message: "list? requires 1 argument"}
 		}
-		cur := args[0]
+		// Tortoise-and-hare cycle detection
+		slow := args[0]
+		fast := args[0]
 		for {
-			if _, ok := cur.(*NilVal); ok {
-				return &BoolVal{Val: true}, nil
+			// Advance fast by 2
+			for i := 0; i < 2; i++ {
+				if _, ok := fast.(*NilVal); ok {
+					return &BoolVal{Val: true}, nil
+				}
+				fp, ok := fast.(*PairVal)
+				if !ok {
+					return &BoolVal{Val: false}, nil
+				}
+				fast = fp.Cdr
 			}
-			p, ok := cur.(*PairVal)
-			if !ok {
-				return &BoolVal{Val: false}, nil
+			// Advance slow by 1
+			slow = slow.(*PairVal).Cdr
+			if slow == fast {
+				return &BoolVal{Val: false}, nil // cycle detected
 			}
-			cur = p.Cdr
 		}
 	})
 
@@ -3127,6 +3203,398 @@ func makeBuiltinEnv(outBuf *strings.Builder) *Env {
 		return &BoolVal{Val: false}, nil
 	})
 
+	// L17: cxr compositions
+	addBuiltin("caar", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "caar requires 1 argument"}
+		}
+		p, ok := args[0].(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "caar: not a pair"}
+		}
+		p2, ok := p.Car.(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "caar: car is not a pair"}
+		}
+		return p2.Car, nil
+	})
+	addBuiltin("cadr", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "cadr requires 1 argument"}
+		}
+		p, ok := args[0].(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "cadr: not a pair"}
+		}
+		p2, ok := p.Cdr.(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "cadr: cdr is not a pair"}
+		}
+		return p2.Car, nil
+	})
+	addBuiltin("cdar", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "cdar requires 1 argument"}
+		}
+		p, ok := args[0].(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "cdar: not a pair"}
+		}
+		p2, ok := p.Car.(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "cdar: car is not a pair"}
+		}
+		return p2.Cdr, nil
+	})
+	addBuiltin("cddr", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "cddr requires 1 argument"}
+		}
+		p, ok := args[0].(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "cddr: not a pair"}
+		}
+		p2, ok := p.Cdr.(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "cddr: cdr is not a pair"}
+		}
+		return p2.Cdr, nil
+	})
+	addBuiltin("caddr", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "caddr requires 1 argument"}
+		}
+		p, ok := args[0].(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "caddr: not a pair"}
+		}
+		p2, ok := p.Cdr.(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "caddr: cdr is not a pair"}
+		}
+		p3, ok := p2.Cdr.(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "caddr: cddr is not a pair"}
+		}
+		return p3.Car, nil
+	})
+	addBuiltin("assv", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "assv requires 2 arguments"}
+		}
+		key := args[0]
+		cur := args[1]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				return &BoolVal{Val: false}, nil
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "assv: not a proper list"}
+			}
+			pair, ok := p.Car.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "assv: element is not a pair"}
+			}
+			if valuesEqv(key, pair.Car) {
+				return p.Car, nil
+			}
+			cur = p.Cdr
+		}
+	})
+	addBuiltin("memq", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "memq requires 2 arguments"}
+		}
+		obj := args[0]
+		cur := args[1]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				return &BoolVal{Val: false}, nil
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "memq: not a proper list"}
+			}
+			if valuesEq(obj, p.Car) {
+				return cur, nil
+			}
+			cur = p.Cdr
+		}
+	})
+	addBuiltin("memv", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "memv requires 2 arguments"}
+		}
+		obj := args[0]
+		cur := args[1]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				return &BoolVal{Val: false}, nil
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "memv: not a proper list"}
+			}
+			if valuesEqv(obj, p.Car) {
+				return cur, nil
+			}
+			cur = p.Cdr
+		}
+	})
+	addBuiltin("assq", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "assq requires 2 arguments"}
+		}
+		key := args[0]
+		cur := args[1]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				return &BoolVal{Val: false}, nil
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "assq: not a proper list"}
+			}
+			pair, ok := p.Car.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "assq: element is not a pair"}
+			}
+			if valuesEq(key, pair.Car) {
+				return p.Car, nil
+			}
+			cur = p.Cdr
+		}
+	})
+	addBuiltin("gcd", func(args []Value) (Value, error) {
+		if len(args) == 0 {
+			return &IntVal{Val: 0}, nil
+		}
+		result := toInt(args[0])
+		if result < 0 {
+			result = -result
+		}
+		for _, a := range args[1:] {
+			b := toInt(a)
+			if b < 0 {
+				b = -b
+			}
+			result = gcdInt(result, b)
+		}
+		return &IntVal{Val: result}, nil
+	})
+	addBuiltin("lcm", func(args []Value) (Value, error) {
+		if len(args) == 0 {
+			return &IntVal{Val: 1}, nil
+		}
+		result := toInt(args[0])
+		if result < 0 {
+			result = -result
+		}
+		for _, a := range args[1:] {
+			b := toInt(a)
+			if b < 0 {
+				b = -b
+			}
+			if result == 0 && b == 0 {
+				result = 0
+			} else {
+				result = result / gcdInt(result, b) * b
+			}
+		}
+		return &IntVal{Val: result}, nil
+	})
+	addBuiltin("truncate", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "truncate requires 1 argument"}
+		}
+		switch v := args[0].(type) {
+		case *IntVal:
+			return v, nil
+		case *RatVal:
+			return &IntVal{Val: v.Num / v.Den}, nil
+		case *FloatVal:
+			return &FloatVal{Val: math.Trunc(v.Val)}, nil
+		default:
+			return nil, &EvalError{Message: "truncate: expected number"}
+		}
+	})
+	addBuiltin("round", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "round requires 1 argument"}
+		}
+		switch v := args[0].(type) {
+		case *IntVal:
+			return v, nil
+		case *RatVal:
+			return &IntVal{Val: int64(math.RoundToEven(float64(v.Num) / float64(v.Den)))}, nil
+		case *FloatVal:
+			return &FloatVal{Val: math.RoundToEven(v.Val)}, nil
+		default:
+			return nil, &EvalError{Message: "round: expected number"}
+		}
+	})
+	addBuiltin("make-string", func(args []Value) (Value, error) {
+		if len(args) < 1 || len(args) > 2 {
+			return nil, &EvalError{Message: "make-string requires 1-2 arguments"}
+		}
+		n := toInt(args[0])
+		ch := ' '
+		if len(args) == 2 {
+			c, ok := args[1].(*CharVal)
+			if !ok {
+				return nil, &EvalError{Message: "make-string: expected char"}
+			}
+			ch = c.Val
+		}
+		return &StringVal{Val: strings.Repeat(string(ch), int(n))}, nil
+	})
+	addBuiltin("string", func(args []Value) (Value, error) {
+		var buf strings.Builder
+		for _, a := range args {
+			c, ok := a.(*CharVal)
+			if !ok {
+				return nil, &EvalError{Message: "string: expected char"}
+			}
+			buf.WriteRune(c.Val)
+		}
+		return &StringVal{Val: buf.String()}, nil
+	})
+	addBuiltin("vector", func(args []Value) (Value, error) {
+		items := make([]Value, len(args))
+		copy(items, args)
+		return &VectorVal{Items: items}, nil
+	})
+	addBuiltin("string>?", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "string>? requires 2 arguments"}
+		}
+		a, ok1 := args[0].(*StringVal)
+		b, ok2 := args[1].(*StringVal)
+		if !ok1 || !ok2 {
+			return nil, &EvalError{Message: "string>?: expected strings"}
+		}
+		return &BoolVal{Val: a.Val > b.Val}, nil
+	})
+	addBuiltin("string<=?", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "string<=? requires 2 arguments"}
+		}
+		a, ok1 := args[0].(*StringVal)
+		b, ok2 := args[1].(*StringVal)
+		if !ok1 || !ok2 {
+			return nil, &EvalError{Message: "string<=?: expected strings"}
+		}
+		return &BoolVal{Val: a.Val <= b.Val}, nil
+	})
+	addBuiltin("string>=?", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "string>=? requires 2 arguments"}
+		}
+		a, ok1 := args[0].(*StringVal)
+		b, ok2 := args[1].(*StringVal)
+		if !ok1 || !ok2 {
+			return nil, &EvalError{Message: "string>=?: expected strings"}
+		}
+		return &BoolVal{Val: a.Val >= b.Val}, nil
+	})
+	addBuiltin("member", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "member requires 2 arguments"}
+		}
+		obj := args[0]
+		cur := args[1]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				return &BoolVal{Val: false}, nil
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "member: not a proper list"}
+			}
+			if valuesEqual(obj, p.Car) {
+				return cur, nil
+			}
+			cur = p.Cdr
+		}
+	})
+	addBuiltin("reverse", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "reverse requires 1 argument"}
+		}
+		var result Value = &NilVal{}
+		cur := args[0]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				return result, nil
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "reverse: not a proper list"}
+			}
+			result = &PairVal{Car: p.Car, Cdr: result}
+			cur = p.Cdr
+		}
+	})
+
+	// L17: pair mutation
+	addBuiltin("set-car!", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "set-car! requires 2 arguments"}
+		}
+		p, ok := args[0].(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "set-car!: not a pair"}
+		}
+		p.Car = args[1]
+		return &VoidVal{}, nil
+	})
+
+	addBuiltin("set-cdr!", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "set-cdr! requires 2 arguments"}
+		}
+		p, ok := args[0].(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "set-cdr!: not a pair"}
+		}
+		p.Cdr = args[1]
+		return &VoidVal{}, nil
+	})
+
+	addBuiltin("for-each", func(args []Value) (Value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: "for-each requires at least 2 arguments"}
+		}
+		proc := args[0]
+		lists := make([]Value, len(args)-1)
+		copy(lists, args[1:])
+		for {
+			callArgs := make([]Value, len(lists))
+			done := false
+			for i, lst := range lists {
+				if _, ok := lst.(*NilVal); ok {
+					done = true
+					break
+				}
+				p, ok := lst.(*PairVal)
+				if !ok {
+					return nil, &EvalError{Message: "for-each: not a proper list"}
+				}
+				callArgs[i] = p.Car
+				lists[i] = p.Cdr
+			}
+			if done {
+				break
+			}
+			_, err := applyProcSimple(proc, callArgs)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return &VoidVal{}, nil
+	})
+
 	return env
 }
 
@@ -3165,21 +3633,32 @@ func displayValue(v Value) string {
 		buf.WriteByte('(')
 		cur := Value(val)
 		first := true
+		seen := make(map[*PairVal]bool)
+		seen[val] = true
 		for {
 			p, ok := cur.(*PairVal)
 			if !ok {
 				break
 			}
 			if !first {
+				if seen[p] {
+					buf.WriteString(" ...")
+					break
+				}
 				buf.WriteByte(' ')
 			}
 			first = false
+			seen[p] = true
 			buf.WriteString(displayValue(p.Car))
 			cur = p.Cdr
 		}
 		if _, ok := cur.(*NilVal); !ok {
-			buf.WriteString(" . ")
-			buf.WriteString(displayValue(cur))
+			if p, ok := cur.(*PairVal); ok && seen[p] {
+				// cycle - already handled
+			} else {
+				buf.WriteString(" . ")
+				buf.WriteString(displayValue(cur))
+			}
 		}
 		buf.WriteByte(')')
 		return buf.String()
