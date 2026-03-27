@@ -262,6 +262,17 @@ fn env_define(env: &Env, name: String, val: Value) {
     env.last().expect("env must have at least one frame").borrow_mut().insert(name, val);
 }
 
+fn env_set(env: &Env, name: &str, val: Value) -> Result<(), EvalError> {
+    for frame in env.iter().rev() {
+        let mut f = frame.borrow_mut();
+        if f.contains_key(name) {
+            f.insert(name.to_string(), val);
+            return Ok(());
+        }
+    }
+    Err(EvalError::UnboundVariable(name.to_string()))
+}
+
 fn with_span(span: Span, err: EvalError) -> EvalError {
     let msg = err.to_string();
     if msg.as_bytes().windows(2).any(|w| w[0].is_ascii_digit() && w[1] == b':') {
@@ -289,6 +300,18 @@ fn eval_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, 
             if let ExprKind::Symbol(op) = &items[0].kind {
                 match op.as_str() {
                     "define" => return eval_define(&items[1..], env, output),
+                    "set!" => {
+                        if items.len() != 3 {
+                            return Err(EvalError::Arity("set! requires 2 arguments".into()));
+                        }
+                        if let ExprKind::Symbol(name) = &items[1].kind {
+                            let val = eval(&items[2], env, output)?;
+                            env_set(env, name, val)?;
+                            return Ok(Value::Boolean(false));
+                        } else {
+                            return Err(EvalError::Type("set! requires a symbol".into()));
+                        }
+                    }
                     "if" => return eval_if(&items[1..], env, output),
                     "quote" => return eval_quote(&items[1..]),
                     "lambda" => return eval_lambda(&items[1..], env),
