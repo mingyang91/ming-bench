@@ -206,6 +206,14 @@ func evalLetrecStar(parts []locatedExpr, env *env) (value, error) {
 	return evalLetrecForm(parts, env, true)
 }
 
+func evalLetrecTail(parts []locatedExpr, env *env) (value, *tailCall, error) {
+	return evalLetrecFormTail(parts, env, false)
+}
+
+func evalLetrecStarTail(parts []locatedExpr, env *env) (value, *tailCall, error) {
+	return evalLetrecFormTail(parts, env, true)
+}
+
 func evalLetrecForm(parts []locatedExpr, env *env, sequential bool) (value, error) {
 	formName := "letrec"
 	if sequential {
@@ -257,6 +265,57 @@ func evalLetrecForm(parts []locatedExpr, env *env, sequential bool) (value, erro
 	return evalSequence(parts[1:], letrecEnv)
 }
 
+func evalLetrecFormTail(parts []locatedExpr, env *env, sequential bool) (value, *tailCall, error) {
+	formName := "letrec"
+	if sequential {
+		formName = "letrec*"
+	}
+	if len(parts) < 2 {
+		return nil, nil, newCurrentEvalError("'%s' expects bindings and a body", formName)
+	}
+
+	bindingExprs, ok := parts[0].form.(listExpr)
+	if !ok {
+		return nil, nil, newEvalError(parts[0].pos, "'%s' bindings must be a list", formName)
+	}
+
+	bindings, err := parseLetBindings(bindingExprs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	letrecEnv := newEnv(env)
+	if sequential {
+		for _, item := range bindings {
+			slot := &binding{value: uninitializedValue{name: item.name}}
+			letrecEnv.defineBinding(item.name, slot)
+
+			v, err := evalExpr(item.init, letrecEnv)
+			if err != nil {
+				return nil, nil, err
+			}
+			slot.value = v
+		}
+	} else {
+		slots := make([]*binding, len(bindings))
+		for i, item := range bindings {
+			slot := &binding{value: uninitializedValue{name: item.name}}
+			letrecEnv.defineBinding(item.name, slot)
+			slots[i] = slot
+		}
+
+		for i, item := range bindings {
+			v, err := evalExpr(item.init, letrecEnv)
+			if err != nil {
+				return nil, nil, err
+			}
+			slots[i].value = v
+		}
+	}
+
+	return evalSequenceTail(parts[1:], letrecEnv)
+}
+
 func evalCase(parts []locatedExpr, env *env) (value, error) {
 	if len(parts) < 1 {
 		return nil, newCurrentEvalError("'case' expects a key and at least 1 clause")
@@ -303,6 +362,54 @@ func evalCase(parts []locatedExpr, env *env) (value, error) {
 	}
 
 	return voidValue{}, nil
+}
+
+func evalCaseTail(parts []locatedExpr, env *env) (value, *tailCall, error) {
+	if len(parts) < 1 {
+		return nil, nil, newCurrentEvalError("'case' expects a key and at least 1 clause")
+	}
+
+	key, err := evalExpr(parts[0], env)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	for i, clauseExpr := range parts[1:] {
+		clause, ok := clauseExpr.form.(listExpr)
+		if !ok || len(clause) == 0 {
+			return nil, nil, newEvalError(clauseExpr.pos, "'case' clauses must be non-empty lists")
+		}
+
+		if keyword, ok := clause[0].form.(symbolExpr); ok && string(keyword) == "else" {
+			if i != len(parts[1:])-1 {
+				return nil, nil, newEvalError(clause[0].pos, "'case' else clause must be last")
+			}
+			if len(clause) == 1 {
+				return voidValue{}, nil, nil
+			}
+			return evalSequenceTail(clause[1:], env)
+		}
+
+		datums, ok := clause[0].form.(listExpr)
+		if !ok {
+			return nil, nil, newEvalError(clause[0].pos, "'case' clause datums must be a list")
+		}
+
+		for _, datumExpr := range datums {
+			datum, err := quoteExpr(datumExpr)
+			if err != nil {
+				return nil, nil, err
+			}
+			if schemeEqv(key, datum) {
+				if len(clause) == 1 {
+					return voidValue{}, nil, nil
+				}
+				return evalSequenceTail(clause[1:], env)
+			}
+		}
+	}
+
+	return voidValue{}, nil, nil
 }
 
 func evalDo(parts []locatedExpr, env *env) (value, error) {
@@ -369,6 +476,80 @@ func evalDo(parts []locatedExpr, env *env) (value, error) {
 			v, err := evalExpr(item.step, doEnv)
 			if err != nil {
 				return nil, err
+			}
+			nextValues[i] = v
+		}
+
+		for i := range slots {
+			slots[i].value = nextValues[i]
+		}
+	}
+}
+
+func evalDoTail(parts []locatedExpr, env *env) (value, *tailCall, error) {
+	if len(parts) < 2 {
+		return nil, nil, newCurrentEvalError("'do' expects bindings, a termination clause, and optional body expressions")
+	}
+
+	bindingExprs, ok := parts[0].form.(listExpr)
+	if !ok {
+		return nil, nil, newEvalError(parts[0].pos, "'do' bindings must be a list")
+	}
+	bindings, err := parseDoBindings(bindingExprs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	testClause, ok := parts[1].form.(listExpr)
+	if !ok || len(testClause) == 0 {
+		return nil, nil, newEvalError(parts[1].pos, "'do' termination clause must be a non-empty list")
+	}
+
+	initValues := make([]value, len(bindings))
+	for i, item := range bindings {
+		v, err := evalExpr(item.init, env)
+		if err != nil {
+			return nil, nil, err
+		}
+		initValues[i] = v
+	}
+
+	doEnv := newEnv(env)
+	slots := make([]*binding, len(bindings))
+	for i, item := range bindings {
+		slot := &binding{value: initValues[i]}
+		doEnv.defineBinding(item.name, slot)
+		slots[i] = slot
+	}
+
+	for {
+		test, err := evalExpr(testClause[0], doEnv)
+		if err != nil {
+			return nil, nil, err
+		}
+		if test.isTruthy() {
+			if len(testClause) == 1 {
+				return voidValue{}, nil, nil
+			}
+			return evalSequenceTail(testClause[1:], doEnv)
+		}
+
+		if len(parts) > 2 {
+			if _, err := evalSequence(parts[2:], doEnv); err != nil {
+				return nil, nil, err
+			}
+		}
+
+		nextValues := make([]value, len(bindings))
+		for i, item := range bindings {
+			if !item.hasStep {
+				nextValues[i] = slots[i].value
+				continue
+			}
+
+			v, err := evalExpr(item.step, doEnv)
+			if err != nil {
+				return nil, nil, err
 			}
 			nextValues[i] = v
 		}

@@ -53,6 +53,11 @@ type letBinding struct {
 	init locatedExpr
 }
 
+type tailCall struct {
+	body []locatedExpr
+	env  *env
+}
+
 type env struct {
 	parent *env
 	vars   map[string]*binding
@@ -255,7 +260,7 @@ func (p closureValue) acceptsArgCount(argCount int) bool {
 	return argCount == len(p.params)
 }
 
-func (p closureValue) call(args []value) (value, error) {
+func (p closureValue) prepareTailCall(args []value) (*tailCall, error) {
 	if !p.acceptsArgCount(len(args)) {
 		if p.hasRest {
 			return nil, newCurrentEvalError("expected at least %d arguments, got %d", len(p.params), len(args))
@@ -271,7 +276,19 @@ func (p closureValue) call(args []value) (value, error) {
 		callEnv.define(p.restParam, listFromValues(args[len(p.params):]))
 	}
 
-	return evalSequence(p.body, callEnv)
+	return &tailCall{
+		body: p.body,
+		env:  callEnv,
+	}, nil
+}
+
+func (p closureValue) call(args []value) (value, error) {
+	call, err := p.prepareTailCall(args)
+	if err != nil {
+		return nil, err
+	}
+
+	return runTailCall(call)
 }
 
 func (caseClosureValue) schemeString() string {
@@ -282,14 +299,23 @@ func (caseClosureValue) isTruthy() bool {
 	return true
 }
 
-func (p caseClosureValue) call(args []value) (value, error) {
+func (p caseClosureValue) prepareTailCall(args []value) (*tailCall, error) {
 	for _, clause := range p.clauses {
 		if clause.acceptsArgCount(len(args)) {
-			return clause.call(args)
+			return clause.prepareTailCall(args)
 		}
 	}
 
 	return nil, newCurrentEvalError("no matching case-lambda clause for %d arguments", len(args))
+}
+
+func (p caseClosureValue) call(args []value) (value, error) {
+	call, err := p.prepareTailCall(args)
+	if err != nil {
+		return nil, err
+	}
+
+	return runTailCall(call)
 }
 
 func newEnv(parent *env) *env {
@@ -434,6 +460,22 @@ func evalInput(input string) (result string, output string, err error) {
 	return last.schemeString(), outputBuilder.String(), nil
 }
 
+func runTailCall(call *tailCall) (value, error) {
+	current := call
+	for current != nil {
+		result, next, err := evalSequenceTail(current.body, current.env)
+		if err != nil {
+			return nil, err
+		}
+		if next == nil {
+			return result, nil
+		}
+		current = next
+	}
+
+	return voidValue{}, nil
+}
+
 func evalSequence(exprs []locatedExpr, env *env) (value, error) {
 	last := value(voidValue{})
 	for _, expr := range exprs {
@@ -447,31 +489,56 @@ func evalSequence(exprs []locatedExpr, env *env) (value, error) {
 }
 
 func evalExpr(e locatedExpr, env *env) (value, error) {
+	result, tail, err := evalExprTail(e, env)
+	if err != nil {
+		return nil, err
+	}
+	if tail != nil {
+		return runTailCall(tail)
+	}
+	return result, nil
+}
+
+func evalSequenceTail(exprs []locatedExpr, env *env) (value, *tailCall, error) {
+	if len(exprs) == 0 {
+		return voidValue{}, nil, nil
+	}
+
+	for _, expr := range exprs[:len(exprs)-1] {
+		if _, err := evalExpr(expr, env); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return evalExprTail(exprs[len(exprs)-1], env)
+}
+
+func evalExprTail(e locatedExpr, env *env) (value, *tailCall, error) {
 	restore := pushEvalPos(e.pos)
 	defer restore()
 
 	switch expr := e.form.(type) {
 	case numberExpr:
-		return expr, nil
+		return expr, nil, nil
 	case boolExpr:
-		return boolValue(expr), nil
+		return boolValue(expr), nil, nil
 	case stringExpr:
-		return newStringValue(string(expr)), nil
+		return newStringValue(string(expr)), nil, nil
 	case charExpr:
-		return charValue(expr), nil
+		return charValue(expr), nil, nil
 	case symbolExpr:
 		binding, ok := env.lookupBinding(string(expr))
 		if !ok {
-			return nil, newCurrentEvalError("unbound variable: %s", string(expr))
+			return nil, nil, newCurrentEvalError("unbound variable: %s", string(expr))
 		}
 		if _, isUninitialized := binding.value.(uninitializedValue); isUninitialized {
-			return nil, newCurrentEvalError("uninitialized variable: %s", string(expr))
+			return nil, nil, newCurrentEvalError("uninitialized variable: %s", string(expr))
 		}
-		return binding.value, nil
+		return binding.value, nil, nil
 	case listExpr:
-		return evalList(expr, env)
+		return evalListExprTail(expr, env)
 	default:
-		return nil, newCurrentEvalError("unknown expression")
+		return nil, nil, newCurrentEvalError("unknown expression")
 	}
 }
 
@@ -553,6 +620,115 @@ func evalList(items listExpr, env *env) (value, error) {
 	return proc.call(args)
 }
 
+func evalListExprTail(items listExpr, env *env) (value, *tailCall, error) {
+	if len(items) == 0 {
+		return nil, nil, newCurrentEvalError("cannot evaluate empty list")
+	}
+
+	if operator, ok := items[0].form.(symbolExpr); ok {
+		switch string(operator) {
+		case "and":
+			return evalAndTail(items[1:], env)
+		case "or":
+			return evalOrTail(items[1:], env)
+		case "begin":
+			return evalSequenceTail(items[1:], env)
+		case "if":
+			return evalIfTail(items[1:], env)
+		case "cond":
+			return evalCondTail(items[1:], env)
+		case "define":
+			v, err := evalDefine(items[1:], env)
+			return v, nil, err
+		case "define-syntax":
+			v, err := evalDefineSyntax(items[1:], env)
+			return v, nil, err
+		case "define-record-type":
+			v, err := evalDefineRecordType(items[1:], env)
+			return v, nil, err
+		case "set!":
+			v, err := evalSet(items[1:], env)
+			return v, nil, err
+		case "quote":
+			v, err := evalQuote(items[1:])
+			return v, nil, err
+		case "let":
+			return evalLetTail(items[1:], env)
+		case "letrec":
+			return evalLetrecTail(items[1:], env)
+		case "letrec*":
+			return evalLetrecStarTail(items[1:], env)
+		case "lambda":
+			v, err := evalLambda(items[1:], env)
+			return v, nil, err
+		case "case-lambda":
+			v, err := evalCaseLambda(items[1:], env)
+			return v, nil, err
+		case "case":
+			return evalCaseTail(items[1:], env)
+		case "do":
+			return evalDoTail(items[1:], env)
+		}
+
+		if macro, found := env.lookupMacro(string(operator)); found {
+			expanded, expansionEnv, err := expandMacroCall(items, macro, env)
+			if err != nil {
+				return nil, nil, err
+			}
+			return evalExprTail(expanded, expansionEnv)
+		}
+	}
+
+	operator, err := evalExpr(items[0], env)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	proc, ok := operator.(procedure)
+	if !ok {
+		restore := pushEvalPos(items[0].pos)
+		defer restore()
+		return nil, nil, newCurrentEvalError("attempt to call non-procedure: %s", operator.schemeString())
+	}
+
+	args := make([]value, 0, len(items)-1)
+	for _, item := range items[1:] {
+		arg, err := evalExpr(item, env)
+		if err != nil {
+			return nil, nil, err
+		}
+		args = append(args, arg)
+	}
+
+	restore := pushEvalPos(items[0].pos)
+	v, tail, err := applyProcedureTail(proc, args)
+	restore()
+	return v, tail, err
+}
+
+func applyProcedureTail(proc procedure, args []value) (value, *tailCall, error) {
+	switch p := proc.(type) {
+	case closureValue:
+		call, err := p.prepareTailCall(args)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, call, nil
+	case caseClosureValue:
+		call, err := p.prepareTailCall(args)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, call, nil
+	default:
+		v, err := proc.call(args)
+		if err != nil {
+			return nil, nil, err
+		}
+		return v, nil, nil
+	}
+}
+
 func evalAnd(items []locatedExpr, env *env) (value, error) {
 	result := value(boolValue(true))
 	for _, item := range items {
@@ -568,6 +744,28 @@ func evalAnd(items []locatedExpr, env *env) (value, error) {
 	return result, nil
 }
 
+func evalAndTail(items []locatedExpr, env *env) (value, *tailCall, error) {
+	if len(items) == 0 {
+		return boolValue(true), nil, nil
+	}
+
+	for i, item := range items {
+		if i == len(items)-1 {
+			return evalExprTail(item, env)
+		}
+
+		next, err := evalExpr(item, env)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !next.isTruthy() {
+			return next, nil, nil
+		}
+	}
+
+	return boolValue(true), nil, nil
+}
+
 func evalOr(items []locatedExpr, env *env) (value, error) {
 	for _, item := range items {
 		next, err := evalExpr(item, env)
@@ -579,6 +777,28 @@ func evalOr(items []locatedExpr, env *env) (value, error) {
 		}
 	}
 	return boolValue(false), nil
+}
+
+func evalOrTail(items []locatedExpr, env *env) (value, *tailCall, error) {
+	if len(items) == 0 {
+		return boolValue(false), nil, nil
+	}
+
+	for i, item := range items {
+		if i == len(items)-1 {
+			return evalExprTail(item, env)
+		}
+
+		next, err := evalExpr(item, env)
+		if err != nil {
+			return nil, nil, err
+		}
+		if next.isTruthy() {
+			return next, nil, nil
+		}
+	}
+
+	return boolValue(false), nil, nil
 }
 
 func evalIf(parts []locatedExpr, env *env) (value, error) {
@@ -600,6 +820,27 @@ func evalIf(parts []locatedExpr, env *env) (value, error) {
 	}
 
 	return voidValue{}, nil
+}
+
+func evalIfTail(parts []locatedExpr, env *env) (value, *tailCall, error) {
+	if len(parts) != 2 && len(parts) != 3 {
+		return nil, nil, newCurrentEvalError("'if' expects 2 or 3 arguments")
+	}
+
+	cond, err := evalExpr(parts[0], env)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if cond.isTruthy() {
+		return evalExprTail(parts[1], env)
+	}
+
+	if len(parts) == 3 {
+		return evalExprTail(parts[2], env)
+	}
+
+	return voidValue{}, nil, nil
 }
 
 func evalDefine(parts []locatedExpr, env *env) (value, error) {
@@ -757,6 +998,38 @@ func evalCond(clauses []locatedExpr, env *env) (value, error) {
 	return voidValue{}, nil
 }
 
+func evalCondTail(clauses []locatedExpr, env *env) (value, *tailCall, error) {
+	for i, clauseExpr := range clauses {
+		clause, ok := clauseExpr.form.(listExpr)
+		if !ok || len(clause) == 0 {
+			return nil, nil, newEvalError(clauseExpr.pos, "'cond' clauses must be non-empty lists")
+		}
+
+		if keyword, ok := clause[0].form.(symbolExpr); ok && string(keyword) == "else" {
+			if i != len(clauses)-1 {
+				return nil, nil, newEvalError(clause[0].pos, "'cond' else clause must be last")
+			}
+			if len(clause) == 1 {
+				return voidValue{}, nil, nil
+			}
+			return evalSequenceTail(clause[1:], env)
+		}
+
+		test, err := evalExpr(clause[0], env)
+		if err != nil {
+			return nil, nil, err
+		}
+		if test.isTruthy() {
+			if len(clause) == 1 {
+				return test, nil, nil
+			}
+			return evalSequenceTail(clause[1:], env)
+		}
+	}
+
+	return voidValue{}, nil, nil
+}
+
 func evalLet(parts []locatedExpr, env *env) (value, error) {
 	if len(parts) < 2 {
 		return nil, newCurrentEvalError("'let' expects bindings and a body")
@@ -818,6 +1091,74 @@ func evalLet(parts []locatedExpr, env *env) (value, error) {
 	}
 
 	return evalSequence(parts[1:], letEnv)
+}
+
+func evalLetTail(parts []locatedExpr, env *env) (value, *tailCall, error) {
+	if len(parts) < 2 {
+		return nil, nil, newCurrentEvalError("'let' expects bindings and a body")
+	}
+
+	if name, ok := parts[0].form.(symbolExpr); ok {
+		if len(parts) < 3 {
+			return nil, nil, newCurrentEvalError("named 'let' expects bindings and a body")
+		}
+
+		bindingExprs, ok := parts[1].form.(listExpr)
+		if !ok {
+			return nil, nil, newEvalError(parts[1].pos, "'let' bindings must be a list")
+		}
+
+		bindings, err := parseLetBindings(bindingExprs)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		args := make([]value, 0, len(bindings))
+		params := make([]string, 0, len(bindings))
+		for _, binding := range bindings {
+			arg, err := evalExpr(binding.init, env)
+			if err != nil {
+				return nil, nil, err
+			}
+			args = append(args, arg)
+			params = append(params, binding.name)
+		}
+
+		letEnv := newEnv(env)
+		proc := closureValue{
+			params: params,
+			body:   parts[2:],
+			env:    letEnv,
+		}
+		letEnv.define(string(name), proc)
+
+		call, err := proc.prepareTailCall(args)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, call, nil
+	}
+
+	bindingExprs, ok := parts[0].form.(listExpr)
+	if !ok {
+		return nil, nil, newEvalError(parts[0].pos, "'let' bindings must be a list")
+	}
+
+	bindings, err := parseLetBindings(bindingExprs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	letEnv := newEnv(env)
+	for _, binding := range bindings {
+		v, err := evalExpr(binding.init, env)
+		if err != nil {
+			return nil, nil, err
+		}
+		letEnv.define(binding.name, v)
+	}
+
+	return evalSequenceTail(parts[1:], letEnv)
 }
 
 type formalsSpec struct {
