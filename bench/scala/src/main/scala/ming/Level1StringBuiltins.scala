@@ -9,6 +9,8 @@ private[ming] object Level1StringBuiltins:
     "display"          -> BuiltinValue("display", display),
     "write"            -> BuiltinValue("write", write),
     "newline"          -> BuiltinValue("newline", newline),
+    "make-string"      -> BuiltinValue("make-string", makeString),
+    "string"           -> BuiltinValue("string", stringValue),
     "string-copy"      -> BuiltinValue("string-copy", stringCopy),
     "string-set!"      -> BuiltinValue("string-set!", stringSet),
     "string->list"     -> BuiltinValue("string->list", stringToList),
@@ -23,6 +25,9 @@ private[ming] object Level1StringBuiltins:
     "string-ref"       -> BuiltinValue("string-ref", stringRef),
     "string=?"         -> BuiltinValue("string=?", compareStrings("string=?")(_ == _)),
     "string<?"         -> BuiltinValue("string<?", compareStrings("string<?")(_ < _)),
+    "string>?"         -> BuiltinValue("string>?", compareStrings("string>?")(_ > _)),
+    "string<=?"        -> BuiltinValue("string<=?", compareStrings("string<=?")(_ <= _)),
+    "string>=?"        -> BuiltinValue("string>=?", compareStrings("string>=?")(_ >= _)),
     "string-ci=?"      -> BuiltinValue("string-ci=?", stringCiEqual),
     "string-upcase"    -> BuiltinValue("string-upcase", stringUpcase),
     "string-downcase"  -> BuiltinValue("string-downcase", stringDowncase),
@@ -51,11 +56,28 @@ private[ming] object Level1StringBuiltins:
     OutputCapture.append("\n")
     VoidValue
 
+  private def makeString(arguments: List[Value], position: Position): Value =
+    val (length, fillChar) =
+      arguments match
+        case lengthValue :: Nil =>
+          (expectIndex(lengthValue, "make-string", position), ' ')
+        case lengthValue :: charValue :: Nil =>
+          (expectIndex(lengthValue, "make-string", position), expectChar(charValue, "make-string", position))
+        case _ =>
+          SchemeFailure.raise(
+            s"make-string expected 1 or 2 argument(s), got ${arguments.length}",
+            position
+          )
+
+    schemeString(fillChar.toString * length)
+
+  private def stringValue(arguments: List[Value], position: Position): Value =
+    schemeString(arguments.map(expectChar(_, "string", position)).mkString)
+
   private def stringCopy(arguments: List[Value], position: Position): Value =
     val value = expectSingleArgument(arguments, "string-copy", position)
     val text  = expectString(value, "string-copy", position)
-    if BenchRuntime.stringsAreImmutable then StringValue(text)
-    else MutableStringValue(text)
+    schemeString(text)
 
   private def stringSet(arguments: List[Value], position: Position): Value =
     expectExact(arguments, 3, "string-set!", position) match
@@ -80,10 +102,12 @@ private[ming] object Level1StringBuiltins:
 
   private def listToString(arguments: List[Value], position: Position): Value =
     val value = expectSingleArgument(arguments, "list->string", position)
-    StringValue(expectProperList(value, "list->string", position).map(expectChar(_, "list->string", position)).mkString)
+    schemeString(
+      expectProperList(value, "list->string", position).map(expectChar(_, "list->string", position)).mkString
+    )
 
   private def stringAppend(arguments: List[Value], position: Position): Value =
-    StringValue(arguments.map(expectString(_, "string-append", position)).mkString)
+    schemeString(arguments.map(expectString(_, "string-append", position)).mkString)
 
   private def stringLength(arguments: List[Value], position: Position): Value =
     val value = expectSingleArgument(arguments, "string-length", position)
@@ -135,11 +159,11 @@ private[ming] object Level1StringBuiltins:
 
   private def stringUpcase(arguments: List[Value], position: Position): Value =
     val value = expectSingleArgument(arguments, "string-upcase", position)
-    StringValue(expectString(value, "string-upcase", position).toUpperCase(Locale.ROOT))
+    schemeString(expectString(value, "string-upcase", position).toUpperCase(Locale.ROOT))
 
   private def stringDowncase(arguments: List[Value], position: Position): Value =
     val value = expectSingleArgument(arguments, "string-downcase", position)
-    StringValue(expectString(value, "string-downcase", position).toLowerCase(Locale.ROOT))
+    schemeString(expectString(value, "string-downcase", position).toLowerCase(Locale.ROOT))
 
   private def charToInteger(arguments: List[Value], position: Position): Value =
     val value = expectSingleArgument(arguments, "char->integer", position)
@@ -180,3 +204,7 @@ private[ming] object Level1StringBuiltins:
     (arguments, position) =>
       val chars = expectAtLeast(arguments, 2, name, position).map(expectChar(_, name, position))
       BoolValue(chars.zip(chars.tail).forall((left, right) => predicate(left, right)))
+
+  private def schemeString(text: String): StringLikeValue =
+    if BenchRuntime.stringsAreImmutable then StringValue(text)
+    else MutableStringValue(text)

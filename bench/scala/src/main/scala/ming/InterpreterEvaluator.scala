@@ -120,6 +120,8 @@ private[ming] object InterpreterEvaluator:
         SpecialFormEvaluator.evalCaseLambda(rest, position, env)
       case SymbolExpr("let", _) :: rest =>
         SpecialFormEvaluator.evalLet(rest, position, env)
+      case SymbolExpr("let*", _) :: rest =>
+        SpecialFormEvaluator.evalLetStar(rest, position, env)
       case SymbolExpr("letrec", _) :: rest =>
         SpecialFormEvaluator.evalLetrec(rest, position, env)
       case SymbolExpr("letrec*", _) :: rest =>

@@ -1,5 +1,6 @@
 package ming
 
+import scala.collection.mutable
 import scala.annotation.tailrec
 
 private[ming] object RuntimeSupport:
@@ -106,20 +107,32 @@ private[ming] object RuntimeSupport:
 
     number.toInt
 
-  @tailrec
   def expectProperList(
     value: Value,
     name: String,
     position: Position,
     reversed: List[Value] = Nil
   ): List[Value] =
-    value match
-      case EmptyListValue =>
-        reversed.reverse
-      case PairValue(head, tail) =>
-        expectProperList(tail, name, position, head :: reversed)
-      case other =>
-        SchemeFailure.raise(s"$name expected a proper list, got ${typeName(other)}", position)
+    val elements = List.newBuilder[Value]
+    reversed.reverseIterator.foreach(elements += _)
+    val visited = mutable.HashSet.empty[PairValue]
+
+    var current: Value = value
+    while true do
+      current match
+        case EmptyListValue =>
+          return elements.result()
+        case pair: PairValue =>
+          if visited.contains(pair) then
+            SchemeFailure.raise(s"$name expected a proper list, got circular list", position)
+
+          visited += pair
+          elements += pair.car
+          current = pair.cdr
+        case other =>
+          SchemeFailure.raise(s"$name expected a proper list, got ${typeName(other)}", position)
+
+    throw new IllegalStateException("unreachable proper list traversal")
 
   def isTruthy(value: Value): Boolean =
     value match

@@ -1,5 +1,7 @@
 package ming
 
+import scala.collection.mutable
+
 sealed private[ming] trait Value:
   def render: String
   def renderDisplay: String = render
@@ -59,19 +61,26 @@ final private[ming] case class SymbolValue(name: String) extends Value:
 private[ming] case object EmptyListValue extends Value:
   override def render: String = "()"
 
-final private[ming] case class PairValue(car: Value, cdr: Value) extends Value:
-  override def render: String = s"(${renderContents(this)})"
+final private[ming] class PairValue(private var currentCar: Value, private var currentCdr: Value) extends Value:
+  def car: Value = currentCar
 
-  private def renderContents(value: Value): String =
-    value match
-      case PairValue(head, EmptyListValue) =>
-        head.render
-      case PairValue(head, tail: PairValue) =>
-        s"${head.render} ${renderContents(tail)}"
-      case PairValue(head, tail) =>
-        s"${head.render} . ${tail.render}"
-      case other =>
-        throw new IllegalStateException(s"expected pair while rendering pair, got ${other.render}")
+  def cdr: Value = currentCdr
+
+  def updateCar(value: Value): Unit =
+    currentCar = value
+
+  def updateCdr(value: Value): Unit =
+    currentCdr = value
+
+  override def render: String = ValueRenderer.render(this)
+
+private[ming] object PairValue:
+
+  def apply(car: Value, cdr: Value): PairValue =
+    new PairValue(car, cdr)
+
+  def unapply(pair: PairValue): Some[(Value, Value)] =
+    Some((pair.car, pair.cdr))
 
 final private[ming] class VectorValue(initialElements: Iterable[Value]) extends Value:
   private val elements: Array[Value] = initialElements.iterator.toArray
@@ -88,8 +97,7 @@ final private[ming] class VectorValue(initialElements: Iterable[Value]) extends 
   def toList: List[Value] =
     elements.toList
 
-  override def render: String =
-    elements.iterator.map(_.render).mkString("#(", " ", ")")
+  override def render: String = ValueRenderer.render(this)
 
 final private[ming] case class BuiltinValue(
   name: String,
@@ -144,3 +152,76 @@ private[ming] case object VoidValue extends Value:
 
 private[ming] case object UninitializedValue extends Value:
   override def render: String = "#<uninitialized>"
+
+private[ming] object ValueRenderer:
+
+  def render(value: Value): String =
+    renderValue(value, mutable.HashSet.empty[AnyRef])
+
+  private def renderValue(value: Value, active: mutable.HashSet[AnyRef]): String =
+    value match
+      case pair: PairValue     => renderPair(pair, active)
+      case vector: VectorValue => renderVector(vector, active)
+      case other               => other.render
+
+  private def renderPair(pair: PairValue, active: mutable.HashSet[AnyRef]): String =
+    val entered = mutable.ArrayBuffer.empty[AnyRef]
+
+    def enter(ref: AnyRef): Boolean =
+      if active.contains(ref) then false
+      else
+        active += ref
+        entered += ref
+        true
+
+    if !enter(pair) then "#<cycle>"
+    else
+      try
+        val builder        = StringBuilder("(")
+        var current: Value = pair
+        var first          = true
+        var done           = false
+
+        while !done do
+          current match
+            case currentPair: PairValue =>
+              val nextValue = appendPairCell(currentPair, first, builder, enter)
+              done = nextValue.isEmpty
+              nextValue.foreach { next =>
+                builder.append(renderValue(currentPair.car, active))
+                current = next
+                first = false
+              }
+
+            case EmptyListValue =>
+              done = true
+
+            case other =>
+              builder.append(" . ")
+              builder.append(renderValue(other, active))
+              done = true
+
+        builder.append(")")
+        builder.result()
+      finally entered.foreach(active.remove)
+
+  private def appendPairCell(
+    pair: PairValue,
+    first: Boolean,
+    builder: StringBuilder,
+    enter: AnyRef => Boolean
+  ): Option[Value] =
+    if first then Some(pair.cdr)
+    else if !enter(pair) then
+      builder.append(" . #<cycle>")
+      None
+    else
+      builder.append(" ")
+      Some(pair.cdr)
+
+  private def renderVector(vector: VectorValue, active: mutable.HashSet[AnyRef]): String =
+    if active.contains(vector) then "#<cycle>"
+    else
+      active += vector
+      try vector.toList.iterator.map(renderValue(_, active)).mkString("#(", " ", ")")
+      finally active -= vector

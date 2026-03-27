@@ -21,9 +21,13 @@ private[ming] object Level1NumericBuiltins:
     "modulo"         -> BuiltinValue("modulo", modulo),
     "remainder"      -> BuiltinValue("remainder", remainder),
     "quotient"       -> BuiltinValue("quotient", quotient),
+    "gcd"            -> BuiltinValue("gcd", gcd),
+    "lcm"            -> BuiltinValue("lcm", lcm),
     "min"            -> BuiltinValue("min", minValue),
     "max"            -> BuiltinValue("max", maxValue),
     "expt"           -> BuiltinValue("expt", expt),
+    "truncate"       -> BuiltinValue("truncate", truncateNumber),
+    "round"          -> BuiltinValue("round", roundNumber),
     "exact->inexact" -> BuiltinValue("exact->inexact", exactToInexact),
     "inexact->exact" -> BuiltinValue("inexact->exact", inexactToExact),
     "numerator"      -> BuiltinValue("numerator", numerator),
@@ -134,6 +138,19 @@ private[ming] object Level1NumericBuiltins:
     val (dividend, divisor) = expectTwoNumbers(arguments, "quotient", position)
     IntValue(quotientValue(dividend, divisor, position))
 
+  private def gcd(arguments: List[Value], position: Position): Value =
+    val integers = arguments.map(expectInteger(_, "gcd", position).abs)
+    IntValue(integers.foldLeft(BigInt(0))(_.gcd(_)))
+
+  private def lcm(arguments: List[Value], position: Position): Value =
+    val integers = arguments.map(expectInteger(_, "lcm", position).abs)
+    IntValue(
+      integers.foldLeft(BigInt(1)) { (current, next) =>
+        if current == 0 || next == 0 then BigInt(0)
+        else (current / current.gcd(next)) * next
+      }
+    )
+
   private def minValue(arguments: List[Value], position: Position): Value =
     val numbers = numericArgumentsAtLeast(arguments, 1, "min", position)
     numbers.reduceLeft((current: NumberValue, next: NumberValue) =>
@@ -157,6 +174,26 @@ private[ming] object Level1NumericBuiltins:
       else loop(currentBase * currentBase, currentExponent / 2, acc)
 
     IntValue(loop(base, exponent, 1))
+
+  private def truncateNumber(arguments: List[Value], position: Position): Value =
+    val number = expectNumber(expectSingleArgument(arguments, "truncate", position), "truncate", position)
+    number match
+      case inexact: InexactValue =>
+        val truncated =
+          if inexact.value >= 0 then math.floor(inexact.value)
+          else math.ceil(inexact.value)
+        InexactValue(truncated)
+      case _ =>
+        val fraction = NumericSupport.exactFractionOnly(number, "truncate", position)
+        IntValue(fraction.numerator / fraction.denominator)
+
+  private def roundNumber(arguments: List[Value], position: Position): Value =
+    val number = expectNumber(expectSingleArgument(arguments, "round", position), "round", position)
+    number match
+      case InexactValue(value) =>
+        InexactValue(math.rint(value))
+      case _ =>
+        IntValue(roundExact(NumericSupport.exactFractionOnly(number, "round", position)))
 
   private def exactToInexact(arguments: List[Value], position: Position): Value =
     val number = expectNumber(expectSingleArgument(arguments, "exact->inexact", position), "exact->inexact", position)
@@ -241,3 +278,13 @@ private[ming] object Level1NumericBuiltins:
     val remainder = remainderValue(dividend, divisor, position)
     if remainder == 0 || remainder.sign == divisor.sign then remainder
     else remainder + divisor
+
+  private def roundExact(fraction: ExactFraction): BigInt =
+    val quotient   = fraction.numerator / fraction.denominator
+    val remainder  = (fraction.numerator % fraction.denominator).abs
+    val comparison = (remainder * 2).compare(fraction.denominator)
+
+    if comparison < 0 then quotient
+    else if comparison > 0 then quotient + fraction.numerator.sign
+    else if quotient % 2 == 0 then quotient
+    else quotient + fraction.numerator.sign

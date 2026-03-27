@@ -51,6 +51,21 @@ private[ming] object SpecialFormBindingEvaluator:
   ): EvaluationStep =
     evalRecursiveLet(arguments, position, env, "letrec*", RecursiveLetMode.Sequential)
 
+  def evalLetStar(
+    arguments: List[Expr],
+    position: Position,
+    env: Environment
+  ): EvaluationStep =
+    arguments match
+      case bindingsExpression :: body if body.nonEmpty =>
+        val bindings = parseBindings(bindingsExpression, position, "let*")
+        val childEnv = Environment.child(env)
+        bindings.foreach: binding =>
+          childEnv.define(binding.name, InterpreterEvaluator.eval(binding.valueExpression, childEnv))
+        InterpreterEvaluator.deferSequence(body, childEnv)
+      case _ =>
+        SchemeFailure.raise("let* expected bindings and body", position)
+
   def evalDo(
     arguments: List[Expr],
     position: Position,

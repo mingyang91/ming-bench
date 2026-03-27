@@ -98,6 +98,13 @@ private[ming] object SpecialFormEvaluator:
   ): EvaluationStep =
     SpecialFormBindingEvaluator.evalLetrecStar(arguments, position, env)
 
+  def evalLetStar(
+    arguments: List[Expr],
+    position: Position,
+    env: Environment
+  ): EvaluationStep =
+    SpecialFormBindingEvaluator.evalLetStar(arguments, position, env)
+
   def evalQuote(arguments: List[Expr], position: Position): EvaluationStep =
     InterpreterEvaluator.done(
       SpecialFormQuoteEvaluator.evalQuote(arguments, position)
