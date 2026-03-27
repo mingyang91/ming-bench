@@ -12,6 +12,7 @@ public class Evaluator {
     // Top-level environment, persisted across evalStr calls
     private final Env globalEnv = createGlobalEnv();
     private StringBuilder outputBuffer = new StringBuilder();
+    private int stepLimit = -1; // -1 means unlimited
 
     public String evalStr(String input) throws EvalError {
         outputBuffer.setLength(0);
@@ -19,6 +20,19 @@ public class Evaluator {
         if (exprs.isEmpty()) return schemeToString(VOID);
         Object result = trampoline(evalSeqK(exprs, 0, globalEnv, BounceValue::new));
         return schemeToString(result);
+    }
+
+    public String evalStrWithLimit(String input, int maxSteps) throws EvalError {
+        outputBuffer.setLength(0);
+        stepLimit = maxSteps;
+        try {
+            List<Object> exprs = parse(input);
+            if (exprs.isEmpty()) return schemeToString(VOID);
+            Object result = trampoline(evalSeqK(exprs, 0, globalEnv, BounceValue::new));
+            return schemeToString(result);
+        } finally {
+            stepLimit = -1;
+        }
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
@@ -35,6 +49,11 @@ public class Evaluator {
         while (true) {
             if (b instanceof BounceValue bv) {
                 return bv.value();
+            }
+            if (stepLimit >= 0) {
+                if (--stepLimit < 0) {
+                    throw new EvalError("step limit exceeded");
+                }
             }
             BounceThunk bt = (BounceThunk) b;
             try {

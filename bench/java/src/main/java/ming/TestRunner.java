@@ -28,6 +28,7 @@ public class TestRunner {
             }
         }
 
+
         String testsJsonPath = System.getenv("TESTS_JSON");
         if (testsJsonPath == null || testsJsonPath.isEmpty()) {
             testsJsonPath = "../tests.json";
@@ -141,6 +142,28 @@ public class TestRunner {
             } catch (Exception e) {
                 System.out.println("FAIL " + testName + ": " + e.getClass().getSimpleName() + ": " + e.getMessage());
                 failed++;
+            }
+        }
+
+        // Run standalone test classes for surprise levels (L27+)
+        if (benchLevel >= 27) {
+            for (int lvl = 27; lvl <= benchLevel; lvl++) {
+                String className = "ming.L" + lvl + "Tests";
+                try {
+                    Class<?> cls = Class.forName(className);
+                    java.lang.reflect.Method mainMethod = cls.getMethod("main", String[].class);
+                    // L*Tests tracks its own pass/fail and calls System.exit
+                    mainMethod.invoke(null, (Object) new String[]{});
+                } catch (ClassNotFoundException e) {
+                    // No standalone test class for this level
+                } catch (java.lang.reflect.InvocationTargetException e) {
+                    // System.exit from the test class throws this — re-throw
+                    if (e.getCause() instanceof RuntimeException re) throw re;
+                    if (e.getCause() instanceof Error err) throw err;
+                } catch (Exception e) {
+                    System.out.println("FAIL L" + lvl + "Tests: " + e);
+                    failed++;
+                }
             }
         }
 
