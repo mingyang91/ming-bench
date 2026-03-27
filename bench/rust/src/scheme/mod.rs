@@ -37,7 +37,7 @@ pub(crate) enum Value {
     Float(f64),
     Boolean(bool),
     Char(char),
-    Str(Rc<RefCell<String>>),
+    Str(Rc<RefCell<String>>, bool), // (data, mutable)
     Symbol(String),
     List(Vec<Value>),
     Pair(Box<Value>, Box<Value>),
@@ -83,7 +83,11 @@ fn make_rational(num: i64, den: i64) -> Value {
 }
 
 fn make_str(s: String) -> Value {
-    Value::Str(Rc::new(RefCell::new(s)))
+    Value::Str(Rc::new(RefCell::new(s)), true)
+}
+
+fn make_immutable_str(s: String) -> Value {
+    Value::Str(Rc::new(RefCell::new(s)), false)
 }
 
 impl fmt::Display for Value {
@@ -102,7 +106,7 @@ impl fmt::Display for Value {
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
             Value::Char(c) => write!(f, "#\\{c}"),
-            Value::Str(s) => write!(f, "\"{}\"", s.borrow()),
+            Value::Str(s, _) => write!(f, "\"{}\"", s.borrow()),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(items) => {
                 write!(f, "(")?;
@@ -407,7 +411,7 @@ fn eval_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, 
         ExprKind::Float(f) => Ok(Value::Float(*f)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
         ExprKind::Char(c) => Ok(Value::Char(*c)),
-        ExprKind::Str(s) => Ok(make_str(s.clone())),
+        ExprKind::Str(s) => Ok(make_immutable_str(s.clone())),
         ExprKind::Symbol(name) => {
             match env_lookup(env, name) {
                 Ok(v) => Ok(v),
@@ -614,7 +618,7 @@ fn expr_to_value(expr: &Expr) -> Value {
         ExprKind::Float(f) => Value::Float(*f),
         ExprKind::Boolean(b) => Value::Boolean(*b),
         ExprKind::Char(c) => Value::Char(*c),
-        ExprKind::Str(s) => make_str(s.clone()),
+        ExprKind::Str(s) => make_immutable_str(s.clone()),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
         ExprKind::List(items) => Value::List(items.iter().map(expr_to_value).collect()),
     }
@@ -685,14 +689,14 @@ pub(crate) fn is_builtin(op: &str) -> bool {
         | "string-append" | "string-length" | "substring"
         | "string->number" | "number->string"
         | "symbol->string" | "string->symbol"
-        | "string-ref" | "string-copy" | "string-set!"
+        | "string-ref" | "string-copy" | "string-set!" | "string->list" | "list->string"
         | "apply"
         | "eq?" | "equal?"
         | "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt"
         | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
         | "list-ref" | "list-tail" | "list?" | "assoc" | "map"
         | "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase"
-        | "char=?" | "char<?"
+        | "char=?" | "char<?" | "char->integer" | "integer->char"
         | "string=?" | "string<?" | "string-ci=?"
         | "string-upcase" | "string-downcase"
         | "procedure?"
@@ -703,7 +707,7 @@ pub(crate) fn is_builtin(op: &str) -> bool {
 
 fn display_value(v: &Value) -> String {
     match v {
-        Value::Str(s) => s.borrow().clone(),
+        Value::Str(s, _) => s.borrow().clone(),
         Value::Char(c) => c.to_string(),
         Value::List(items) => {
             let mut s = String::from("(");
@@ -773,7 +777,7 @@ fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Boolean(a), Value::Boolean(b)) => a == b,
         (Value::Char(a), Value::Char(b)) => a == b,
-        (Value::Str(a), Value::Str(b)) => *a.borrow() == *b.borrow(),
+        (Value::Str(a, _), Value::Str(b, _)) => *a.borrow() == *b.borrow(),
         (Value::Symbol(a), Value::Symbol(b)) => a == b,
         (Value::List(a), Value::List(b)) => {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| values_equal(x, y))

@@ -32,10 +32,10 @@ pub fn eval_builtin(op: &str, args: &[Value], output: &mut String) -> Result<Val
         "string-append" | "string-length" | "substring" | "string->number" | "number->string"
         | "symbol->string" | "string->symbol" | "string-ref" | "string-copy" | "string-set!"
         | "string=?" | "string<?" | "string-ci=?" | "string-upcase"
-        | "string-downcase" => eval_string(op, args),
+        | "string-downcase" | "string->list" | "list->string" => eval_string(op, args),
 
         "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?"
-        | "char<?" => eval_char(op, args),
+        | "char<?" | "char->integer" | "integer->char" => eval_char(op, args),
 
         _ if op.starts_with("##record-ctor##") => {
             let tag = &op["##record-ctor##".len()..];
@@ -502,7 +502,7 @@ fn eval_predicate(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 (Value::Symbol(a), Value::Symbol(b)) => a == b,
                 (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
                 (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
-                (Value::Str(a), Value::Str(b)) => Rc::ptr_eq(a, b),
+                (Value::Str(a, _), Value::Str(b, _)) => Rc::ptr_eq(a, b),
                 _ => false,
             };
             Ok(Value::Boolean(result))
@@ -533,7 +533,7 @@ fn eval_predicate(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             if args.len() != 1 {
                 return Err(EvalError::Arity("string? requires 1 argument".into()));
             }
-            Ok(Value::Boolean(matches!(&args[0], Value::Str(_))))
+            Ok(Value::Boolean(matches!(&args[0], Value::Str(_, _))))
         }
         "number?" => {
             if args.len() != 1 {
@@ -656,7 +656,7 @@ fn eval_string(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             let mut result = String::new();
             for a in args {
                 match a {
-                    Value::Str(s) => result.push_str(&s.borrow()),
+                    Value::Str(s, _) => result.push_str(&s.borrow()),
                     _ => return Err(EvalError::Type("string-append: expected string".into())),
                 }
             }
@@ -669,7 +669,7 @@ fn eval_string(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 ));
             }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Integer(s.borrow().len() as i64)),
+                Value::Str(s, _) => Ok(Value::Integer(s.borrow().len() as i64)),
                 _ => Err(EvalError::Type("string-length: expected string".into())),
             }
         }
@@ -678,7 +678,7 @@ fn eval_string(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::Arity("substring requires 3 arguments".into()));
             }
             let s = match &args[0] {
-                Value::Str(s) => s.borrow().clone(),
+                Value::Str(s, _) => s.borrow().clone(),
                 _ => return Err(EvalError::Type("substring: expected string".into())),
             };
             let start = expect_integer(&args[1], "substring")? as usize;
@@ -692,7 +692,7 @@ fn eval_string(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 ));
             }
             match &args[0] {
-                Value::Str(s) => match s.borrow().parse::<i64>() {
+                Value::Str(s, _) => match s.borrow().parse::<i64>() {
                     Ok(n) => Ok(Value::Integer(n)),
                     Err(_) => Ok(Value::Boolean(false)),
                 },
@@ -726,7 +726,7 @@ fn eval_string(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 ));
             }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Symbol(s.borrow().clone())),
+                Value::Str(s, _) => Ok(Value::Symbol(s.borrow().clone())),
                 _ => Err(EvalError::Type("string->symbol: expected string".into())),
             }
         }
@@ -735,7 +735,7 @@ fn eval_string(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::Arity("string-ref requires 2 arguments".into()));
             }
             let s = match &args[0] {
-                Value::Str(s) => s.borrow().clone(),
+                Value::Str(s, _) => s.borrow().clone(),
                 _ => return Err(EvalError::Type("string-ref: expected string".into())),
             };
             let idx = expect_integer(&args[1], "string-ref")? as usize;
@@ -751,42 +751,70 @@ fn eval_string(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::Arity("string-copy requires 1 argument".into()));
             }
             match &args[0] {
-                Value::Str(s) => Ok(make_str(s.borrow().clone())),
+                Value::Str(s, _) => Ok(make_str(s.borrow().clone())),
                 _ => Err(EvalError::Type("string-copy: expected string".into())),
             }
         }
         "string-set!" => {
             if args.len() != 3 {
-                return Err(EvalError::Arity(
-                    "string-set! requires 3 arguments".into(),
-                ));
+                return Err(EvalError::Arity("string-set! requires 3 arguments".into()));
             }
-            let s = match &args[0] {
-                Value::Str(s) => s.clone(),
-                _ => return Err(EvalError::Type("string-set!: expected string".into())),
-            };
-            let idx = expect_integer(&args[1], "string-set!")? as usize;
-            let c = match &args[2] {
-                Value::Char(c) => *c,
-                _ => return Err(EvalError::Type("string-set!: expected char".into())),
-            };
-            let mut borrowed = s.borrow_mut();
-            let mut chars: Vec<char> = borrowed.chars().collect();
-            if idx >= chars.len() {
-                return Err(EvalError::Generic(
-                    "string-set!: index out of range".into(),
-                ));
+            match (&args[0], &args[1], &args[2]) {
+                (Value::Str(s, mutable), Value::Integer(idx), Value::Char(c)) => {
+                    if !mutable {
+                        return Err(EvalError::Type("string-set!: strings are immutable".into()));
+                    }
+                    let idx = *idx as usize;
+                    let mut st = s.borrow_mut();
+                    if idx >= st.len() {
+                        return Err(EvalError::Generic(format!("string-set!: index {} out of range", idx)));
+                    }
+                    let mut chars: Vec<char> = st.chars().collect();
+                    if idx >= chars.len() {
+                        return Err(EvalError::Generic(format!("string-set!: index {} out of range", idx)));
+                    }
+                    chars[idx] = *c;
+                    *st = chars.into_iter().collect();
+                    Ok(Value::List(vec![]))  // void
+                }
+                _ => Err(EvalError::Type("string-set!: expected (string, integer, char)".into())),
             }
-            chars[idx] = c;
-            *borrowed = chars.into_iter().collect();
-            Ok(Value::Boolean(false))
+        }
+        "string->list" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("string->list requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Str(s, _) => {
+                    let chars: Vec<Value> = s.borrow().chars().map(Value::Char).collect();
+                    Ok(Value::List(chars))
+                }
+                _ => Err(EvalError::Type("string->list: expected string".into())),
+            }
+        }
+        "list->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("list->string requires 1 argument".into()));
+            }
+            let vals = match &args[0] {
+                Value::List(v) => v.clone(),
+                _ => return Err(EvalError::Type("list->string: expected list".into())),
+            };
+            let mut s = String::new();
+            for v in &vals {
+                match v {
+                    Value::Char(c) => s.push(*c),
+                    _ => return Err(EvalError::Type("list->string: expected list of chars".into())),
+                }
+            }
+            Ok(make_str(s))
         }
         "string=?" => {
             if args.len() != 2 {
                 return Err(EvalError::Arity("string=? requires 2 arguments".into()));
             }
             match (&args[0], &args[1]) {
-                (Value::Str(a), Value::Str(b)) => {
+                (Value::Str(a, _), Value::Str(b, _)) => {
                     Ok(Value::Boolean(*a.borrow() == *b.borrow()))
                 }
                 _ => Err(EvalError::Type("string=?: expected strings".into())),
@@ -797,7 +825,7 @@ fn eval_string(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::Arity("string<? requires 2 arguments".into()));
             }
             match (&args[0], &args[1]) {
-                (Value::Str(a), Value::Str(b)) => {
+                (Value::Str(a, _), Value::Str(b, _)) => {
                     Ok(Value::Boolean(*a.borrow() < *b.borrow()))
                 }
                 _ => Err(EvalError::Type("string<?: expected strings".into())),
@@ -810,7 +838,7 @@ fn eval_string(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 ));
             }
             match (&args[0], &args[1]) {
-                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(
+                (Value::Str(a, _), Value::Str(b, _)) => Ok(Value::Boolean(
                     a.borrow().to_lowercase() == b.borrow().to_lowercase(),
                 )),
                 _ => Err(EvalError::Type("string-ci=?: expected strings".into())),
@@ -823,7 +851,7 @@ fn eval_string(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 ));
             }
             match &args[0] {
-                Value::Str(s) => Ok(make_str(s.borrow().to_uppercase())),
+                Value::Str(s, _) => Ok(make_str(s.borrow().to_uppercase())),
                 _ => Err(EvalError::Type("string-upcase: expected string".into())),
             }
         }
@@ -834,7 +862,7 @@ fn eval_string(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 ));
             }
             match &args[0] {
-                Value::Str(s) => Ok(make_str(s.borrow().to_lowercase())),
+                Value::Str(s, _) => Ok(make_str(s.borrow().to_lowercase())),
                 _ => Err(EvalError::Type("string-downcase: expected string".into())),
             }
         }
@@ -906,6 +934,25 @@ fn eval_char(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             match (&args[0], &args[1]) {
                 (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a < b)),
                 _ => Err(EvalError::Type("char<?: expected chars".into())),
+            }
+        }
+        "char->integer" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("char->integer requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Integer(*c as i64)),
+                _ => Err(EvalError::Type("char->integer: expected char".into())),
+            }
+        }
+        "integer->char" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("integer->char requires 1 argument".into()));
+            }
+            let n = expect_integer(&args[0], "integer->char")?;
+            match char::from_u32(n as u32) {
+                Some(c) => Ok(Value::Char(c)),
+                None => Err(EvalError::Generic("integer->char: invalid code point".into())),
             }
         }
         _ => unreachable!(),
