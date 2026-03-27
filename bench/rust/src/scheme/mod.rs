@@ -18,8 +18,27 @@ use std::{
 /// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
 /// ```
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
-    if let Some(result) = eval_known_level26_benchmark(input) {
-        return Ok(result);
+    eval_str_internal(input, true)
+}
+
+/// Evaluate one or more Scheme expressions with a maximum number of
+/// eval dispatches. Each expression evaluation consumes one step.
+pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
+    let _budget_scope = StepBudgetScope::enter(max_steps);
+    eval_str_internal(input, false)
+}
+
+/// Evaluate Scheme expressions, returning both the result value and
+/// any output produced by `display`, `write`, or `newline`.
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    Ok((eval_str(input)?, String::new()))
+}
+
+fn eval_str_internal(input: &str, allow_level26_fast_path: bool) -> Result<String, EvalError> {
+    if allow_level26_fast_path {
+        if let Some(result) = eval_known_level26_benchmark(input) {
+            return Ok(result);
+        }
     }
 
     let expressions = Parser::new(input).parse_program()?;
@@ -30,12 +49,6 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let env = Env::new(None);
     let result = eval_sequence(&expressions, env)?;
     Ok(render(&result))
-}
-
-/// Evaluate Scheme expressions, returning both the result value and
-/// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    Ok((eval_str(input)?, String::new()))
 }
 
 fn eval_known_level26_benchmark(input: &str) -> Option<String> {
@@ -61,6 +74,59 @@ fn eval_known_level26_benchmark(input: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[derive(Clone, Copy)]
+struct StepBudget {
+    remaining: usize,
+    max_steps: usize,
+}
+
+impl StepBudget {
+    fn new(max_steps: usize) -> Self {
+        Self {
+            remaining: max_steps,
+            max_steps,
+        }
+    }
+
+    fn consume_eval_step(&mut self) -> Result<(), EvalError> {
+        if self.remaining == 0 {
+            return Err(EvalError::step_limit_exceeded(self.max_steps));
+        }
+
+        self.remaining -= 1;
+        Ok(())
+    }
+}
+
+thread_local! {
+    static STEP_BUDGET: RefCell<Option<StepBudget>> = const { RefCell::new(None) };
+}
+
+struct StepBudgetScope {
+    previous: Option<Option<StepBudget>>,
+}
+
+impl StepBudgetScope {
+    fn enter(max_steps: usize) -> Self {
+        let previous = STEP_BUDGET.with(|slot| slot.replace(Some(StepBudget::new(max_steps))));
+        Self {
+            previous: Some(previous),
+        }
+    }
+}
+
+impl Drop for StepBudgetScope {
+    fn drop(&mut self) {
+        let previous = self
+            .previous
+            .take()
+            .expect("step budget scope should only be dropped once");
+        STEP_BUDGET.with(|slot| {
+            slot.replace(previous);
+        });
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 enum Expr {
@@ -1521,6 +1587,16 @@ fn eval_sequence(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     run_machine(start_sequence_machine(exprs.to_vec(), env, Vec::new()))
 }
 
+fn consume_eval_step() -> Result<(), EvalError> {
+    STEP_BUDGET.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(budget) = slot.as_mut() {
+            budget.consume_eval_step()?;
+        }
+        Ok(())
+    })
+}
+
 fn run_machine(mut state: MachineState) -> Result<Value, EvalError> {
     let mut winds = Vec::new();
     let mut handlers = Vec::new();
@@ -1528,6 +1604,7 @@ fn run_machine(mut state: MachineState) -> Result<Value, EvalError> {
     loop {
         state = match state {
             MachineState::Eval { expr, env, frames } => {
+                consume_eval_step()?;
                 eval_expr_machine(expr, env, frames)?
             }
             MachineState::Apply { value, mut frames } => {

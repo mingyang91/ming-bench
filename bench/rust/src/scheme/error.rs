@@ -6,10 +6,16 @@
 pub enum EvalError {
     #[error("{0}")]
     Message(String),
+    #[error("step limit exceeded after {max_steps} eval dispatch(es)")]
+    StepLimitExceeded { max_steps: usize },
 }
 
 impl EvalError {
     pub fn message(message: impl Into<String>) -> Self {
         Self::Message(message.into())
+    }
+
+    pub fn step_limit_exceeded(max_steps: usize) -> Self {
+        Self::StepLimitExceeded { max_steps }
     }
 }
