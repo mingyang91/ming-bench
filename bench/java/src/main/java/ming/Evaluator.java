@@ -43,6 +43,7 @@ public class Evaluator {
     @FunctionalInterface
     interface Builtin { Object apply(List<Object> args) throws EvalError; }
     record BuiltinProc(String name, Builtin fn) {}
+    record DynamicWindEntry(Object inThunk, Object outThunk) {}
 
     private static class CekState {
         Object current;
@@ -57,13 +58,18 @@ public class Evaluator {
     static final Object CALLCC_PROC = new Object() {
         @Override public String toString() { return "#<procedure call/cc>"; }
     };
+    static final Object DYNAMIC_WIND_PROC = new Object() {
+        @Override public String toString() { return "#<procedure dynamic-wind>"; }
+    };
 
     static class Continuation {
         final List<Object> savedKont;
         final int evalId;
-        Continuation(List<Object> kont, int evalId) {
+        final List<DynamicWindEntry> savedWindStack;
+        Continuation(List<Object> kont, int evalId, List<DynamicWindEntry> windStack) {
             this.savedKont = new ArrayList<>(kont);
             this.evalId = evalId;
+            this.savedWindStack = new ArrayList<>(windStack);
         }
     }
 
@@ -96,6 +102,9 @@ public class Evaluator {
     private record LetrecBindFrame(List<String> names, List<Object> initExprs, int bindingIdx,
                                     List<Object> values, List<Object> bodyExprs,
                                     Env letrecEnv, boolean isStar) {}
+    private record DWAfterInFrame(Object inThunk, Object bodyThunk, Object outThunk) {}
+    private record DWAfterBodyFrame(Object inThunk, Object outThunk) {}
+    private record DWAfterOutFrame(Object bodyValue) {}
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "if", "begin", "let", "let*", "set!", "define", "quote", "lambda", "case-lambda",
@@ -106,6 +115,7 @@ public class Evaluator {
     private int gensymCounter = 0;
     private int nextEvalId = 0;
     private StringBuilder outputBuffer;
+    private final List<DynamicWindEntry> windStack = new ArrayList<>();
 
     public String evalStr(String input) throws EvalError {
         outputBuffer = new StringBuilder();
@@ -146,11 +156,13 @@ public class Evaluator {
         Builtins.registerAll(env, outputBuffer, this::applyProc);
         env.define("call/cc", CALLCC_PROC);
         env.define("call-with-current-continuation", CALLCC_PROC);
+        env.define("dynamic-wind", DYNAMIC_WIND_PROC);
         env.define("procedure?", new BuiltinProc("procedure?", args -> {
             if (args.size() != 1) throw new EvalError("procedure?: expected 1 arg");
             Object v = args.get(0);
             return (v instanceof Lambda || v instanceof CaseLambda || v instanceof BuiltinProc
-                    || v instanceof Continuation || v == CALLCC_PROC) ? Boolean.TRUE : Boolean.FALSE;
+                    || v instanceof Continuation || v == CALLCC_PROC
+                    || v == DYNAMIC_WIND_PROC) ? Boolean.TRUE : Boolean.FALSE;
         }));
         return env;
     }
@@ -379,6 +391,7 @@ public class Evaluator {
             }
           } catch (ContinuationInvoked ci) {
               if (ci.cont.evalId == evalId) {
+                  performWindTransition(ci.cont.savedWindStack);
                   kont.clear(); kont.addAll(ci.cont.savedKont);
                   current = ci.value; evaluating = false;
               } else throw ci;
@@ -467,6 +480,23 @@ public class Evaluator {
         }
         if (frame instanceof LetrecBindFrame f) {
             return processLetrecBindFrame(f, current, kont);
+        }
+        if (frame instanceof DWAfterInFrame f) {
+            windStack.add(new DynamicWindEntry(f.inThunk, f.outThunk));
+            kont.add(new DWAfterBodyFrame(f.inThunk, f.outThunk));
+            doApply(f.bodyThunk, List.of(), kont, 0, 0, evalId);
+            Env newEnv = applyResult[1] != null ? (Env) applyResult[1] : env;
+            return new CekState(applyResult[0], newEnv, (Boolean) applyResult[2]);
+        }
+        if (frame instanceof DWAfterBodyFrame f) {
+            windStack.remove(windStack.size() - 1);
+            kont.add(new DWAfterOutFrame(current));
+            doApply(f.outThunk, List.of(), kont, 0, 0, evalId);
+            Env newEnv = applyResult[1] != null ? (Env) applyResult[1] : env;
+            return new CekState(applyResult[0], newEnv, (Boolean) applyResult[2]);
+        }
+        if (frame instanceof DWAfterOutFrame f) {
+            return new CekState(f.bodyValue, env, false);
         }
         throw new EvalError("unknown frame: " + frame.getClass().getSimpleName());
     }
@@ -579,9 +609,16 @@ public class Evaluator {
     private void doApply(Object proc, List<Object> args, List<Object> kont,
                          int eLine, int eCol, int evalId) throws EvalError {
         String posStr = eLine > 0 ? " at " + eLine + ":" + eCol : "";
+        if (proc == DYNAMIC_WIND_PROC) {
+            if (args.size() != 3) throw new EvalError("dynamic-wind: expected 3 arguments" + posStr);
+            Object inThunk = args.get(0), bodyThunk = args.get(1), outThunk = args.get(2);
+            kont.add(new DWAfterInFrame(inThunk, bodyThunk, outThunk));
+            doApply(inThunk, List.of(), kont, eLine, eCol, evalId);
+            return;
+        }
         if (proc == CALLCC_PROC) {
             if (args.size() != 1) throw new EvalError("call/cc: expected 1 argument" + posStr);
-            Continuation k = new Continuation(kont, evalId);
+            Continuation k = new Continuation(kont, evalId, windStack);
             proc = args.get(0); args = List.of(k);
             // Fall through to apply proc
         }
@@ -735,6 +772,22 @@ public class Evaluator {
             else { if (args.size() == c.params.size()) return c; }
         }
         throw new EvalError("case-lambda: no matching clause for " + args.size() + " arguments");
+    }
+
+    private void performWindTransition(List<DynamicWindEntry> target) throws EvalError {
+        int common = 0;
+        int minLen = Math.min(windStack.size(), target.size());
+        while (common < minLen && windStack.get(common) == target.get(common)) common++;
+        // Unwind: out-thunks from innermost to outermost
+        for (int i = windStack.size() - 1; i >= common; i--) {
+            applyProc(windStack.get(i).outThunk(), List.of());
+        }
+        while (windStack.size() > common) windStack.remove(windStack.size() - 1);
+        // Rewind: in-thunks from outermost to innermost
+        for (int i = common; i < target.size(); i++) {
+            windStack.add(target.get(i));
+            applyProc(target.get(i).inThunk(), List.of());
+        }
     }
 
     // Used by builtins (map, for-each, apply) via callback
