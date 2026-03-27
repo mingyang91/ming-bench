@@ -1,13 +1,37 @@
+use std::cell::RefCell;
 use std::fmt;
+use std::rc::Rc;
 
-#[derive(Debug, Clone, PartialEq)]
+use crate::scheme::env::Env;
+
+#[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
     Boolean(bool),
     String(std::string::String),
     Symbol(std::string::String),
     List(Vec<Value>),
+    Lambda {
+        params: Vec<std::string::String>,
+        body: Vec<Value>,
+        env: Rc<RefCell<Env>>,
+    },
     Void,
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Void, Value::Void) => true,
+            (Value::Lambda { .. }, Value::Lambda { .. }) => false,
+            _ => false,
+        }
+    }
 }
 
 impl Value {
@@ -23,6 +47,7 @@ impl Value {
                     elems.iter().map(|v| v.to_display()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Lambda { .. } => "#<procedure>".into(),
             Value::Void => "".into(),
         }
     }

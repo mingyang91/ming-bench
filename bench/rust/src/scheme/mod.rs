@@ -1,9 +1,11 @@
 pub mod error;
+pub(crate) mod env;
 mod parser;
 mod eval;
 mod value;
 
 pub use error::EvalError;
+use env::Env;
 use parser::Parser;
 use eval::eval;
 use value::Value;
@@ -18,9 +20,14 @@ use value::Value;
 /// ```
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = Parser::new(input).parse_all()?;
+    let env = Env::new();
+    // Pre-populate builtins as symbols
+    for name in &["+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not"] {
+        env.borrow_mut().set(name.to_string(), Value::Symbol(name.to_string()));
+    }
     let mut result = Value::Boolean(false);
     for expr in exprs {
-        result = eval(&expr)?;
+        result = eval(&expr, &env)?;
     }
     Ok(result.to_display())
 }
