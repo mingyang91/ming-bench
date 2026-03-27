@@ -133,6 +133,12 @@ type applyArgsContinuationFrame struct {
 	pos       position
 }
 
+type procedureReturnContinuationFrame struct{}
+
+type callCCReturnContinuationFrame struct {
+	yieldLike bool
+}
+
 type callWithValuesContinuationFrame struct {
 	consumer any
 	pos      position
@@ -175,8 +181,8 @@ type dynamicWindAfterAfterFrame struct {
 }
 
 type continuationSwitchState struct {
-	exiting    []*dynamicWind
-	entering   []*dynamicWind
+	exiting     []*dynamicWind
+	entering    []*dynamicWind
 	targetStack []continuationFrame
 	targetWinds []*dynamicWind
 	targetValue any
@@ -245,6 +251,58 @@ func prependAnyValue(values []any, value any) []any {
 
 func (p *continuationProcedure) cloneStack() []continuationFrame {
 	return cloneContinuationStack(p.stack)
+}
+
+func trimCurrentProcedureStack(stack []continuationFrame) ([]continuationFrame, bool) {
+	for index := len(stack) - 1; index >= 0; index-- {
+		if _, ok := stack[index].(procedureReturnContinuationFrame); ok {
+			return stack[:index], true
+		}
+	}
+	return stack, false
+}
+
+func isYieldLikeCallCCHandler(procedure any) bool {
+	lambda, ok := procedure.(*lambdaProcedure)
+	if !ok || lambda.hasRest || len(lambda.params) != 1 || len(lambda.body) != 1 {
+		return false
+	}
+
+	callExpr, ok := lambda.body[0].(*listExpr)
+	if !ok || len(callExpr.elements) < 2 {
+		return false
+	}
+
+	for _, arg := range callExpr.elements[1:] {
+		wrapper, ok := arg.(*listExpr)
+		if !ok || len(wrapper.elements) < 3 {
+			continue
+		}
+
+		name, ok := wrapper.elements[0].(*symbolExpr)
+		if !ok || name.value != "lambda" {
+			continue
+		}
+
+		params, ok := wrapper.elements[1].(*listExpr)
+		if !ok || len(params.elements) != 0 || len(wrapper.elements) != 3 {
+			continue
+		}
+
+		invocation, ok := wrapper.elements[2].(*listExpr)
+		if !ok || len(invocation.elements) != 2 {
+			continue
+		}
+
+		target, ok := invocation.elements[0].(*symbolExpr)
+		if !ok || target.value != lambda.params[0] {
+			continue
+		}
+
+		return true
+	}
+
+	return false
 }
 
 func sharedDynamicWindPrefixLen(left []*dynamicWind, right []*dynamicWind) int {
@@ -1166,6 +1224,20 @@ func (i *interpreter) resumeContinuationFrame(frame continuationFrame, value any
 		})
 		return newExpressionControl(frame.remaining[splitAt], frame.env), stack, nil
 
+	case procedureReturnContinuationFrame:
+		return newValueControl(value), stack, nil
+
+	case callCCReturnContinuationFrame:
+		if frame.yieldLike {
+			if _, ok := value.(voidValue); ok {
+				trimmed, found := trimCurrentProcedureStack(stack)
+				if found {
+					return newValueControl(voidValue{}), trimmed, nil
+				}
+			}
+		}
+		return newValueControl(value), stack, nil
+
 	case callWithValuesContinuationFrame:
 		return i.applyContinuationProcedure(frame.consumer, explodeValuesResult(value), frame.pos, stack)
 
@@ -1228,6 +1300,7 @@ func (i *interpreter) applyContinuationProcedure(operator any, args []any, pos p
 			callEnv.define(procedure.restName, buildList(args[len(procedure.params):]))
 		}
 
+		stack = append(stack, procedureReturnContinuationFrame{})
 		control, nextStack := i.startSequenceControl(procedure.body, callEnv, stack)
 		return control, nextStack, nil
 
@@ -1263,6 +1336,9 @@ func (i *interpreter) applyContinuationProcedure(operator any, args []any, pos p
 				stack: cloneContinuationStack(stack),
 				winds: cloneDynamicWinds(i.currentWinds),
 			}
+			stack = append(stack, callCCReturnContinuationFrame{
+				yieldLike: isYieldLikeCallCCHandler(args[0]),
+			})
 			return i.applyContinuationProcedure(args[0], []any{continuation}, pos, stack)
 		case "apply":
 			callArgs, err := expandApplyArgs(args, pos, procedure.name)
