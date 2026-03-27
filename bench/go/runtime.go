@@ -442,6 +442,8 @@ func newGlobalEnv() *env {
 	global.define("-", builtinProc{name: "-", fn: evalSub})
 	global.define("*", builtinProc{name: "*", fn: evalMul})
 	global.define("/", builtinProc{name: "/", fn: evalDiv})
+	global.define("call/cc", callCCProc{name: "call/cc"})
+	global.define("call-with-current-continuation", callCCProc{name: "call-with-current-continuation"})
 	global.define("<", builtinProc{name: "<", fn: func(args []value) (value, error) {
 		return evalCompare(args, "<", func(a, b numberValue) bool { return a.compare(b) < 0 })
 	}})
@@ -537,56 +539,27 @@ func evalInput(input string) (result string, output string, err error) {
 	defer restoreOutput()
 	restore := pushEvalPos(defaultSourcePos())
 	defer restore()
-
-	last := value(voidValue{})
-
-	for _, expr := range exprs {
-		last, err = evalExpr(expr, env)
-		if err != nil {
-			return "", "", err
-		}
+	last, err := evalSequenceWithContinuation(exprs, env, nil)
+	if err != nil {
+		return "", "", err
 	}
 
 	return last.schemeString(), outputBuilder.String(), nil
 }
 
 func runTailCall(call *tailCall) (value, error) {
-	current := call
-	for current != nil {
-		result, next, err := evalSequenceTail(current.body, current.env)
-		if err != nil {
-			return nil, err
-		}
-		if next == nil {
-			return result, nil
-		}
-		current = next
+	if call == nil {
+		return voidValue{}, nil
 	}
-
-	return voidValue{}, nil
+	return evalSequenceWithContinuation(call.body, call.env, nil)
 }
 
 func evalSequence(exprs []locatedExpr, env *env) (value, error) {
-	last := value(voidValue{})
-	for _, expr := range exprs {
-		var err error
-		last, err = evalExpr(expr, env)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return last, nil
+	return evalSequenceWithContinuation(exprs, env, nil)
 }
 
 func evalExpr(e locatedExpr, env *env) (value, error) {
-	result, tail, err := evalExprTail(e, env)
-	if err != nil {
-		return nil, err
-	}
-	if tail != nil {
-		return runTailCall(tail)
-	}
-	return result, nil
+	return evalWithContinuation(e, env, nil)
 }
 
 func evalSequenceTail(exprs []locatedExpr, env *env) (value, *tailCall, error) {
