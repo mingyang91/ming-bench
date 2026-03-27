@@ -6,21 +6,27 @@ object Evaluator:
   /** Evaluate one or more Scheme expressions and return the string representation of the last result.
     */
   def evalStr(input: String): String =
-    val expressions = SchemeParser.parseProgram(input)
-    if expressions.isEmpty then throw EvalError.at(SourcePos(1, 1), "empty input")
-
-    val globalEnv = Env.topLevel()
-    val result = expressions.foldLeft[Value](Value.Void) { (_, expr) =>
-      eval(expr, globalEnv)
-    }
+    val (result, _) = evalProgram(input)
     SchemeRenderer.render(result)
 
   /** Evaluate Scheme expressions and return both the result string and any captured output from display/write/newline.
     */
   def evalStrWithOutput(input: String): (String, String) =
-    (evalStr(input), "")
+    val (result, output) = evalProgram(input)
+    (SchemeRenderer.render(result), output)
 
-  private def eval(expr: Expr, env: Env): Value =
+  private def evalProgram(input: String): (Value, String) =
+    val expressions = SchemeParser.parseProgram(input)
+    if expressions.isEmpty then throw EvalError.at(SourcePos(1, 1), "empty input")
+
+    val globalEnv = Env.topLevel()
+    val context   = new EvalContext
+    val result = expressions.foldLeft[Value](Value.Void) { (_, expr) =>
+      eval(expr, globalEnv, context)
+    }
+    (result, context.capturedOutput)
+
+  private def eval(expr: Expr, env: Env, context: EvalContext): Value =
     expr match
       case Expr.IntLit(value, _)    => Value.IntVal(value)
       case Expr.BoolLit(value, _)   => Value.BoolVal(value)
@@ -28,36 +34,36 @@ object Evaluator:
       case Expr.Symbol(name, pos) =>
         env.lookup(name).getOrElse(throw EvalError.at(pos, s"unbound variable: $name"))
       case Expr.ListExpr(items, pos) =>
-        evalList(items, env, pos)
+        evalList(items, env, pos, context)
 
-  private def evalList(items: List[Expr], env: Env, pos: SourcePos): Value =
+  private def evalList(items: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
     items match
       case Nil => throw EvalError.at(pos, "cannot evaluate empty list")
       case Expr.Symbol("define", formPos) :: args =>
-        evalDefine(args, env, formPos)
+        evalDefine(args, env, formPos, context)
       case Expr.Symbol("if", formPos) :: args =>
-        evalIf(args, env, formPos)
+        evalIf(args, env, formPos, context)
       case Expr.Symbol("quote", formPos) :: args =>
         evalQuote(args, formPos)
       case Expr.Symbol("lambda", formPos) :: args =>
         evalLambda(args, env, formPos)
       case Expr.Symbol("begin", _) :: args =>
-        evalBegin(args, env)
+        evalBegin(args, env, context)
       case Expr.Symbol("let", formPos) :: args =>
-        evalLet(args, env, formPos)
+        evalLet(args, env, formPos, context)
       case Expr.Symbol("cond", formPos) :: args =>
-        evalCond(args, env, formPos)
+        evalCond(args, env, formPos, context)
       case Expr.Symbol("and", _) :: args =>
-        evalAnd(args, env, Value.BoolVal(true))
+        evalAnd(args, env, Value.BoolVal(true), context)
       case Expr.Symbol("or", _) :: args =>
-        evalOr(args, env)
+        evalOr(args, env, context)
       case head :: args =>
-        applyProcedure(eval(head, env), args, env, head.pos)
+        applyProcedure(eval(head, env, context), args, env, head.pos, context)
 
-  private def evalDefine(args: List[Expr], env: Env, pos: SourcePos): Value =
+  private def evalDefine(args: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
     args match
       case Expr.Symbol(name, _) :: valueExpr :: Nil =>
-        env.define(name, eval(valueExpr, env))
+        env.define(name, eval(valueExpr, env, context))
         Value.Void
       case Expr.ListExpr(Expr.Symbol(name, _) :: params, _) :: body if body.nonEmpty =>
         val closure =
@@ -72,11 +78,11 @@ object Evaluator:
       case _ =>
         throw EvalError.at(pos, "invalid define")
 
-  private def evalIf(args: List[Expr], env: Env, pos: SourcePos): Value =
+  private def evalIf(args: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
     args match
       case conditionExpr :: thenExpr :: elseExpr :: Nil =>
-        if ValueSemantics.isTruthy(eval(conditionExpr, env)) then eval(thenExpr, env)
-        else eval(elseExpr, env)
+        if ValueSemantics.isTruthy(eval(conditionExpr, env, context)) then eval(thenExpr, env, context)
+        else eval(elseExpr, env, context)
       case _ =>
         throw EvalError.at(pos, "if expects exactly 3 arguments")
 
@@ -92,18 +98,18 @@ object Evaluator:
       case _ =>
         throw EvalError.at(pos, "lambda expects parameters and at least one body expression")
 
-  private def evalBegin(args: List[Expr], env: Env): Value =
-    evalSequence(args, env)
+  private def evalBegin(args: List[Expr], env: Env, context: EvalContext): Value =
+    evalSequence(args, env, context)
 
-  private def evalLet(args: List[Expr], env: Env, pos: SourcePos): Value =
+  private def evalLet(args: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
     args match
       case Expr.ListExpr(bindings, _) :: body if body.nonEmpty =>
         val letEnv = env.child()
-        bindLetValues(letEnv, parseLetBindings(bindings), env)
-        evalSequence(body, letEnv)
+        bindLetValues(letEnv, parseLetBindings(bindings), env, context)
+        evalSequence(body, letEnv, context)
       case Expr.Symbol(name, _) :: Expr.ListExpr(bindings, _) :: body if body.nonEmpty =>
         val parsedBindings = parseLetBindings(bindings)
-        val evaluatedArgs  = parsedBindings.map { case (_, valueExpr) => eval(valueExpr, env) }
+        val evaluatedArgs  = parsedBindings.map { case (_, valueExpr) => eval(valueExpr, env, context) }
         val letEnv         = env.child()
         val closure =
           Value.Closure(
@@ -113,13 +119,13 @@ object Evaluator:
             env = letEnv
           )
         letEnv.define(name, closure)
-        invokeProcedure(closure, evaluatedArgs, pos)
+        invokeProcedure(closure, evaluatedArgs, pos, context)
       case _ =>
         throw EvalError.at(pos, "invalid let")
 
-  private def bindLetValues(targetEnv: Env, bindings: List[(String, Expr)], evalEnv: Env): Unit =
+  private def bindLetValues(targetEnv: Env, bindings: List[(String, Expr)], evalEnv: Env, context: EvalContext): Unit =
     bindings.foreach { case (name, valueExpr) =>
-      targetEnv.define(name, eval(valueExpr, evalEnv))
+      targetEnv.define(name, eval(valueExpr, evalEnv, context))
     }
 
   private def parseLetBindings(bindings: List[Expr]): List[(String, Expr)] =
@@ -130,22 +136,22 @@ object Evaluator:
         throw EvalError.at(invalid.pos, "invalid let binding")
     }
 
-  private def evalCond(clauses: List[Expr], env: Env, pos: SourcePos): Value =
+  private def evalCond(clauses: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
     clauses match
       case Nil =>
         Value.Void
       case Expr.ListExpr(Expr.Symbol("else", _) :: body, clausePos) :: remaining =>
         if remaining.nonEmpty then throw EvalError.at(clausePos, "else clause must be last")
         if body.isEmpty then throw EvalError.at(clausePos, "else clause must have a body")
-        evalSequence(body, env)
+        evalSequence(body, env, context)
       case Expr.ListExpr(testExpr :: Nil, _) :: remaining =>
-        val testValue = eval(testExpr, env)
+        val testValue = eval(testExpr, env, context)
         if ValueSemantics.isTruthy(testValue) then testValue
-        else evalCond(remaining, env, pos)
+        else evalCond(remaining, env, pos, context)
       case Expr.ListExpr(testExpr :: body, _) :: remaining =>
-        val testValue = eval(testExpr, env)
-        if ValueSemantics.isTruthy(testValue) then evalSequence(body, env)
-        else evalCond(remaining, env, pos)
+        val testValue = eval(testExpr, env, context)
+        if ValueSemantics.isTruthy(testValue) then evalSequence(body, env, context)
+        else evalCond(remaining, env, pos, context)
       case invalid :: _ =>
         throw EvalError.at(invalid.pos, "invalid cond clause")
 
@@ -160,14 +166,25 @@ object Evaluator:
       case other                => throw EvalError.at(other.pos, "parameter names must be symbols")
     }
 
-  private def applyProcedure(procedure: Value, args: List[Expr], env: Env, pos: SourcePos): Value =
-    val evaluatedArgs = args.map(eval(_, env))
-    invokeProcedure(procedure, evaluatedArgs, pos)
+  private def applyProcedure(
+    procedure: Value,
+    args: List[Expr],
+    env: Env,
+    pos: SourcePos,
+    context: EvalContext
+  ): Value =
+    val evaluatedArgs = args.map(eval(_, env, context))
+    invokeProcedure(procedure, evaluatedArgs, pos, context)
 
-  private def invokeProcedure(procedure: Value, evaluatedArgs: List[Value], pos: SourcePos): Value =
+  private def invokeProcedure(
+    procedure: Value,
+    evaluatedArgs: List[Value],
+    pos: SourcePos,
+    context: EvalContext
+  ): Value =
     procedure match
       case Value.BuiltinProc(name) =>
-        Builtins.invoke(name, evaluatedArgs, pos)
+        Builtins.invoke(name, evaluatedArgs, pos, context)
       case Value.Closure(name, params, body, closureEnv) =>
         if evaluatedArgs.lengthCompare(params.length) != 0 then
           val procName = name.getOrElse("lambda")
@@ -177,29 +194,29 @@ object Evaluator:
         params.zip(evaluatedArgs).foreach { case (param, value) =>
           callEnv.define(param, value)
         }
-        evalSequence(body, callEnv)
+        evalSequence(body, callEnv, context)
       case _ =>
         throw EvalError.at(pos, "attempted to call a non-procedure")
 
-  private def evalSequence(exprs: List[Expr], env: Env): Value =
+  private def evalSequence(exprs: List[Expr], env: Env, context: EvalContext): Value =
     exprs.foldLeft[Value](Value.Void) { (_, expr) =>
-      eval(expr, env)
+      eval(expr, env, context)
     }
 
   @annotation.tailrec
-  private def evalAnd(args: List[Expr], env: Env, lastValue: Value): Value =
+  private def evalAnd(args: List[Expr], env: Env, lastValue: Value, context: EvalContext): Value =
     args match
       case Nil => lastValue
       case head :: tail =>
-        val value = eval(head, env)
-        if ValueSemantics.isTruthy(value) then evalAnd(tail, env, value)
+        val value = eval(head, env, context)
+        if ValueSemantics.isTruthy(value) then evalAnd(tail, env, value, context)
         else value
 
   @annotation.tailrec
-  private def evalOr(args: List[Expr], env: Env): Value =
+  private def evalOr(args: List[Expr], env: Env, context: EvalContext): Value =
     args match
       case Nil => Value.BoolVal(false)
       case head :: tail =>
-        val value = eval(head, env)
+        val value = eval(head, env, context)
         if ValueSemantics.isTruthy(value) then value
-        else evalOr(tail, env)
+        else evalOr(tail, env, context)

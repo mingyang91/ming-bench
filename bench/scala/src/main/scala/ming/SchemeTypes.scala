@@ -13,6 +13,7 @@ private[ming] enum Value:
   case IntVal(value: Int)
   case BoolVal(value: Boolean)
   case StringVal(value: String)
+  case CharVal(value: Char)
   case SymbolVal(name: String)
   case EmptyList
   case PairVal(car: Value, cdr: Value)

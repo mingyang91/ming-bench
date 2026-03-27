@@ -12,6 +12,7 @@ private[ming] object ValueSemantics:
       case Value.IntVal(_)     => "number"
       case Value.BoolVal(_)    => "boolean"
       case Value.StringVal(_)  => "string"
+      case Value.CharVal(_)    => "character"
       case Value.SymbolVal(_)  => "symbol"
       case Value.EmptyList     => "null"
       case Value.PairVal(_, _) => "pair"

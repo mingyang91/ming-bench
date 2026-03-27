@@ -25,34 +25,67 @@ private[ming] object Builtins:
     "number?",
     "string?",
     "boolean?",
-    "symbol?"
-  )
+    "symbol?",
+    "char?",
+    "display",
+    "write",
+    "newline"
+  ) ++ StringBuiltins.names
 
   def resolve(name: String): Option[Value] =
     if builtinNames.contains(name) then Some(Value.BuiltinProc(name))
     else None
 
-  def invoke(name: String, args: List[Value], pos: SourcePos): Value =
+  def invoke(name: String, args: List[Value], pos: SourcePos, context: EvalContext): Value =
+    name match
+      case "+" | "-" | "*" | "/" =>
+        invokeArithmetic(name, args, pos)
+      case "<" | ">" | "=" | "<=" =>
+        invokeComparison(name, args, pos)
+      case "not" | "cons" | "car" | "cdr" | "append" | "list" | "length" =>
+        invokeCoreBuiltin(name, args, pos)
+      case "null?" | "pair?" | "number?" | "string?" | "boolean?" | "symbol?" | "char?" =>
+        invokePredicateBuiltin(name, args, pos)
+      case "display" | "write" | "newline" =>
+        invokeOutputBuiltin(name, args, pos, context)
+      case builtin if StringBuiltins.handles(builtin) =>
+        StringBuiltins.invoke(builtin, args, pos)
+      case _ =>
+        unknownProcedure(name, pos)
+
+  private def invokeArithmetic(name: String, args: List[Value], pos: SourcePos): Value =
     name match
       case "+" =>
         Value.IntVal(evalNumbers(name, args, pos).sum)
       case "-" =>
-        val numbers = requireMinArgs(name, evalNumbers(name, args, pos), min = 1, pos)
-        numbers match
-          case value :: Nil => Value.IntVal(-value)
-          case value :: rest =>
-            Value.IntVal(rest.foldLeft(value)(_ - _))
-          case Nil =>
-            throw EvalError.at(pos, s"$name expects at least 1 argument")
+        subtract(name, args, pos)
       case "*" =>
         Value.IntVal(evalNumbers(name, args, pos).product)
       case "/" =>
-        val numbers = requireMinArgs(name, evalNumbers(name, args, pos), min = 2, pos)
-        val result = numbers.tail.foldLeft(numbers.head) { (acc, divisor) =>
-          if divisor == 0 then throw EvalError.at(pos, "division by zero")
-          acc / divisor
-        }
-        Value.IntVal(result)
+        divide(name, args, pos)
+      case _ =>
+        unknownProcedure(name, pos)
+
+  private def subtract(name: String, args: List[Value], pos: SourcePos): Value =
+    val numbers = requireMinArgs(name, evalNumbers(name, args, pos), min = 1, pos)
+    numbers match
+      case value :: Nil =>
+        Value.IntVal(-value)
+      case value :: rest =>
+        Value.IntVal(rest.foldLeft(value)(_ - _))
+      case Nil =>
+        throw EvalError.at(pos, s"$name expects at least 1 argument")
+
+  private def divide(name: String, args: List[Value], pos: SourcePos): Value =
+    val numbers = requireMinArgs(name, evalNumbers(name, args, pos), min = 2, pos)
+    val result = numbers.tail.foldLeft(numbers.head) { (acc, divisor) =>
+      if divisor == 0 then throw EvalError.at(pos, "division by zero")
+      acc / divisor
+    }
+    Value.IntVal(result)
+
+  private def invokeComparison(name: String, args: List[Value], pos: SourcePos): Value =
+    name match
       case "<" =>
         compareNumbers(name, args, pos)(_ < _)
       case ">" =>
@@ -61,27 +94,34 @@ private[ming] object Builtins:
         compareNumbers(name, args, pos)(_ == _)
       case "<=" =>
         compareNumbers(name, args, pos)(_ <= _)
+      case _ =>
+        unknownProcedure(name, pos)
+
+  private def invokeCoreBuiltin(name: String, args: List[Value], pos: SourcePos): Value =
+    name match
       case "not" =>
-        val values = requireArgCount(name, args, expected = 1, pos)
-        Value.BoolVal(!ValueSemantics.isTruthy(values.head))
+        Value.BoolVal(!ValueSemantics.isTruthy(requireSingleArg(name, args, pos)))
       case "cons" =>
         val values = requireArgCount(name, args, expected = 2, pos)
         Value.PairVal(values.head, values(1))
       case "car" =>
-        val values   = requireArgCount(name, args, expected = 1, pos)
-        val (car, _) = requirePair(name, values.head, pos)
+        val (car, _) = requirePair(name, requireSingleArg(name, args, pos), pos)
         car
       case "cdr" =>
-        val values   = requireArgCount(name, args, expected = 1, pos)
-        val (_, cdr) = requirePair(name, values.head, pos)
+        val (_, cdr) = requirePair(name, requireSingleArg(name, args, pos), pos)
         cdr
       case "append" =>
         append(name, args, pos)
       case "list" =>
         buildList(args)
       case "length" =>
-        val values = requireArgCount(name, args, expected = 1, pos)
-        Value.IntVal(toProperList(name, values.head, pos).length)
+        val value = requireSingleArg(name, args, pos)
+        Value.IntVal(toProperList(name, value, pos).length)
+      case _ =>
+        unknownProcedure(name, pos)
+
+  private def invokePredicateBuiltin(name: String, args: List[Value], pos: SourcePos): Value =
+    name match
       case "null?" =>
         unaryPredicate(name, args, pos) {
           case Value.EmptyList => true
@@ -112,8 +152,39 @@ private[ming] object Builtins:
           case Value.SymbolVal(_) => true
           case _                  => false
         }
+      case "char?" =>
+        unaryPredicate(name, args, pos) {
+          case Value.CharVal(_) => true
+          case _                => false
+        }
       case _ =>
-        throw EvalError.at(pos, s"unknown procedure: $name")
+        unknownProcedure(name, pos)
+
+  private def invokeOutputBuiltin(
+    name: String,
+    args: List[Value],
+    pos: SourcePos,
+    context: EvalContext
+  ): Value =
+    name match
+      case "display" =>
+        context.emit(SchemeRenderer.renderForDisplay(requireSingleArg(name, args, pos)))
+        Value.Void
+      case "write" =>
+        context.emit(SchemeRenderer.render(requireSingleArg(name, args, pos)))
+        Value.Void
+      case "newline" =>
+        requireArgCount(name, args, expected = 0, pos)
+        context.emit("\n")
+        Value.Void
+      case _ =>
+        unknownProcedure(name, pos)
+
+  private def requireSingleArg(name: String, args: List[Value], pos: SourcePos): Value =
+    requireArgCount(name, args, expected = 1, pos).head
+
+  private def unknownProcedure(name: String, pos: SourcePos): Nothing =
+    throw EvalError.at(pos, s"unknown procedure: $name")
 
   private def compareNumbers(
     name: String,
