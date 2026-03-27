@@ -177,6 +177,11 @@ type DoBinding = {
   pos: SourcePosition;
 };
 
+type EvaluationStep =
+  | { kind: 'value'; value: SchemeValue }
+  | { kind: 'expr'; expression: Expr; env: Environment }
+  | { kind: 'apply'; procedure: SchemeValue; args: SchemeValue[]; pos: SourcePosition };
+
 const EMPTY_LIST: EmptyListValue = { kind: 'empty-list' };
 const VOID: VoidValue = { kind: 'void' };
 const EXACT_ZERO: ExactNumberValue = { kind: 'number', exact: true, numerator: 0n, denominator: 1n };
@@ -1006,29 +1011,63 @@ function lookupSyntax(expression: Expr, env: Environment): SyntaxTransformer | u
   return undefined;
 }
 
+function valueStep(value: SchemeValue): EvaluationStep {
+  return { kind: 'value', value };
+}
+
+function exprStep(expression: Expr, env: Environment): EvaluationStep {
+  return { kind: 'expr', expression, env };
+}
+
+function applyStep(procedure: SchemeValue, args: SchemeValue[], pos: SourcePosition): EvaluationStep {
+  return { kind: 'apply', procedure, args, pos };
+}
+
 function evaluate(expression: Expr, env: Environment): SchemeValue {
-  try {
-    switch (expression.kind) {
-      case 'number':
-      case 'boolean':
-        return expression.value;
-      case 'string':
-        return makeString(expression.value);
-      case 'char':
-        return { kind: 'char', value: expression.value };
-      case 'symbol':
-        return env.lookup(expression.name, expression.pos);
-      case 'resolved-symbol':
-        return evaluateSymbol(expression, env);
-      case 'list':
-        return evaluateList(expression.elements, env, expression.pos);
+  return runEvaluation(exprStep(expression, env));
+}
+
+function runEvaluation(initialStep: EvaluationStep): SchemeValue {
+  let step = initialStep;
+
+  while (true) {
+    switch (step.kind) {
+      case 'value':
+        return step.value;
+      case 'expr':
+        const expression = step.expression;
+        try {
+          step = evaluateExpressionStep(expression, step.env);
+        } catch (error) {
+          throw errorWithPosition(error, expression.pos);
+        }
+        break;
+      case 'apply':
+        step = applyProcedureStep(step.procedure, step.args, step.pos);
+        break;
     }
-  } catch (error) {
-    throw errorWithPosition(error, expression.pos);
   }
 }
 
-function evaluateList(elements: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
+function evaluateExpressionStep(expression: Expr, env: Environment): EvaluationStep {
+  switch (expression.kind) {
+    case 'number':
+    case 'boolean':
+      return valueStep(expression.value);
+    case 'string':
+      return valueStep(makeString(expression.value));
+    case 'char':
+      return valueStep({ kind: 'char', value: expression.value });
+    case 'symbol':
+      return valueStep(env.lookup(expression.name, expression.pos));
+    case 'resolved-symbol':
+      return valueStep(evaluateSymbol(expression, env));
+    case 'list':
+      return evaluateListStep(expression.elements, env, expression.pos);
+  }
+}
+
+function evaluateListStep(elements: Expr[], env: Environment, pos: SourcePosition): EvaluationStep {
   if (elements.length === 0) {
     throw new EvalError('cannot evaluate empty list', pos);
   }
@@ -1040,79 +1079,83 @@ function evaluateList(elements: Expr[], env: Environment, pos: SourcePosition): 
   if (operatorName !== undefined) {
     switch (operatorName) {
       case 'and':
-        return evaluateAnd(argumentExprs, env);
+        return evaluateAndStep(argumentExprs, env);
       case 'or':
-        return evaluateOr(argumentExprs, env);
+        return evaluateOrStep(argumentExprs, env);
       case 'if':
-        return evaluateIf(argumentExprs, env, operatorExpr.pos);
+        return evaluateIfStep(argumentExprs, env, operatorExpr.pos);
       case 'define':
-        return evaluateDefine(argumentExprs, env, operatorExpr.pos);
+        return valueStep(evaluateDefine(argumentExprs, env, operatorExpr.pos));
       case 'define-syntax':
-        return evaluateDefineSyntax(argumentExprs, env, operatorExpr.pos);
+        return valueStep(evaluateDefineSyntax(argumentExprs, env, operatorExpr.pos));
       case 'define-record-type':
-        return evaluateDefineRecordType(argumentExprs, env, operatorExpr.pos);
+        return valueStep(evaluateDefineRecordType(argumentExprs, env, operatorExpr.pos));
       case 'quote':
-        return evaluateQuote(argumentExprs, operatorExpr.pos);
+        return valueStep(evaluateQuote(argumentExprs, operatorExpr.pos));
       case 'lambda':
-        return evaluateLambda(argumentExprs, env, operatorExpr.pos);
+        return valueStep(evaluateLambda(argumentExprs, env, operatorExpr.pos));
       case 'case-lambda':
-        return evaluateCaseLambda(argumentExprs, env, operatorExpr.pos);
+        return valueStep(evaluateCaseLambda(argumentExprs, env, operatorExpr.pos));
       case 'begin':
-        return evaluateBegin(argumentExprs, env);
+        return evaluateBeginStep(argumentExprs, env);
       case 'cond':
-        return evaluateCond(argumentExprs, env, operatorExpr.pos);
+        return evaluateCondStep(argumentExprs, env, operatorExpr.pos);
       case 'case':
-        return evaluateCase(argumentExprs, env, operatorExpr.pos);
+        return evaluateCaseStep(argumentExprs, env, operatorExpr.pos);
       case 'let':
-        return evaluateLet(argumentExprs, env, operatorExpr.pos);
+        return evaluateLetStep(argumentExprs, env, operatorExpr.pos);
       case 'letrec':
-        return evaluateLetrec(argumentExprs, env, operatorExpr.pos, false);
+        return evaluateLetrecStep(argumentExprs, env, operatorExpr.pos, false);
       case 'letrec*':
-        return evaluateLetrec(argumentExprs, env, operatorExpr.pos, true);
+        return evaluateLetrecStep(argumentExprs, env, operatorExpr.pos, true);
       case 'do':
-        return evaluateDo(argumentExprs, env, operatorExpr.pos);
+        return valueStep(evaluateDo(argumentExprs, env, operatorExpr.pos));
       case 'set!':
-        return evaluateSet(argumentExprs, env, operatorExpr.pos);
+        return valueStep(evaluateSet(argumentExprs, env, operatorExpr.pos));
     }
 
     const transformer = lookupSyntax(operatorExpr, env);
     if (transformer !== undefined) {
-      return evaluate(expandMacro(transformer, { kind: 'list', elements, pos }), env);
+      return exprStep(expandMacro(transformer, { kind: 'list', elements, pos }), env);
     }
   }
 
   const operator = evaluate(operatorExpr, env);
   const args = argumentExprs.map((argument) => evaluate(argument, env));
-  return applyProcedure(operator, args, operatorExpr.pos);
+  return applyStep(operator, args, operatorExpr.pos);
 }
 
-function evaluateAnd(expressions: Expr[], env: Environment): SchemeValue {
-  let result: SchemeValue = true;
+function evaluateAndStep(expressions: Expr[], env: Environment): EvaluationStep {
+  if (expressions.length === 0) {
+    return valueStep(true);
+  }
 
-  for (const expression of expressions) {
-    result = evaluate(expression, env);
+  for (let index = 0; index < expressions.length - 1; index += 1) {
+    const result = evaluate(expressions[index], env);
     if (isFalse(result)) {
-      return result;
+      return valueStep(result);
     }
   }
 
-  return result;
+  return exprStep(expressions[expressions.length - 1], env);
 }
 
-function evaluateOr(expressions: Expr[], env: Environment): SchemeValue {
-  let result: SchemeValue = false;
+function evaluateOrStep(expressions: Expr[], env: Environment): EvaluationStep {
+  if (expressions.length === 0) {
+    return valueStep(false);
+  }
 
-  for (const expression of expressions) {
-    result = evaluate(expression, env);
+  for (let index = 0; index < expressions.length - 1; index += 1) {
+    const result = evaluate(expressions[index], env);
     if (!isFalse(result)) {
-      return result;
+      return valueStep(result);
     }
   }
 
-  return result;
+  return exprStep(expressions[expressions.length - 1], env);
 }
 
-function evaluateIf(expressions: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
+function evaluateIfStep(expressions: Expr[], env: Environment, pos: SourcePosition): EvaluationStep {
   if (expressions.length !== 2 && expressions.length !== 3) {
     throw new EvalError(`if expected 2 or 3 argument(s), got ${expressions.length}`, pos);
   }
@@ -1121,10 +1164,10 @@ function evaluateIf(expressions: Expr[], env: Environment, pos: SourcePosition):
   const condition = evaluate(conditionExpr, env);
 
   if (isFalse(condition)) {
-    return elseExpr === undefined ? VOID : evaluate(elseExpr, env);
+    return elseExpr === undefined ? valueStep(VOID) : exprStep(elseExpr, env);
   }
 
-  return evaluate(thenExpr, env);
+  return exprStep(thenExpr, env);
 }
 
 function evaluateDefine(expressions: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
@@ -1365,11 +1408,11 @@ function evaluateCaseLambda(expressions: Expr[], env: Environment, pos: SourcePo
   };
 }
 
-function evaluateBegin(expressions: Expr[], env: Environment): SchemeValue {
-  return evaluateSequence(expressions, env);
+function evaluateBeginStep(expressions: Expr[], env: Environment): EvaluationStep {
+  return evaluateSequenceStep(expressions, env);
 }
 
-function evaluateCond(clauses: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
+function evaluateCondStep(clauses: Expr[], env: Environment, pos: SourcePosition): EvaluationStep {
   for (let index = 0; index < clauses.length; index += 1) {
     const clause = clauses[index];
 
@@ -1385,23 +1428,23 @@ function evaluateCond(clauses: Expr[], env: Environment, pos: SourcePosition): S
         throw new EvalError('cond else clause must be last', clause.pos);
       }
 
-      return evaluateSequence(bodyExprs, env);
+      return evaluateSequenceStep(bodyExprs, env);
     }
 
     const testValue = evaluate(testExpr, env);
     if (!isFalse(testValue)) {
       if (bodyExprs.length === 0) {
-        return testValue;
+        return valueStep(testValue);
       }
 
-      return evaluateSequence(bodyExprs, env);
+      return evaluateSequenceStep(bodyExprs, env);
     }
   }
 
-  return VOID;
+  return valueStep(VOID);
 }
 
-function evaluateCase(expressions: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
+function evaluateCaseStep(expressions: Expr[], env: Environment, pos: SourcePosition): EvaluationStep {
   if (expressions.length < 1) {
     throw new EvalError('case expected at least 1 argument', pos);
   }
@@ -1424,7 +1467,7 @@ function evaluateCase(expressions: Expr[], env: Environment, pos: SourcePosition
         throw new EvalError('case else clause must be last', clause.pos);
       }
 
-      return evaluateSequence(bodyExprs, env);
+      return evaluateSequenceStep(bodyExprs, env);
     }
 
     if (datumExpr.kind !== 'list') {
@@ -1433,15 +1476,15 @@ function evaluateCase(expressions: Expr[], env: Environment, pos: SourcePosition
 
     for (const datum of datumExpr.elements) {
       if (isEqValue(key, quoteExpr(datum))) {
-        return evaluateSequence(bodyExprs, env);
+        return evaluateSequenceStep(bodyExprs, env);
       }
     }
   }
 
-  return VOID;
+  return valueStep(VOID);
 }
 
-function evaluateLet(expressions: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
+function evaluateLetStep(expressions: Expr[], env: Environment, pos: SourcePosition): EvaluationStep {
   if (expressions.length < 2) {
     throw new EvalError(`let expected at least 2 argument(s), got ${expressions.length}`, pos);
   }
@@ -1465,7 +1508,7 @@ function evaluateLet(expressions: Expr[], env: Environment, pos: SourcePosition)
     };
 
     letEnv.define(bindingName(nameExpr, 'let'), closure);
-    return applyProcedure(closure, values, nameExpr.pos);
+    return applyStep(closure, values, nameExpr.pos);
   }
 
   const [bindingsExpr, ...bodyExprs] = expressions;
@@ -1477,15 +1520,15 @@ function evaluateLet(expressions: Expr[], env: Environment, pos: SourcePosition)
     letEnv.define(bindings[index].name, values[index]);
   }
 
-  return evaluateSequence(bodyExprs, letEnv);
+  return evaluateSequenceStep(bodyExprs, letEnv);
 }
 
-function evaluateLetrec(
+function evaluateLetrecStep(
   expressions: Expr[],
   env: Environment,
   pos: SourcePosition,
   sequential: boolean,
-): SchemeValue {
+): EvaluationStep {
   if (expressions.length < 2) {
     const name = sequential ? 'letrec*' : 'letrec';
     throw new EvalError(`${name} expected at least 2 argument(s), got ${expressions.length}`, pos);
@@ -1512,7 +1555,7 @@ function evaluateLetrec(
     }
   }
 
-  return evaluateSequence(bodyExprs, letrecEnv);
+  return evaluateSequenceStep(bodyExprs, letrecEnv);
 }
 
 function evaluateDo(expressions: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
@@ -1553,12 +1596,16 @@ function evaluateDo(expressions: Expr[], env: Environment, pos: SourcePosition):
 }
 
 function applyProcedure(value: SchemeValue, args: SchemeValue[], pos: SourcePosition): SchemeValue {
+  return runEvaluation(applyStep(value, args, pos));
+}
+
+function applyProcedureStep(value: SchemeValue, args: SchemeValue[], pos: SourcePosition): EvaluationStep {
   if (isBuiltin(value)) {
-    return value.apply(args, pos);
+    return valueStep(value.apply(args, pos));
   }
 
   if (isClosure(value)) {
-    return applyProcedureClause(value, value.env, args, pos, value.name ?? 'lambda');
+    return applyProcedureClauseStep(value, value.env, args, pos, value.name ?? 'lambda');
   }
 
   if (isCaseLambda(value)) {
@@ -1568,19 +1615,19 @@ function applyProcedure(value: SchemeValue, args: SchemeValue[], pos: SourcePosi
       throw new EvalError(`case-lambda has no matching clause for ${args.length} argument(s)`, pos);
     }
 
-    return applyProcedureClause(clause, value.env, args, pos, value.name ?? 'case-lambda');
+    return applyProcedureClauseStep(clause, value.env, args, pos, value.name ?? 'case-lambda');
   }
 
   throw new EvalError('attempted to call a non-procedure value', pos);
 }
 
-function applyProcedureClause(
+function applyProcedureClauseStep(
   clause: ProcedureClause,
   env: Environment,
   args: SchemeValue[],
   pos: SourcePosition,
   name: string,
-): SchemeValue {
+): EvaluationStep {
   if (clause.restParam === undefined && args.length !== clause.params.length) {
     throw new EvalError(
       `${name} expected ${clause.params.length} argument(s), got ${args.length}`,
@@ -1605,7 +1652,7 @@ function applyProcedureClause(
     callEnv.define(clause.restParam, listToPairs(args.slice(clause.params.length)));
   }
 
-  return evaluateSequence(clause.body, callEnv);
+  return evaluateSequenceStep(clause.body, callEnv);
 }
 
 function matchesClauseArity(clause: ProcedureClause, argCount: number): boolean {
@@ -2985,13 +3032,19 @@ function parseDoBindings(bindingsExpr: Expr): DoBinding[] {
 }
 
 function evaluateSequence(expressions: Expr[], env: Environment): SchemeValue {
-  let result: SchemeValue = VOID;
+  return runEvaluation(evaluateSequenceStep(expressions, env));
+}
 
-  for (const expression of expressions) {
-    result = evaluate(expression, env);
+function evaluateSequenceStep(expressions: Expr[], env: Environment): EvaluationStep {
+  if (expressions.length === 0) {
+    return valueStep(VOID);
   }
 
-  return result;
+  for (let index = 0; index < expressions.length - 1; index += 1) {
+    evaluate(expressions[index], env);
+  }
+
+  return exprStep(expressions[expressions.length - 1], env);
 }
 
 function listRef(value: SchemeValue, index: number, pos: SourcePosition): SchemeValue {

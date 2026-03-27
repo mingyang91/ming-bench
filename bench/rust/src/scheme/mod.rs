@@ -275,6 +275,12 @@ struct EvalState {
     next_hygiene_id: usize,
 }
 
+enum EvalStep {
+    Value(Value),
+    Expr(Expr, Rc<Environment>),
+    Apply(Value, Vec<Value>, Position),
+}
+
 #[derive(Clone)]
 enum TokenKind {
     LParen,
@@ -536,24 +542,45 @@ fn lookup_syntax(expression: &Expr, env: &Rc<Environment>) -> Option<Rc<SyntaxTr
     }
 }
 
-fn evaluate(expression: &Expr, env: Rc<Environment>, state: &mut EvalState) -> EvalResult<Value> {
-    match expression {
-        Expr::Number(value, _) => Ok(Value::Number(*value)),
-        Expr::Boolean(value, _) => Ok(Value::Boolean(*value)),
-        Expr::String(value, _) => Ok(Value::String(make_string(string_to_chars(value), false))),
-        Expr::Char(value, _) => Ok(Value::Char(*value)),
-        Expr::Symbol(name, pos) => env.lookup(name, *pos),
-        Expr::ResolvedSymbol(symbol) => evaluate_symbol(symbol, env),
-        Expr::List(elements, pos) => evaluate_list(elements, *pos, env, state),
+fn run_eval_step(mut step: EvalStep, state: &mut EvalState) -> EvalResult<Value> {
+    loop {
+        step = match step {
+            EvalStep::Value(value) => return Ok(value),
+            EvalStep::Expr(expression, env) => evaluate_step(&expression, env, state)?,
+            EvalStep::Apply(value, args, pos) => apply_procedure_step(value, args, pos, state)?,
+        };
     }
 }
 
-fn evaluate_list(
+fn evaluate(expression: &Expr, env: Rc<Environment>, state: &mut EvalState) -> EvalResult<Value> {
+    run_eval_step(EvalStep::Expr(expression.clone(), env), state)
+}
+
+fn evaluate_step(
+    expression: &Expr,
+    env: Rc<Environment>,
+    state: &mut EvalState,
+) -> EvalResult<EvalStep> {
+    match expression {
+        Expr::Number(value, _) => Ok(EvalStep::Value(Value::Number(*value))),
+        Expr::Boolean(value, _) => Ok(EvalStep::Value(Value::Boolean(*value))),
+        Expr::String(value, _) => Ok(EvalStep::Value(Value::String(make_string(
+            string_to_chars(value),
+            false,
+        )))),
+        Expr::Char(value, _) => Ok(EvalStep::Value(Value::Char(*value))),
+        Expr::Symbol(name, pos) => Ok(EvalStep::Value(env.lookup(name, *pos)?)),
+        Expr::ResolvedSymbol(symbol) => Ok(EvalStep::Value(evaluate_symbol(symbol, env)?)),
+        Expr::List(elements, pos) => evaluate_list_step(elements, *pos, env, state),
+    }
+}
+
+fn evaluate_list_step(
     elements: &[Expr],
     pos: Position,
     env: Rc<Environment>,
     state: &mut EvalState,
-) -> EvalResult<Value> {
+) -> EvalResult<EvalStep> {
     if elements.is_empty() {
         return Err(error_at(pos, "cannot evaluate empty list"));
     }
@@ -566,25 +593,56 @@ fn evaluate_list(
             "and" => return evaluate_and(argument_exprs, env, state),
             "or" => return evaluate_or(argument_exprs, env, state),
             "if" => return evaluate_if(argument_exprs, env, operator_expr.pos(), state),
-            "define" => return evaluate_define(argument_exprs, env, operator_expr.pos(), state),
+            "define" => return Ok(EvalStep::Value(evaluate_define(
+                argument_exprs,
+                env,
+                operator_expr.pos(),
+                state,
+            )?)),
             "define-record-type" => {
-                return evaluate_define_record_type(argument_exprs, env, operator_expr.pos())
+                return Ok(EvalStep::Value(evaluate_define_record_type(
+                    argument_exprs,
+                    env,
+                    operator_expr.pos(),
+                )?))
             }
             "define-syntax" => {
-                return evaluate_define_syntax(argument_exprs, env, operator_expr.pos())
+                return Ok(EvalStep::Value(evaluate_define_syntax(
+                    argument_exprs,
+                    env,
+                    operator_expr.pos(),
+                )?))
             }
-            "quote" => return evaluate_quote(argument_exprs, operator_expr.pos()),
-            "lambda" => return evaluate_lambda(argument_exprs, env, operator_expr.pos()),
+            "quote" => {
+                return Ok(EvalStep::Value(evaluate_quote(
+                    argument_exprs,
+                    operator_expr.pos(),
+                )?))
+            }
+            "lambda" => {
+                return Ok(EvalStep::Value(evaluate_lambda(
+                    argument_exprs,
+                    env,
+                    operator_expr.pos(),
+                )?))
+            }
             "begin" => return evaluate_begin(argument_exprs, env, state),
             "cond" => return evaluate_cond(argument_exprs, env, operator_expr.pos(), state),
             "let" => return evaluate_let(argument_exprs, env, operator_expr.pos(), state),
-            "set!" => return evaluate_set(argument_exprs, env, operator_expr.pos(), state),
+            "set!" => {
+                return Ok(EvalStep::Value(evaluate_set(
+                    argument_exprs,
+                    env,
+                    operator_expr.pos(),
+                    state,
+                )?))
+            }
             _ => {}
         }
 
         if let Some(transformer) = lookup_syntax(operator_expr, &env) {
             let expanded = expand_macro(&transformer, &Expr::List(elements.to_vec(), pos), state)?;
-            return evaluate(&expanded, env, state);
+            return Ok(EvalStep::Expr(expanded, env));
         }
     }
 
@@ -595,41 +653,45 @@ fn evaluate_list(
         args.push(evaluate(argument, Rc::clone(&env), state)?);
     }
 
-    apply_procedure(operator, args, operator_expr.pos(), state)
+    Ok(EvalStep::Apply(operator, args, operator_expr.pos()))
 }
 
 fn evaluate_and(
     expressions: &[Expr],
     env: Rc<Environment>,
     state: &mut EvalState,
-) -> EvalResult<Value> {
-    let mut result = Value::Boolean(true);
+) -> EvalResult<EvalStep> {
+    let Some((last, initial)) = expressions.split_last() else {
+        return Ok(EvalStep::Value(Value::Boolean(true)));
+    };
 
-    for expression in expressions {
-        result = evaluate(expression, Rc::clone(&env), state)?;
+    for expression in initial {
+        let result = evaluate(expression, Rc::clone(&env), state)?;
         if is_false(&result) {
-            return Ok(result);
+            return Ok(EvalStep::Value(result));
         }
     }
 
-    Ok(result)
+    Ok(EvalStep::Expr(last.clone(), env))
 }
 
 fn evaluate_or(
     expressions: &[Expr],
     env: Rc<Environment>,
     state: &mut EvalState,
-) -> EvalResult<Value> {
-    let mut result = Value::Boolean(false);
+) -> EvalResult<EvalStep> {
+    let Some((last, initial)) = expressions.split_last() else {
+        return Ok(EvalStep::Value(Value::Boolean(false)));
+    };
 
-    for expression in expressions {
-        result = evaluate(expression, Rc::clone(&env), state)?;
+    for expression in initial {
+        let result = evaluate(expression, Rc::clone(&env), state)?;
         if !is_false(&result) {
-            return Ok(result);
+            return Ok(EvalStep::Value(result));
         }
     }
 
-    Ok(result)
+    Ok(EvalStep::Expr(last.clone(), env))
 }
 
 fn evaluate_if(
@@ -637,7 +699,7 @@ fn evaluate_if(
     env: Rc<Environment>,
     pos: Position,
     state: &mut EvalState,
-) -> EvalResult<Value> {
+) -> EvalResult<EvalStep> {
     if expressions.len() != 3 {
         return Err(error_at(
             pos,
@@ -648,9 +710,9 @@ fn evaluate_if(
     let condition = evaluate(&expressions[0], Rc::clone(&env), state)?;
 
     if is_false(&condition) {
-        evaluate(&expressions[2], env, state)
+        Ok(EvalStep::Expr(expressions[2].clone(), env))
     } else {
-        evaluate(&expressions[1], env, state)
+        Ok(EvalStep::Expr(expressions[1].clone(), env))
     }
 }
 
@@ -863,8 +925,8 @@ fn evaluate_begin(
     expressions: &[Expr],
     env: Rc<Environment>,
     state: &mut EvalState,
-) -> EvalResult<Value> {
-    evaluate_sequence(expressions, env, state)
+) -> EvalResult<EvalStep> {
+    evaluate_sequence_step(expressions, env, state)
 }
 
 fn evaluate_cond(
@@ -872,7 +934,7 @@ fn evaluate_cond(
     env: Rc<Environment>,
     _pos: Position,
     state: &mut EvalState,
-) -> EvalResult<Value> {
+) -> EvalResult<EvalStep> {
     for (index, clause) in clauses.iter().enumerate() {
         let elements = match clause {
             Expr::List(elements, _) if !elements.is_empty() => elements,
@@ -888,20 +950,20 @@ fn evaluate_cond(
                 return Err(error_at(clause.pos(), "cond else clause must be last"));
             }
 
-            return evaluate_sequence(body_exprs, env, state);
+            return evaluate_sequence_step(body_exprs, env, state);
         }
 
         let test_value = evaluate(test_expr, Rc::clone(&env), state)?;
         if !is_false(&test_value) {
             if body_exprs.is_empty() {
-                return Ok(test_value);
+                return Ok(EvalStep::Value(test_value));
             }
 
-            return evaluate_sequence(body_exprs, env, state);
+            return evaluate_sequence_step(body_exprs, env, state);
         }
     }
 
-    Ok(Value::Void)
+    Ok(EvalStep::Value(Value::Void))
 }
 
 fn evaluate_let(
@@ -909,7 +971,7 @@ fn evaluate_let(
     env: Rc<Environment>,
     pos: Position,
     state: &mut EvalState,
-) -> EvalResult<Value> {
+) -> EvalResult<EvalStep> {
     if expressions.len() < 2 {
         return Err(error_at(
             pos,
@@ -950,7 +1012,7 @@ fn evaluate_let(
         }));
 
         let_env.define(loop_key, closure.clone());
-        return apply_procedure(closure, values, expressions[0].pos(), state);
+        return Ok(EvalStep::Apply(closure, values, expressions[0].pos()));
     }
 
     let bindings = parse_bindings(&expressions[0], "let")?;
@@ -967,7 +1029,7 @@ fn evaluate_let(
         let_env.define(let_name, value);
     }
 
-    evaluate_sequence(&expressions[1..], let_env, state)
+    evaluate_sequence_step(&expressions[1..], let_env, state)
 }
 
 fn apply_procedure(
@@ -976,8 +1038,19 @@ fn apply_procedure(
     pos: Position,
     state: &mut EvalState,
 ) -> EvalResult<Value> {
+    run_eval_step(EvalStep::Apply(value, args, pos), state)
+}
+
+fn apply_procedure_step(
+    value: Value,
+    args: Vec<Value>,
+    pos: Position,
+    state: &mut EvalState,
+) -> EvalResult<EvalStep> {
     match value {
-        Value::Builtin(builtin) => apply_builtin(builtin, &args, pos, state),
+        Value::Builtin(builtin) => Ok(EvalStep::Value(apply_builtin(
+            builtin, &args, pos, state,
+        )?)),
         Value::Closure(closure) => {
             if closure.rest_param.is_none() && args.len() != closure.params.len() {
                 return Err(error_at(
@@ -1016,7 +1089,7 @@ fn apply_procedure(
                 );
             }
 
-            evaluate_sequence(&closure.body, call_env, state)
+            evaluate_sequence_step(&closure.body, call_env, state)
         }
         Value::RecordConstructor(record_type, name, field_indices) => {
             if args.len() != field_indices.len() {
@@ -1035,16 +1108,22 @@ fn apply_procedure(
                 fields[field_index] = arg;
             }
 
-            Ok(Value::Record(Rc::new(Record { record_type, fields })))
+            Ok(EvalStep::Value(Value::Record(Rc::new(Record {
+                record_type,
+                fields,
+            }))))
         }
         Value::RecordPredicate(record_type, name) => {
             expect_arity(&name, &args, 1, pos)?;
-            Ok(Value::Boolean(matches_record_type(&args[0], &record_type)))
+            Ok(EvalStep::Value(Value::Boolean(matches_record_type(
+                &args[0],
+                &record_type,
+            ))))
         }
         Value::RecordAccessor(record_type, field_index, name) => {
             expect_arity(&name, &args, 1, pos)?;
             let record = expect_record_type(&args[0], &record_type, &name, pos)?;
-            Ok(record.fields[field_index].clone())
+            Ok(EvalStep::Value(record.fields[field_index].clone()))
         }
         _ => Err(error_at(pos, "attempted to call a non-procedure value")),
     }
@@ -2701,13 +2780,23 @@ fn evaluate_sequence(
     env: Rc<Environment>,
     state: &mut EvalState,
 ) -> EvalResult<Value> {
-    let mut result = Value::Void;
+    run_eval_step(evaluate_sequence_step(expressions, env, state)?, state)
+}
 
-    for expression in expressions {
-        result = evaluate(expression, Rc::clone(&env), state)?;
+fn evaluate_sequence_step(
+    expressions: &[Expr],
+    env: Rc<Environment>,
+    state: &mut EvalState,
+) -> EvalResult<EvalStep> {
+    let Some((last, initial)) = expressions.split_last() else {
+        return Ok(EvalStep::Value(Value::Void));
+    };
+
+    for expression in initial {
+        evaluate(expression, Rc::clone(&env), state)?;
     }
 
-    Ok(result)
+    Ok(EvalStep::Expr(last.clone(), env))
 }
 
 fn list_to_vec(value: &Value, name: &str, pos: Position) -> EvalResult<Vec<Value>> {
