@@ -8,6 +8,21 @@ use crate::scheme::value::{Value, ContData};
 pub type Output = Rc<RefCell<String>>;
 
 // ---------------------------------------------------------------------------
+// dynamic-wind support: winder stack
+// ---------------------------------------------------------------------------
+
+type Winders = Vec<(usize, Value, Value)>; // (id, in_thunk, out_thunk)
+
+static WINDER_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+fn next_winder_id() -> usize {
+    WINDER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn winder_common_prefix(a: &Winders, b: &Winders) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x.0 == y.0).count()
+}
+
+// ---------------------------------------------------------------------------
 // Continuation (explicit frame stack for the CEK machine)
 // ---------------------------------------------------------------------------
 
@@ -103,6 +118,30 @@ pub(crate) enum Cont {
         env: Rc<RefCell<Env>>,
         next: Rc<Cont>,
     },
+    /// dynamic-wind: in-thunk just evaluated, push winder, call body-thunk
+    DynWindIn {
+        in_thunk: Value,
+        body_thunk: Value,
+        out_thunk: Value,
+        next: Rc<Cont>,
+    },
+    /// dynamic-wind: body-thunk returned, pop winder, call out-thunk
+    DynWindBody {
+        out_thunk: Value,
+        next: Rc<Cont>,
+    },
+    /// dynamic-wind: out-thunk returned, deliver saved body value
+    DynWindOut {
+        body_val: Value,
+        next: Rc<Cont>,
+    },
+    /// Chain of thunks to call during continuation unwind/rewind
+    DynWindDoThunks {
+        thunks: Vec<Value>,
+        final_val: Value,
+        final_cont: Rc<Cont>,
+        final_winders: Winders,
+    },
 }
 
 enum CekAction {
@@ -137,17 +176,20 @@ fn transform_cont_for_capture(k: &Rc<Cont>) -> Rc<Cont> {
     }
 }
 
-// Helper: wrap Rc<Cont> into Value::Continuation
-fn cont_to_value(k: &Rc<Cont>) -> Value {
-    let boxed: Rc<dyn std::any::Any> = Rc::new(Rc::clone(k));
+type CapturedContData = (Rc<Cont>, Winders);
+
+// Helper: wrap Rc<Cont> + winders into Value::Continuation
+fn cont_to_value(k: &Rc<Cont>, winders: &Winders) -> Value {
+    let data: CapturedContData = (Rc::clone(k), winders.clone());
+    let boxed: Rc<dyn std::any::Any> = Rc::new(data);
     Value::Continuation(ContData(boxed))
 }
 
-// Helper: extract Rc<Cont> from Value::Continuation
-fn value_to_cont(v: &Value) -> Rc<Cont> {
+// Helper: extract Rc<Cont> + winders from Value::Continuation
+fn value_to_cont(v: &Value) -> (Rc<Cont>, Winders) {
     match v {
         Value::Continuation(cd) => {
-            cd.0.downcast_ref::<Rc<Cont>>().expect("invalid continuation data").clone()
+            cd.0.downcast_ref::<CapturedContData>().expect("invalid continuation data").clone()
         }
         _ => panic!("not a continuation"),
     }
@@ -274,6 +316,7 @@ fn apply_cek(
     ctrl: &mut Value,
     env: &mut Rc<RefCell<Env>>,
     kont: &mut Rc<Cont>,
+    winders: &mut Winders,
 ) -> Result<CekAction, EvalError> {
     match func {
         Value::Lambda { params, rest_param, body, env: lenv } => {
@@ -317,8 +360,35 @@ fn apply_cek(
             if args.len() != 1 {
                 return Err(EvalError::Arity("continuation requires 1 argument".into()));
             }
-            *kont = value_to_cont(func);
-            Ok(CekAction::Value(args[0].clone()))
+            let (target_cont, target_winders) = value_to_cont(func);
+            let target_val = args[0].clone();
+
+            let common = winder_common_prefix(winders, &target_winders);
+
+            // Build thunk sequence: unwind current (out-thunks, innermost first),
+            // then rewind target (in-thunks, outermost first)
+            let mut thunks = Vec::new();
+            for i in (common..winders.len()).rev() {
+                thunks.push(winders[i].2.clone());
+            }
+            for i in common..target_winders.len() {
+                thunks.push(target_winders[i].1.clone());
+            }
+
+            if thunks.is_empty() {
+                *kont = target_cont;
+                *winders = target_winders;
+                Ok(CekAction::Value(target_val))
+            } else {
+                let first = thunks.remove(0);
+                *kont = Rc::new(Cont::DynWindDoThunks {
+                    thunks,
+                    final_val: target_val,
+                    final_cont: target_cont,
+                    final_winders: target_winders,
+                });
+                apply_cek(&first, &[], out, ctrl, env, kont, winders)
+            }
         }
         Value::Symbol(op) => {
             if op == "apply" {
@@ -330,15 +400,15 @@ fn apply_cek(
                 let tail = value_to_vec(last)?;
                 let mut full: Vec<Value> = args[1..args.len() - 1].to_vec();
                 full.extend(tail);
-                return apply_cek(inner, &full, out, ctrl, env, kont);
+                return apply_cek(inner, &full, out, ctrl, env, kont, winders);
             }
             if op == "call/cc" || op == "call-with-current-continuation" {
                 // First-class call/cc: (apply call/cc (list f)) or similar
                 if args.len() != 1 {
                     return Err(EvalError::Arity("call/cc requires 1 argument".into()));
                 }
-                let continuation = cont_to_value(kont);
-                return apply_cek(&args[0], &[continuation], out, ctrl, env, kont);
+                let continuation = cont_to_value(kont, winders);
+                return apply_cek(&args[0], &[continuation], out, ctrl, env, kont, winders);
             }
             Ok(CekAction::Value(apply_builtin(op, args, out)?))
         }
@@ -382,6 +452,7 @@ fn cek_eval(
     let mut ctrl = init_ctrl;
     let mut env = init_env;
     let mut kont = init_kont;
+    let mut winders: Winders = Vec::new();
 
     loop {
         // ===== EVAL PHASE: reduce ctrl to a value =====
@@ -590,6 +661,26 @@ fn cek_eval(
                                 continue;
                             }
 
+                            // ---- dynamic-wind ----
+                            "dynamic-wind" => {
+                                if elems.len() != 4 {
+                                    return Err(EvalError::Arity("dynamic-wind requires 3 arguments".into()));
+                                }
+                                let in_thunk = eval(&elems[1], &env, out)?;
+                                let body_thunk = eval(&elems[2], &env, out)?;
+                                let out_thunk = eval(&elems[3], &env, out)?;
+                                kont = Rc::new(Cont::DynWindIn {
+                                    in_thunk: in_thunk.clone(),
+                                    body_thunk,
+                                    out_thunk,
+                                    next: kont,
+                                });
+                                match apply_cek(&in_thunk, &[], out, &mut ctrl, &mut env, &mut kont, &mut winders)? {
+                                    CekAction::Value(v) => break v,
+                                    CekAction::Eval => continue,
+                                }
+                            }
+
                             // ---- macro / fall-through ----
                             _ => {
                                 let maybe_macro = env.borrow().get(op).ok();
@@ -638,7 +729,7 @@ fn cek_eval(
                                 break apply_builtin(op, &args, out)?;
                             }
                             other => {
-                                match apply_cek(&other, &args, out, &mut ctrl, &mut env, &mut kont)? {
+                                match apply_cek(&other, &args, out, &mut ctrl, &mut env, &mut kont, &mut winders)? {
                                     CekAction::Value(v) => break v,
                                     CekAction::Eval => continue,
                                 }
@@ -675,7 +766,7 @@ fn cek_eval(
                         let func = ev.remove(0);
                         let args = ev;
                         kont = Rc::clone(next);
-                        match apply_cek(&func, &args, out, &mut ctrl, &mut env, &mut kont)? {
+                        match apply_cek(&func, &args, out, &mut ctrl, &mut env, &mut kont, &mut winders)? {
                             CekAction::Value(v) => { val = v; continue; }
                             CekAction::Eval => { break; }
                         }
@@ -945,9 +1036,9 @@ fn cek_eval(
                 Cont::CallCC { next } => {
                     let proc = std::mem::replace(&mut val, Value::Void);
                     let transformed = transform_cont_for_capture(next);
-                    let captured = cont_to_value(&transformed);
+                    let captured = cont_to_value(&transformed, &winders);
                     kont = Rc::clone(next);
-                    match apply_cek(&proc, &[captured], out, &mut ctrl, &mut env, &mut kont)? {
+                    match apply_cek(&proc, &[captured], out, &mut ctrl, &mut env, &mut kont, &mut winders)? {
                         CekAction::Value(v) => { val = v; continue; }
                         CekAction::Eval => { break; }
                     }
@@ -969,7 +1060,66 @@ fn cek_eval(
                         args.push(eval(expr, renv, out)?);
                     }
                     kont = Rc::clone(next);
-                    match apply_cek(&func_val, &args, out, &mut ctrl, &mut env, &mut kont)? {
+                    match apply_cek(&func_val, &args, out, &mut ctrl, &mut env, &mut kont, &mut winders)? {
+                        CekAction::Value(v) => { val = v; continue; }
+                        CekAction::Eval => { break; }
+                    }
+                }
+
+                // --- DynWindIn: in-thunk returned, push winder, call body-thunk ---
+                Cont::DynWindIn { in_thunk, body_thunk, out_thunk, next } => {
+                    let wid = next_winder_id();
+                    winders.push((wid, in_thunk.clone(), out_thunk.clone()));
+                    let body_thunk = body_thunk.clone();
+                    kont = Rc::new(Cont::DynWindBody {
+                        out_thunk: out_thunk.clone(),
+                        next: Rc::clone(next),
+                    });
+                    match apply_cek(&body_thunk, &[], out, &mut ctrl, &mut env, &mut kont, &mut winders)? {
+                        CekAction::Value(v) => { val = v; continue; }
+                        CekAction::Eval => { break; }
+                    }
+                }
+
+                // --- DynWindBody: body returned, pop winder, call out-thunk ---
+                Cont::DynWindBody { out_thunk, next } => {
+                    let body_val = std::mem::replace(&mut val, Value::Void);
+                    winders.pop();
+                    let out_thunk = out_thunk.clone();
+                    kont = Rc::new(Cont::DynWindOut {
+                        body_val,
+                        next: Rc::clone(next),
+                    });
+                    match apply_cek(&out_thunk, &[], out, &mut ctrl, &mut env, &mut kont, &mut winders)? {
+                        CekAction::Value(v) => { val = v; continue; }
+                        CekAction::Eval => { break; }
+                    }
+                }
+
+                // --- DynWindOut: out-thunk returned, deliver saved body value ---
+                Cont::DynWindOut { body_val, next } => {
+                    val = body_val.clone();
+                    kont = Rc::clone(next);
+                    continue;
+                }
+
+                // --- DynWindDoThunks: chain of thunks for unwind/rewind ---
+                Cont::DynWindDoThunks { thunks, final_val, final_cont, final_winders } => {
+                    if thunks.is_empty() {
+                        winders = final_winders.clone();
+                        val = final_val.clone();
+                        kont = Rc::clone(final_cont);
+                        continue;
+                    }
+                    let next_thunk = thunks[0].clone();
+                    let remaining = thunks[1..].to_vec();
+                    kont = Rc::new(Cont::DynWindDoThunks {
+                        thunks: remaining,
+                        final_val: final_val.clone(),
+                        final_cont: Rc::clone(final_cont),
+                        final_winders: final_winders.clone(),
+                    });
+                    match apply_cek(&next_thunk, &[], out, &mut ctrl, &mut env, &mut kont, &mut winders)? {
                         CekAction::Value(v) => { val = v; continue; }
                         CekAction::Eval => { break; }
                     }
