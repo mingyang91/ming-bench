@@ -1,9 +1,19 @@
+mod procedure;
+mod sequence;
+
+pub(super) use self::procedure::{apply_procedure, quote_expr};
+use self::procedure::exact_int;
+use self::sequence::{
+    apply_append, apply_assoc, apply_assv, apply_car, apply_cddr, apply_cdr, apply_cons,
+    apply_for_each, apply_length, apply_list, apply_list_pred, apply_list_ref,
+    apply_list_tail, apply_list_to_vector, apply_make_vector, apply_map, apply_member,
+    apply_null, apply_reverse, apply_set_car, apply_set_cdr, apply_vector, apply_vector_length,
+    apply_vector_pred, apply_vector_ref, apply_vector_set, apply_vector_to_list,
+};
 use super::{
-    eval_program_tail,
     number::{parse_number_token, Number, Rational},
-    values_eq, values_equal, BuiltinFn, EnvRef, Environment, EvalError, EvaluatedArg, Expr,
-    PairValue, Position, Procedure, RecordType, RecordValue, SchemeString, TailEvalResult, Value,
-    VectorValue,
+    list_from_values, values_eq, values_equal, BuiltinFn, EnvRef, Environment, EvalError,
+    EvaluatedArg, Procedure, RecordType, RecordValue, SchemeString, Value,
 };
 use std::{cell::RefCell, cmp::Ordering, rc::Rc};
 
@@ -15,12 +25,16 @@ pub(super) fn default_env() -> EnvRef {
         ("*", apply_mul as BuiltinFn),
         ("/", apply_div as BuiltinFn),
         ("abs", apply_abs as BuiltinFn),
+        ("gcd", apply_gcd as BuiltinFn),
+        ("lcm", apply_lcm as BuiltinFn),
         ("modulo", apply_modulo as BuiltinFn),
         ("remainder", apply_remainder as BuiltinFn),
         ("quotient", apply_quotient as BuiltinFn),
         ("min", apply_min as BuiltinFn),
         ("max", apply_max as BuiltinFn),
         ("expt", apply_expt as BuiltinFn),
+        ("truncate", apply_truncate as BuiltinFn),
+        ("round", apply_round as BuiltinFn),
         ("<", apply_lt as BuiltinFn),
         (">", apply_gt as BuiltinFn),
         ("=", apply_eq as BuiltinFn),
@@ -33,15 +47,22 @@ pub(super) fn default_env() -> EnvRef {
         ("cons", apply_cons as BuiltinFn),
         ("car", apply_car as BuiltinFn),
         ("cdr", apply_cdr as BuiltinFn),
+        ("cddr", apply_cddr as BuiltinFn),
+        ("set-car!", apply_set_car as BuiltinFn),
+        ("set-cdr!", apply_set_cdr as BuiltinFn),
         ("null?", apply_null as BuiltinFn),
         ("list", apply_list as BuiltinFn),
         ("list?", apply_list_pred as BuiltinFn),
         ("length", apply_length as BuiltinFn),
         ("list-ref", apply_list_ref as BuiltinFn),
         ("list-tail", apply_list_tail as BuiltinFn),
+        ("member", apply_member as BuiltinFn),
+        ("assv", apply_assv as BuiltinFn),
         ("assoc", apply_assoc as BuiltinFn),
         ("append", apply_append as BuiltinFn),
+        ("reverse", apply_reverse as BuiltinFn),
         ("map", apply_map as BuiltinFn),
+        ("for-each", apply_for_each as BuiltinFn),
         ("vector", apply_vector as BuiltinFn),
         ("make-vector", apply_make_vector as BuiltinFn),
         ("vector-ref", apply_vector_ref as BuiltinFn),
@@ -73,6 +94,8 @@ pub(super) fn default_env() -> EnvRef {
         ("display", apply_display as BuiltinFn),
         ("write", apply_write as BuiltinFn),
         ("newline", apply_newline as BuiltinFn),
+        ("make-string", apply_make_string as BuiltinFn),
+        ("string", apply_string as BuiltinFn),
         ("string-append", apply_string_append as BuiltinFn),
         ("string-copy", apply_string_copy as BuiltinFn),
         ("string->list", apply_string_to_list as BuiltinFn),
@@ -87,6 +110,9 @@ pub(super) fn default_env() -> EnvRef {
         ("string-set!", apply_string_set as BuiltinFn),
         ("string=?", apply_string_eq_pred as BuiltinFn),
         ("string<?", apply_string_lt_pred as BuiltinFn),
+        ("string>?", apply_string_gt_pred as BuiltinFn),
+        ("string<=?", apply_string_lte_pred as BuiltinFn),
+        ("string>=?", apply_string_gte_pred as BuiltinFn),
         ("string-ci=?", apply_string_ci_eq_pred as BuiltinFn),
         ("string-upcase", apply_string_upcase as BuiltinFn),
         ("string-downcase", apply_string_downcase as BuiltinFn),
@@ -108,189 +134,23 @@ pub(super) fn default_env() -> EnvRef {
     env
 }
 
-pub(super) fn quote_expr(expr: &Expr) -> Value {
-    match expr {
-        Expr::Bool { value, .. } => Value::Bool(*value),
-        Expr::Number { value, .. } => Value::Number(*value),
-        Expr::Char { value, .. } => Value::Char(*value),
-        Expr::String { value, .. } => Value::String(SchemeString::immutable(value)),
-        Expr::Symbol { name, .. } => Value::Symbol(name.clone()),
-        Expr::List { items, .. } => Value::List(items.iter().map(quote_expr).collect()),
+fn gcd_i64(mut left: i64, mut right: i64) -> i64 {
+    left = left.abs();
+    right = right.abs();
+    while right != 0 {
+        let next = left % right;
+        left = right;
+        right = next;
     }
+    left
 }
 
-pub(super) fn apply_procedure(
-    value: Value,
-    args: &[EvaluatedArg],
-    output: &mut String,
-) -> Result<Value, EvalError> {
-    let mut current_value = value;
-    let mut current_args = args.to_vec();
-    let mut call_pos = None;
-
-    loop {
-        let procedure = match current_value {
-            Value::Procedure(ref procedure) => procedure.clone(),
-            _ => {
-                return Err(attach_call_position(
-                    EvalError::NotAProcedure {
-                        found: current_value.render(),
-                    },
-                    call_pos,
-                ));
-            }
-        };
-
-        match procedure.as_ref() {
-            Procedure::Builtin { func, .. } => {
-                return with_call_position(func(&current_args, output), call_pos);
-            }
-            Procedure::Lambda { params, body, env } => {
-                let call_env = with_call_position(
-                    prepare_lambda_call_env("lambda", params, env, &current_args),
-                    call_pos,
-                )?;
-                match eval_program_tail(body, call_env, output)? {
-                    TailEvalResult::Value(value) => return Ok(value),
-                    TailEvalResult::Call {
-                        procedure,
-                        args,
-                        pos,
-                    } => {
-                        current_value = procedure;
-                        current_args = args;
-                        call_pos = Some(pos);
-                    }
-                }
-            }
-            Procedure::CaseLambda { clauses, env } => {
-                let clause = with_call_position(
-                    clauses
-                        .iter()
-                        .find(|clause| clause.params.matches_arity(current_args.len()))
-                        .ok_or(EvalError::WrongArgCount {
-                            name: "case-lambda",
-                            expected: "matching clause",
-                            got: current_args.len(),
-                        }),
-                    call_pos,
-                )?;
-
-                let call_env = with_call_position(
-                    prepare_lambda_call_env("case-lambda", &clause.params, env, &current_args),
-                    call_pos,
-                )?;
-
-                match eval_program_tail(&clause.body, call_env, output)? {
-                    TailEvalResult::Value(value) => return Ok(value),
-                    TailEvalResult::Call {
-                        procedure,
-                        args,
-                        pos,
-                    } => {
-                        current_value = procedure;
-                        current_args = args;
-                        call_pos = Some(pos);
-                    }
-                }
-            }
-            Procedure::RecordConstructor {
-                record_type,
-                field_count,
-                ..
-            } => {
-                return with_call_position(
-                    apply_record_constructor(record_type.clone(), *field_count, &current_args),
-                    call_pos,
-                );
-            }
-            Procedure::RecordPredicate { record_type, .. } => {
-                return with_call_position(
-                    apply_record_predicate(record_type, &current_args),
-                    call_pos,
-                );
-            }
-            Procedure::RecordAccessor {
-                record_type,
-                field_index,
-                ..
-            } => {
-                return with_call_position(
-                    apply_record_accessor(record_type, *field_index, &current_args),
-                    call_pos,
-                );
-            }
-            Procedure::RecordMutator {
-                record_type,
-                field_index,
-                ..
-            } => {
-                return with_call_position(
-                    apply_record_mutator(record_type, *field_index, &current_args),
-                    call_pos,
-                );
-            }
-        }
+fn number_to_truncated_i64(number: Number) -> Option<i64> {
+    match number {
+        Number::Exact(rational) => Some(rational.numerator() / rational.denominator()),
+        Number::Inexact(value) if value.is_finite() => Some(value.trunc() as i64),
+        Number::Inexact(_) => None,
     }
-}
-
-fn with_call_position<T>(
-    result: Result<T, EvalError>,
-    pos: Option<Position>,
-) -> Result<T, EvalError> {
-    match pos {
-        Some(pos) => result.map_err(|error| error.with_position(pos.line, pos.col)),
-        None => result,
-    }
-}
-
-fn attach_call_position(error: EvalError, pos: Option<Position>) -> EvalError {
-    match pos {
-        Some(pos) => error.with_position(pos.line, pos.col),
-        None => error,
-    }
-}
-
-fn prepare_lambda_call_env(
-    name: &'static str,
-    params: &super::LambdaParams,
-    env: &EnvRef,
-    args: &[EvaluatedArg],
-) -> Result<EnvRef, EvalError> {
-    if args.len() < params.fixed_arity() {
-        return Err(EvalError::WrongArgCountAtLeast {
-            name,
-            min: params.fixed_arity(),
-            got: args.len(),
-        });
-    }
-
-    if !params.matches_arity(args.len()) {
-        return Err(EvalError::WrongArgCount {
-            name,
-            expected: "exact parameter count",
-            got: args.len(),
-        });
-    }
-
-    let call_env = Environment::new(Some(env.clone()));
-    for (binding_name, arg) in params.fixed.iter().zip(args.iter()) {
-        call_env.define(binding_name.clone(), arg.value.clone());
-    }
-
-    if let Some(rest_name) = &params.rest {
-        let rest_items = args[params.fixed_arity()..]
-            .iter()
-            .map(|arg| arg.value.clone())
-            .collect();
-        call_env.define(rest_name.clone(), Value::List(rest_items));
-    }
-
-    Ok(call_env)
-}
-
-fn exact_int(value: i64) -> Value {
-    Value::Number(Number::exact_int(value))
 }
 
 fn extract_rational(arg: &EvaluatedArg) -> Result<Rational, EvalError> {
@@ -476,6 +336,27 @@ fn apply_abs(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalE
     Ok(Value::Number(value.as_number()?.abs()))
 }
 
+fn apply_gcd(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let mut result = 0i64;
+    for arg in args {
+        result = gcd_i64(result, arg.as_int()?);
+    }
+    Ok(exact_int(result))
+}
+
+fn apply_lcm(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let mut result = 1i64;
+    for arg in args {
+        let value = arg.as_int()?;
+        if value == 0 || result == 0 {
+            result = 0;
+        } else {
+            result = (result / gcd_i64(result, value)) * value.abs();
+        }
+    }
+    Ok(exact_int(result.abs()))
+}
+
 fn apply_modulo(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
     let [dividend, divisor] = args else {
         return Err(EvalError::WrongArgCount {
@@ -596,6 +477,53 @@ fn apply_expt(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, Eval
     Ok(exact_int(base.pow(exponent)))
 }
 
+fn apply_truncate(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "truncate",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    let Some(result) = number_to_truncated_i64(value.as_number()?) else {
+        return Err(EvalError::TypeMismatch {
+            expected: "finite number",
+            found: value.value.render(),
+        }
+        .with_position(value.pos.line, value.pos.col));
+    };
+
+    Ok(exact_int(result))
+}
+
+fn apply_round(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "round",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    let number = value.as_number()?;
+    let result = match number {
+        Number::Exact(rational) => {
+            (rational.numerator() as f64 / rational.denominator() as f64).round() as i64
+        }
+        Number::Inexact(raw) if raw.is_finite() => raw.round() as i64,
+        Number::Inexact(_) => {
+            return Err(EvalError::TypeMismatch {
+                expected: "finite number",
+                found: value.value.render(),
+            }
+            .with_position(value.pos.line, value.pos.col));
+        }
+    };
+
+    Ok(exact_int(result))
+}
+
 fn apply_lt(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
     apply_comparison("<", args, |ordering| ordering == Ordering::Less)
 }
@@ -689,349 +617,6 @@ fn apply_equal_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value
     };
 
     Ok(Value::Bool(values_equal(&left.value, &right.value)))
-}
-
-fn apply_cons(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let [head, tail] = args else {
-        return Err(EvalError::WrongArgCount {
-            name: "cons",
-            expected: "exactly 2",
-            got: args.len(),
-        });
-    };
-
-    match &tail.value {
-        Value::List(tail_items) => {
-            let mut items = Vec::with_capacity(tail_items.len() + 1);
-            items.push(head.value.clone());
-            items.extend(tail_items.iter().cloned());
-            Ok(Value::List(items))
-        }
-        _ => Ok(Value::Pair(Rc::new(PairValue {
-            head: head.value.clone(),
-            tail: tail.value.clone(),
-        }))),
-    }
-}
-
-fn apply_car(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let [value] = args else {
-        return Err(EvalError::WrongArgCount {
-            name: "car",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    };
-
-    match &value.value {
-        Value::List(items) => items.first().cloned().ok_or_else(|| {
-            EvalError::TypeMismatch {
-                expected: "non-empty pair",
-                found: value.value.render(),
-            }
-            .with_position(value.pos.line, value.pos.col)
-        }),
-        Value::Pair(pair) => Ok(pair.head.clone()),
-        _ => Err(EvalError::TypeMismatch {
-            expected: "pair",
-            found: value.value.render(),
-        }
-        .with_position(value.pos.line, value.pos.col)),
-    }
-}
-
-fn apply_cdr(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let [value] = args else {
-        return Err(EvalError::WrongArgCount {
-            name: "cdr",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    };
-
-    match &value.value {
-        Value::List(items) => {
-            if items.is_empty() {
-                return Err(EvalError::TypeMismatch {
-                    expected: "non-empty pair",
-                    found: value.value.render(),
-                }
-                .with_position(value.pos.line, value.pos.col));
-            }
-
-            Ok(Value::List(items[1..].to_vec()))
-        }
-        Value::Pair(pair) => Ok(pair.tail.clone()),
-        _ => Err(EvalError::TypeMismatch {
-            expected: "pair",
-            found: value.value.render(),
-        }
-        .with_position(value.pos.line, value.pos.col)),
-    }
-}
-
-fn apply_null(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let [value] = args else {
-        return Err(EvalError::WrongArgCount {
-            name: "null?",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    };
-
-    Ok(Value::Bool(
-        matches!(&value.value, Value::List(items) if items.is_empty()),
-    ))
-}
-
-fn apply_list(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    Ok(Value::List(
-        args.iter().map(|arg| arg.value.clone()).collect(),
-    ))
-}
-
-fn apply_list_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let [value] = args else {
-        return Err(EvalError::WrongArgCount {
-            name: "list?",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    };
-
-    Ok(Value::Bool(matches!(&value.value, Value::List(_))))
-}
-
-fn apply_length(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let [value] = args else {
-        return Err(EvalError::WrongArgCount {
-            name: "length",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    };
-
-    Ok(exact_int(value.as_list()?.len() as i64))
-}
-
-fn apply_list_ref(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let [value, index] = args else {
-        return Err(EvalError::WrongArgCount {
-            name: "list-ref",
-            expected: "exactly 2",
-            got: args.len(),
-        });
-    };
-
-    let items = value.as_list()?;
-    let index = parse_index_arg(index, items.len())?;
-    Ok(items[index].clone())
-}
-
-fn apply_list_tail(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let [value, index] = args else {
-        return Err(EvalError::WrongArgCount {
-            name: "list-tail",
-            expected: "exactly 2",
-            got: args.len(),
-        });
-    };
-
-    let items = value.as_list()?;
-    let index = parse_index_bound(index, items.len(), true)?;
-    Ok(Value::List(items[index..].to_vec()))
-}
-
-fn apply_assoc(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let [key, list] = args else {
-        return Err(EvalError::WrongArgCount {
-            name: "assoc",
-            expected: "exactly 2",
-            got: args.len(),
-        });
-    };
-
-    let entries = list.as_list()?;
-    for entry in entries {
-        let candidate = match entry {
-            Value::List(items) => items.first(),
-            Value::Pair(pair) => Some(&pair.head),
-            _ => {
-                return Err(EvalError::TypeMismatch {
-                    expected: "association list entry",
-                    found: entry.render(),
-                }
-                .with_position(list.pos.line, list.pos.col));
-            }
-        };
-
-        if let Some(candidate) = candidate {
-            if values_equal(&key.value, candidate) {
-                return Ok(entry.clone());
-            }
-        }
-    }
-
-    Ok(Value::Bool(false))
-}
-
-fn apply_append(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let mut items = Vec::new();
-    for value in args {
-        items.extend(value.as_list()?.iter().cloned());
-    }
-    Ok(Value::List(items))
-}
-
-fn apply_map(args: &[EvaluatedArg], output: &mut String) -> Result<Value, EvalError> {
-    let [procedure, lists @ ..] = args else {
-        return Err(EvalError::WrongArgCount {
-            name: "map",
-            expected: "at least 2",
-            got: 0,
-        });
-    };
-
-    if lists.is_empty() {
-        return Err(EvalError::WrongArgCount {
-            name: "map",
-            expected: "at least 2",
-            got: 1,
-        });
-    }
-
-    let list_values = lists
-        .iter()
-        .map(EvaluatedArg::as_list)
-        .collect::<Result<Vec<_>, _>>()?;
-    let limit = list_values
-        .iter()
-        .map(|items| items.len())
-        .min()
-        .unwrap_or(0);
-
-    let mut results = Vec::with_capacity(limit);
-    for index in 0..limit {
-        let call_args = lists
-            .iter()
-            .zip(list_values.iter())
-            .map(|(arg, items)| EvaluatedArg {
-                value: items[index].clone(),
-                pos: arg.pos,
-            })
-            .collect::<Vec<_>>();
-        let value = apply_procedure(procedure.value.clone(), &call_args, output)
-            .map_err(|error| error.with_position(procedure.pos.line, procedure.pos.col))?;
-        results.push(value);
-    }
-
-    Ok(Value::List(results))
-}
-
-fn apply_vector(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    Ok(Value::Vector(Rc::new(VectorValue {
-        elements: RefCell::new(args.iter().map(|arg| arg.value.clone()).collect()),
-    })))
-}
-
-fn apply_make_vector(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let (size_arg, fill) = match args {
-        [size] => (size, Value::Void),
-        [size, fill] => (size, fill.value.clone()),
-        _ => {
-            return Err(EvalError::WrongArgCount {
-                name: "make-vector",
-                expected: "1 or 2",
-                got: args.len(),
-            });
-        }
-    };
-
-    let len = parse_length_arg(size_arg)?;
-    Ok(Value::Vector(Rc::new(VectorValue {
-        elements: RefCell::new(vec![fill; len]),
-    })))
-}
-
-fn apply_vector_ref(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let [vector, index] = args else {
-        return Err(EvalError::WrongArgCount {
-            name: "vector-ref",
-            expected: "exactly 2",
-            got: args.len(),
-        });
-    };
-
-    let vector = vector.as_vector()?;
-    let elements = vector.elements.borrow();
-    let index = parse_index_arg(index, elements.len())?;
-    Ok(elements[index].clone())
-}
-
-fn apply_vector_set(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let [vector, index, value] = args else {
-        return Err(EvalError::WrongArgCount {
-            name: "vector-set!",
-            expected: "exactly 3",
-            got: args.len(),
-        });
-    };
-
-    let vector = vector.as_vector()?;
-    let mut elements = vector.elements.borrow_mut();
-    let index = parse_index_arg(index, elements.len())?;
-    elements[index] = value.value.clone();
-    Ok(Value::Void)
-}
-
-fn apply_vector_length(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let [vector] = args else {
-        return Err(EvalError::WrongArgCount {
-            name: "vector-length",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    };
-
-    Ok(exact_int(vector.as_vector()?.elements.borrow().len() as i64))
-}
-
-fn apply_vector_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let [value] = args else {
-        return Err(EvalError::WrongArgCount {
-            name: "vector?",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    };
-
-    Ok(Value::Bool(matches!(&value.value, Value::Vector(_))))
-}
-
-fn apply_vector_to_list(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let [vector] = args else {
-        return Err(EvalError::WrongArgCount {
-            name: "vector->list",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    };
-
-    Ok(Value::List(vector.as_vector()?.elements.borrow().clone()))
-}
-
-fn apply_list_to_vector(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let [list] = args else {
-        return Err(EvalError::WrongArgCount {
-            name: "list->vector",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    };
-
-    Ok(Value::Vector(Rc::new(VectorValue {
-        elements: RefCell::new(list.as_list()?.to_vec()),
-    })))
 }
 
 fn apply_string_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -1296,7 +881,7 @@ fn apply_apply(args: &[EvaluatedArg], output: &mut String) -> Result<Value, Eval
 
     let mut applied_args = Vec::with_capacity(prefix.len() + tail_items.len());
     applied_args.extend(prefix.iter().cloned());
-    applied_args.extend(tail_items.iter().cloned().map(|value| EvaluatedArg {
+    applied_args.extend(tail_items.into_iter().map(|value| EvaluatedArg {
         value,
         pos: tail.pos,
     }));
@@ -1344,6 +929,32 @@ fn apply_newline(args: &[EvaluatedArg], output: &mut String) -> Result<Value, Ev
     Ok(Value::Void)
 }
 
+fn apply_make_string(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let (length, fill) = match args {
+        [length] => (parse_length_arg(length)?, '\0'),
+        [length, fill] => (parse_length_arg(length)?, fill.as_char()?),
+        _ => {
+            return Err(EvalError::WrongArgCount {
+                name: "make-string",
+                expected: "1 or 2",
+                got: args.len(),
+            });
+        }
+    };
+
+    Ok(Value::String(SchemeString::runtime(
+        std::iter::repeat_n(fill, length).collect::<String>(),
+    )))
+}
+
+fn apply_string(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let string = args
+        .iter()
+        .map(EvaluatedArg::as_char)
+        .collect::<Result<String, _>>()?;
+    Ok(Value::String(SchemeString::runtime(string)))
+}
+
 fn apply_string_append(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
     let mut combined = String::new();
     for arg in args {
@@ -1374,13 +985,13 @@ fn apply_string_to_list(args: &[EvaluatedArg], _output: &mut String) -> Result<V
         });
     };
 
-    let items = value
+    let items: Vec<_> = value
         .as_string()?
         .to_plain_string()
         .chars()
         .map(Value::Char)
         .collect();
-    Ok(Value::List(items))
+    Ok(list_from_values(items))
 }
 
 fn apply_list_to_string(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -1394,7 +1005,7 @@ fn apply_list_to_string(args: &[EvaluatedArg], _output: &mut String) -> Result<V
 
     let chars = list
         .as_list()?
-        .iter()
+        .into_iter()
         .map(|value| {
             value
                 .as_char()
@@ -1543,6 +1154,18 @@ fn apply_string_eq_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<V
 
 fn apply_string_lt_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
     apply_string_comparison("string<?", args, |left, right| left < right)
+}
+
+fn apply_string_gt_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    apply_string_comparison("string>?", args, |left, right| left > right)
+}
+
+fn apply_string_lte_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    apply_string_comparison("string<=?", args, |left, right| left <= right)
+}
+
+fn apply_string_gte_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    apply_string_comparison("string>=?", args, |left, right| left >= right)
 }
 
 fn apply_string_ci_eq_pred(
