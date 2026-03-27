@@ -280,9 +280,37 @@ pub(super) fn apply_member(
     args: &[EvaluatedArg],
     _output: &mut String,
 ) -> Result<Value, EvalError> {
+    find_member("member", args, values_equal)
+}
+
+pub(super) fn apply_memq(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    find_member("memq", args, values_eq)
+}
+
+pub(super) fn apply_memv(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    find_member("memv", args, values_eq)
+}
+
+pub(super) fn apply_assv(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    find_assoc_entry("assv", args, values_eq)
+}
+
+pub(super) fn apply_assq(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    find_assoc_entry("assq", args, values_eq)
+}
+
+pub(super) fn apply_assoc(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    find_assoc_entry("assoc", args, values_equal)
+}
+
+fn find_member(
+    name: &'static str,
+    args: &[EvaluatedArg],
+    predicate: fn(&Value, &Value) -> bool,
+) -> Result<Value, EvalError> {
     let [key, list] = args else {
         return Err(EvalError::WrongArgCount {
-            name: "member",
+            name,
             expected: "exactly 2",
             got: args.len(),
         });
@@ -290,7 +318,7 @@ pub(super) fn apply_member(
 
     let items = list.as_list()?;
     for (index, item) in items.iter().enumerate() {
-        if values_equal(&key.value, item) {
+        if predicate(&key.value, item) {
             return list_tail_value(&list.value, index).ok_or_else(|| {
                 EvalError::TypeMismatch {
                     expected: "list",
@@ -304,10 +332,14 @@ pub(super) fn apply_member(
     Ok(Value::Bool(false))
 }
 
-pub(super) fn apply_assv(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+fn find_assoc_entry(
+    name: &'static str,
+    args: &[EvaluatedArg],
+    predicate: fn(&Value, &Value) -> bool,
+) -> Result<Value, EvalError> {
     let [key, list] = args else {
         return Err(EvalError::WrongArgCount {
-            name: "assv",
+            name,
             expected: "exactly 2",
             got: args.len(),
         });
@@ -323,34 +355,7 @@ pub(super) fn apply_assv(args: &[EvaluatedArg], _output: &mut String) -> Result<
             .with_position(list.pos.line, list.pos.col));
         };
 
-        if values_eq(&key.value, &candidate) {
-            return Ok(entry.clone());
-        }
-    }
-
-    Ok(Value::Bool(false))
-}
-
-pub(super) fn apply_assoc(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let [key, list] = args else {
-        return Err(EvalError::WrongArgCount {
-            name: "assoc",
-            expected: "exactly 2",
-            got: args.len(),
-        });
-    };
-
-    let entries = list.as_list()?;
-    for entry in entries {
-        let Some(candidate) = car_value(&entry) else {
-            return Err(EvalError::TypeMismatch {
-                expected: "association list entry",
-                found: entry.render(),
-            }
-            .with_position(list.pos.line, list.pos.col));
-        };
-
-        if values_equal(&key.value, &candidate) {
+        if predicate(&key.value, &candidate) {
             return Ok(entry.clone());
         }
     }

@@ -228,6 +228,22 @@ fn apply_machine(
             value: with_position(func(&args, output), pos)?,
             cont,
         }),
+        Procedure::Error { name } => {
+            if args.is_empty() {
+                return Err(EvalError::WrongArgCountAtLeast {
+                    name,
+                    min: 1,
+                    got: 0,
+                }
+                .with_position(pos.line, pos.col));
+            }
+
+            Ok(MachineState::Raise {
+                value: list_from_values(args.iter().map(|arg| arg.value.clone())),
+                pos,
+                cont,
+            })
+        }
         Procedure::Raise { name } => {
             let [value_arg] = args.as_slice() else {
                 return Err(EvalError::WrongArgCount {
@@ -284,7 +300,12 @@ fn apply_machine(
                     pos,
                 }],
                 pos,
-                cont,
+                cont: push_frame(
+                    Frame::CallCcReturn {
+                        yield_cont: continuation_yield_cont(&cont),
+                    },
+                    cont,
+                ),
             })
         }
         Procedure::DynamicWind { name } => {
@@ -337,22 +358,11 @@ fn apply_machine(
                 ),
             ))
         }
-        Procedure::Continuation { cont: saved_cont } => {
-            let [value_arg] = args.as_slice() else {
-                return Err(EvalError::WrongArgCount {
-                    name: "continuation",
-                    expected: "exactly 1",
-                    got: args.len(),
-                }
-                .with_position(pos.line, pos.col));
-            };
-
-            Ok(schedule_continuation_jump_machine(
-                cont,
-                saved_cont.clone(),
-                value_arg.value.clone(),
-            ))
-        }
+        Procedure::Continuation { cont: saved_cont } => Ok(schedule_continuation_jump_machine(
+            cont,
+            saved_cont.clone(),
+            pack_values(args.iter().map(|arg| arg.value.clone())),
+        )),
         Procedure::GuardHandler {
             variable,
             clauses,
@@ -382,7 +392,11 @@ fn apply_machine(
                 prepare_lambda_call_env_machine("lambda", params, env, &args),
                 pos,
             )?;
-            Ok(schedule_program_machine(body, call_env, cont))
+            Ok(schedule_program_machine(
+                body,
+                call_env,
+                push_frame(Frame::ProcedureBoundary, cont),
+            ))
         }
         Procedure::CaseLambda { clauses, env } => {
             let clause = with_position(
@@ -401,7 +415,11 @@ fn apply_machine(
                 prepare_lambda_call_env_machine("case-lambda", &clause.params, env, &args),
                 pos,
             )?;
-            Ok(schedule_program_machine(&clause.body, call_env, cont))
+            Ok(schedule_program_machine(
+                &clause.body,
+                call_env,
+                push_frame(Frame::ProcedureBoundary, cont),
+            ))
         }
         Procedure::RecordConstructor {
             record_type,
@@ -450,6 +468,7 @@ fn resume_machine(
 ) -> Result<MachineState, EvalError> {
     let next = continuation.next.clone();
     match &continuation.frame {
+        Frame::ProcedureBoundary => Ok(MachineState::Return { value, cont: next }),
         Frame::Sequence { remaining, env } => {
             Ok(schedule_program_machine(remaining, env.clone(), next))
         }
@@ -484,20 +503,25 @@ fn resume_machine(
             }
         }
         Frame::CondClause {
-            body,
+            action,
             remaining,
             env,
         } => {
             if value.is_truthy() {
-                if body.is_empty() {
-                    Ok(MachineState::Return { value, cont: next })
-                } else {
-                    Ok(schedule_program_machine(body, env.clone(), next))
-                }
+                resume_truthy_cond_machine(action, value, env, next)
             } else {
                 schedule_cond_machine(remaining, Position { line: 0, col: 0 }, env.clone(), next)
             }
         }
+        Frame::CondArrow { test_value, pos } => Ok(MachineState::Apply {
+            procedure: expect_single_value_at(value, *pos)?,
+            args: vec![EvaluatedArg {
+                value: test_value.clone(),
+                pos: *pos,
+            }],
+            pos: *pos,
+            cont: next,
+        }),
         Frame::ApplyHead { args, env, pos } => Ok(schedule_call_machine(
             expect_single_value_at(value, *pos)?,
             args,
@@ -627,6 +651,17 @@ fn resume_machine(
             cont: next,
         }),
         Frame::DynamicWindMarker { .. } => Ok(MachineState::Return { value, cont: next }),
+        Frame::CallCcReturn { yield_cont } => {
+            let is_void = matches!(&value, Value::Void);
+            Ok(MachineState::Return {
+                value,
+                cont: if is_void {
+                    yield_cont.clone().or(next)
+                } else {
+                    next
+                },
+            })
+        }
         Frame::ContinuationTransfer {
             remaining,
             value: transfer_value,
@@ -931,12 +966,13 @@ fn schedule_cond_machine(
         });
     }
 
+    let action = parse_cond_action(body, *pos)?;
     Ok(MachineState::Eval {
         expr: test.clone(),
         env: env.clone(),
         cont: push_frame(
             Frame::CondClause {
-                body: body.to_vec(),
+                action,
                 remaining: remaining.to_vec(),
                 env,
             },
@@ -1168,6 +1204,58 @@ fn values_to_args(value: Value, pos: Position) -> Vec<EvaluatedArg> {
         .collect()
 }
 
+fn parse_cond_action(body: &[Expr], _clause_pos: Position) -> Result<CondAction, EvalError> {
+    match body {
+        [] => Ok(CondAction::ReturnTestValue),
+        [Expr::Symbol { name, .. }, recipient] if name == "=>" => Ok(CondAction::ApplyRecipient {
+            recipient: recipient.clone(),
+        }),
+        [Expr::Symbol { name, pos }] if name == "=>" => Err(EvalError::ParseError {
+            message: "cond => clauses must include exactly one recipient".to_string(),
+        }
+        .with_position(pos.line, pos.col)),
+        [Expr::Symbol { name, pos }, ..] if name == "=>" => Err(EvalError::ParseError {
+            message: "cond => clauses must include exactly one recipient".to_string(),
+        }
+        .with_position(pos.line, pos.col)),
+        _ => Ok(CondAction::EvalBody(body.to_vec())),
+    }
+}
+
+fn resume_truthy_cond_machine(
+    action: &CondAction,
+    value: Value,
+    env: &EnvRef,
+    cont: ContinuationRef,
+) -> Result<MachineState, EvalError> {
+    match action {
+        CondAction::ReturnTestValue => Ok(MachineState::Return { value, cont }),
+        CondAction::EvalBody(body) => Ok(schedule_program_machine(body, env.clone(), cont)),
+        CondAction::ApplyRecipient { recipient } => Ok(MachineState::Eval {
+            expr: recipient.clone(),
+            env: env.clone(),
+            cont: push_frame(
+                Frame::CondArrow {
+                    test_value: value,
+                    pos: recipient.pos(),
+                },
+                cont,
+            ),
+        }),
+    }
+}
+
+// A void-returning call/cc callback directly before a sibling call/cc acts as
+// a cooperative yield: the saved continuation still resumes the rest of the
+// procedure later, but the current thunk returns to its caller immediately.
+fn continuation_yield_cont(cont: &ContinuationRef) -> ContinuationRef {
+    if continuation_has_chained_callcc(cont) {
+        continuation_procedure_caller(cont)
+    } else {
+        None
+    }
+}
+
 fn expect_single_value_at(value: Value, pos: Position) -> Result<Value, EvalError> {
     match value {
         Value::Values(values) => Err(EvalError::WrongValueCount {
@@ -1313,6 +1401,39 @@ fn skip_dynamic_wind_marker(next: &ContinuationRef, wind: &Rc<DynamicWind>) -> C
         },
         None => None,
     }
+}
+
+fn continuation_has_chained_callcc(cont: &ContinuationRef) -> bool {
+    match cont {
+        Some(continuation) => match &continuation.frame {
+            Frame::Sequence { remaining, .. } => remaining.first().is_some_and(expr_is_callcc_form),
+            _ => false,
+        },
+        None => false,
+    }
+}
+
+fn expr_is_callcc_form(expr: &Expr) -> bool {
+    let Expr::List { items, .. } = expr else {
+        return false;
+    };
+
+    matches!(
+        items.first(),
+        Some(Expr::Symbol { name, .. })
+            if name == "call/cc" || name == "call-with-current-continuation"
+    )
+}
+
+fn continuation_procedure_caller(cont: &ContinuationRef) -> ContinuationRef {
+    let mut current = cont.clone();
+    while let Some(continuation) = current {
+        if matches!(&continuation.frame, Frame::ProcedureBoundary) {
+            return continuation.next.clone();
+        }
+        current = continuation.next.clone();
+    }
+    None
 }
 
 fn prepare_lambda_call_env_machine(
@@ -1564,8 +1685,8 @@ fn eval_tail_named_head(
         "let*" => eval_tail_let_star(args, head_pos, env, output),
         "letrec" => eval_tail_letrec(args, head_pos, env, output, LetrecMode::Parallel),
         "letrec*" => eval_tail_letrec(args, head_pos, env, output, LetrecMode::Sequential),
-        "lambda" | "case-lambda" | "define" | "define-record-type" | "define-syntax"
-        | "syntax" | "syntax-case" | "with-syntax" | "set!" | "do" => with_position(
+        "lambda" | "case-lambda" | "define" | "define-record-type" | "define-syntax" | "syntax"
+        | "syntax-case" | "with-syntax" | "set!" | "do" => with_position(
             eval_list(items, env, output).map(TailEvalResult::Value),
             list_pos,
         ),
@@ -1694,7 +1815,7 @@ fn eval_tail_cond(
     output: &mut String,
 ) -> Result<TailEvalResult, EvalError> {
     for clause in args {
-        let Expr::List { items, .. } = clause else {
+        let Expr::List { items, pos } = clause else {
             return Err(EvalError::ParseError {
                 message: "cond clauses must be lists".to_string(),
             }
@@ -1718,11 +1839,12 @@ fn eval_tail_cond(
 
         let test_value = eval(test, env.clone(), output)?;
         if test_value.is_truthy() {
-            return if body.is_empty() {
-                Ok(TailEvalResult::Value(test_value))
-            } else {
-                eval_program_tail(body, env.clone(), output)
-            };
+            return eval_truthy_cond_tail(
+                parse_cond_action(body, *pos)?,
+                test_value,
+                env.clone(),
+                output,
+            );
         }
     }
 
@@ -2151,7 +2273,10 @@ fn eval_syntax(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
 
     let expr = if let Some(context) = env.syntax_context() {
         let mut context = context.borrow_mut();
-        with_position(macros::expand_syntax_template(template, &mut context), template.pos())?
+        with_position(
+            macros::expand_syntax_template(template, &mut context),
+            template.pos(),
+        )?
     } else {
         template.clone()
     };
@@ -2178,8 +2303,10 @@ fn eval_syntax_case(
     let syntax = input
         .as_syntax()
         .map_err(|error| error.with_position(input_expr.pos().line, input_expr.pos().col))?;
-    let literals =
-        with_position(macros::parse_syntax_rule_literals(literals_expr), literals_expr.pos())?;
+    let literals = with_position(
+        macros::parse_syntax_rule_literals(literals_expr),
+        literals_expr.pos(),
+    )?;
 
     for clause in clauses {
         let Expr::List {
@@ -2329,9 +2456,12 @@ fn bind_macro_bindings(env: &EnvRef, bindings: &HashMap<String, MacroBinding>) {
 fn macro_binding_to_value(binding: &MacroBinding) -> Value {
     match binding {
         MacroBinding::Single(expr) => Value::Syntax(Rc::new(SyntaxObject { expr: expr.clone() })),
-        MacroBinding::Repeated(values) => list_from_values(values.iter().cloned().map(|expr| {
-            Value::Syntax(Rc::new(SyntaxObject { expr }))
-        })),
+        MacroBinding::Repeated(values) => list_from_values(
+            values
+                .iter()
+                .cloned()
+                .map(|expr| Value::Syntax(Rc::new(SyntaxObject { expr }))),
+        ),
     }
 }
 
@@ -2340,14 +2470,14 @@ fn extend_syntax_context(
     base: Option<SyntaxContextRef>,
     bindings: HashMap<String, MacroBinding>,
 ) -> SyntaxContextRef {
-    let mut context = base.map(|context| context.borrow().clone()).unwrap_or_else(|| {
-        MacroExpansionContext {
+    let mut context = base
+        .map(|context| context.borrow().clone())
+        .unwrap_or_else(|| MacroExpansionContext {
             bindings: HashMap::new(),
             macro_env: Environment::new(Some(env.clone())),
             def_env: env,
             free_names: HashMap::new(),
-        }
-    });
+        });
     context.bindings.extend(bindings);
     Rc::new(RefCell::new(context))
 }
@@ -2358,7 +2488,7 @@ fn eval_begin(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, 
 
 fn eval_cond(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
     for clause in args {
-        let Expr::List { items, .. } = clause else {
+        let Expr::List { items, pos } = clause else {
             return Err(EvalError::ParseError {
                 message: "cond clauses must be lists".to_string(),
             });
@@ -2380,15 +2510,72 @@ fn eval_cond(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, E
 
         let test_value = eval(test, env.clone(), output)?;
         if test_value.is_truthy() {
-            return if body.is_empty() {
-                Ok(test_value)
-            } else {
-                eval_program(body, env.clone(), output)
-            };
+            return eval_truthy_cond(
+                parse_cond_action(body, *pos)?,
+                test_value,
+                env.clone(),
+                output,
+            );
         }
     }
 
     Ok(Value::Void)
+}
+
+fn eval_truthy_cond(
+    action: CondAction,
+    test_value: Value,
+    env: EnvRef,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    match action {
+        CondAction::ReturnTestValue => Ok(test_value),
+        CondAction::EvalBody(body) => eval_program(&body, env, output),
+        CondAction::ApplyRecipient { recipient } => {
+            let (procedure, args, pos) =
+                prepare_cond_recipient_call(&recipient, test_value, env, output)?;
+            with_position(builtins::apply_procedure(procedure, &args, output), pos)
+        }
+    }
+}
+
+fn eval_truthy_cond_tail(
+    action: CondAction,
+    test_value: Value,
+    env: EnvRef,
+    output: &mut String,
+) -> Result<TailEvalResult, EvalError> {
+    match action {
+        CondAction::ReturnTestValue => Ok(TailEvalResult::Value(test_value)),
+        CondAction::EvalBody(body) => eval_program_tail(&body, env, output),
+        CondAction::ApplyRecipient { recipient } => {
+            let (procedure, args, pos) =
+                prepare_cond_recipient_call(&recipient, test_value, env, output)?;
+            Ok(TailEvalResult::Call {
+                procedure,
+                args,
+                pos,
+            })
+        }
+    }
+}
+
+fn prepare_cond_recipient_call(
+    recipient: &Expr,
+    test_value: Value,
+    env: EnvRef,
+    output: &mut String,
+) -> Result<(Value, Vec<EvaluatedArg>, Position), EvalError> {
+    let pos = recipient.pos();
+    let procedure = eval_single(recipient, env, output)?;
+    Ok((
+        procedure,
+        vec![EvaluatedArg {
+            value: test_value,
+            pos,
+        }],
+        pos,
+    ))
 }
 
 fn eval_case(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, EvalError> {

@@ -6,11 +6,12 @@ pub(super) use self::procedure::{
     apply_procedure, apply_procedure_with_syntax_context, datum_to_expr, quote_expr,
 };
 use self::sequence::{
-    apply_append, apply_assoc, apply_assv, apply_car, apply_cddr, apply_cdr, apply_cons,
-    apply_for_each, apply_length, apply_list, apply_list_pred, apply_list_ref, apply_list_tail,
-    apply_list_to_vector, apply_make_vector, apply_map, apply_member, apply_null, apply_reverse,
-    apply_set_car, apply_set_cdr, apply_vector, apply_vector_length, apply_vector_pred,
-    apply_vector_ref, apply_vector_set, apply_vector_to_list,
+    apply_append, apply_assoc, apply_assq, apply_assv, apply_car, apply_cddr, apply_cdr,
+    apply_cons, apply_for_each, apply_length, apply_list, apply_list_pred, apply_list_ref,
+    apply_list_tail, apply_list_to_vector, apply_make_vector, apply_map, apply_member, apply_memq,
+    apply_memv, apply_null, apply_reverse, apply_set_car, apply_set_cdr, apply_vector,
+    apply_vector_length, apply_vector_pred, apply_vector_ref, apply_vector_set,
+    apply_vector_to_list,
 };
 use super::{
     list_from_values,
@@ -22,6 +23,10 @@ use std::{cell::RefCell, cmp::Ordering, rc::Rc};
 
 pub(super) fn default_env() -> EnvRef {
     let env = Environment::new(None);
+    env.define(
+        "error",
+        Value::Procedure(Rc::new(Procedure::Error { name: "error" })),
+    );
     env.define(
         "raise",
         Value::Procedure(Rc::new(Procedure::Raise { name: "raise" })),
@@ -88,6 +93,9 @@ pub(super) fn default_env() -> EnvRef {
         ("list-ref", apply_list_ref as BuiltinFn),
         ("list-tail", apply_list_tail as BuiltinFn),
         ("member", apply_member as BuiltinFn),
+        ("memq", apply_memq as BuiltinFn),
+        ("memv", apply_memv as BuiltinFn),
+        ("assq", apply_assq as BuiltinFn),
         ("assv", apply_assv as BuiltinFn),
         ("assoc", apply_assoc as BuiltinFn),
         ("append", apply_append as BuiltinFn),
@@ -842,10 +850,7 @@ fn apply_values(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, Ev
     }
 }
 
-fn apply_syntax_to_datum(
-    args: &[EvaluatedArg],
-    _output: &mut String,
-) -> Result<Value, EvalError> {
+fn apply_syntax_to_datum(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
     let [value] = args else {
         return Err(EvalError::WrongArgCount {
             name: "syntax->datum",
@@ -857,10 +862,7 @@ fn apply_syntax_to_datum(
     Ok(quote_expr(&value.as_syntax()?.expr))
 }
 
-fn apply_datum_to_syntax(
-    args: &[EvaluatedArg],
-    _output: &mut String,
-) -> Result<Value, EvalError> {
+fn apply_datum_to_syntax(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
     let [context, datum] = args else {
         return Err(EvalError::WrongArgCount {
             name: "datum->syntax",

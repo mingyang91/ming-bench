@@ -1,8 +1,8 @@
 use super::super::text::SchemeString;
 use super::super::{
-    eval_program_tail, list_from_values, unpack_values, EnvRef, Environment, EvalError,
-    EvaluatedArg, Expr, LambdaParams, Position, Procedure, SyntaxContextRef, TailEvalResult,
-    Value,
+    eval_program_tail, list_from_values, list_from_values_with_tail, pack_values, unpack_values,
+    EnvRef, Environment, EvalError, EvaluatedArg, Expr, LambdaParams, Position, Procedure,
+    SyntaxContextRef, TailEvalResult, Value,
 };
 use super::{
     apply_record_accessor, apply_record_constructor, apply_record_mutator, apply_record_predicate,
@@ -16,7 +16,7 @@ pub(crate) fn quote_expr(expr: &Expr) -> Value {
         Expr::Char { value, .. } => Value::Char(*value),
         Expr::String { value, .. } => Value::String(SchemeString::immutable(value)),
         Expr::Symbol { name, .. } => Value::Symbol(name.clone()),
-        Expr::List { items, .. } => list_from_values(items.iter().map(quote_expr)),
+        Expr::List { items, .. } => quote_list_expr(items),
     }
 }
 
@@ -33,21 +33,64 @@ pub(crate) fn datum_to_expr(value: &Value, pos: Position) -> Result<Expr, EvalEr
             name: value.clone(),
             pos,
         }),
-        Value::List(_) | Value::Pair(_) => {
-            let items = value.as_list()?;
-            Ok(Expr::List {
-                items: items
-                    .iter()
-                    .map(|item| datum_to_expr(item, pos))
-                    .collect::<Result<Vec<_>, _>>()?,
-                pos,
-            })
-        }
+        Value::List(_) | Value::Pair(_) => datum_list_to_expr(value, pos),
         Value::Syntax(syntax) => Ok(syntax.expr.clone()),
         _ => Err(EvalError::TypeMismatch {
             expected: "datum",
             found: value.render(),
         }),
+    }
+}
+
+fn quote_list_expr(items: &[Expr]) -> Value {
+    match dotted_list_parts(items) {
+        Some((prefix, tail)) => {
+            list_from_values_with_tail(prefix.iter().map(quote_expr), quote_expr(tail))
+        }
+        None => list_from_values(items.iter().map(quote_expr)),
+    }
+}
+
+fn dotted_list_parts(items: &[Expr]) -> Option<(&[Expr], &Expr)> {
+    let dot_index = items.iter().position(is_dot_symbol)?;
+    (dot_index > 0 && dot_index + 2 == items.len())
+        .then(|| (&items[..dot_index], &items[dot_index + 1]))
+}
+
+fn is_dot_symbol(expr: &Expr) -> bool {
+    matches!(expr, Expr::Symbol { name, .. } if name == ".")
+}
+
+fn datum_list_to_expr(value: &Value, pos: Position) -> Result<Expr, EvalError> {
+    let mut items = Vec::new();
+    let mut current = value.clone();
+
+    loop {
+        match current {
+            Value::List(values) => {
+                items.extend(
+                    values
+                        .iter()
+                        .map(|item| datum_to_expr(item, pos))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                return Ok(Expr::List { items, pos });
+            }
+            Value::Pair(pair) => {
+                let head = pair.head.borrow().clone();
+                let tail = pair.tail.borrow().clone();
+                items.push(datum_to_expr(&head, pos)?);
+                current = tail;
+            }
+            value => {
+                items.push(Expr::Symbol {
+                    name: ".".to_string(),
+                    pos,
+                });
+                items.push(datum_to_expr(&value, pos)?);
+                return Ok(Expr::List { items, pos });
+            }
+        }
     }
 }
 
@@ -85,6 +128,23 @@ pub(crate) fn apply_procedure_with_syntax_context(
         match procedure.as_ref() {
             Procedure::Builtin { func, .. } => {
                 return with_call_position(func(&current_args, output), call_pos);
+            }
+            Procedure::Error { name } => {
+                if current_args.is_empty() {
+                    return with_call_position(
+                        Err(EvalError::WrongArgCountAtLeast {
+                            name,
+                            min: 1,
+                            got: 0,
+                        }),
+                        call_pos,
+                    );
+                }
+
+                return Err(EvalError::UncaughtException {
+                    value: list_from_values(current_args.iter().map(|arg| arg.value.clone()))
+                        .render(),
+                });
             }
             Procedure::Raise { name } => {
                 let [value_arg] = current_args.as_slice() else {
@@ -217,18 +277,9 @@ pub(crate) fn apply_procedure_with_syntax_context(
                     .collect();
             }
             Procedure::Continuation { .. } => {
-                let [value_arg] = current_args.as_slice() else {
-                    return with_call_position(
-                        Err(EvalError::WrongArgCount {
-                            name: "continuation",
-                            expected: "exactly 1",
-                            got: current_args.len(),
-                        }),
-                        call_pos,
-                    );
-                };
-
-                return Ok(value_arg.value.clone());
+                return Ok(pack_values(
+                    current_args.iter().map(|arg| arg.value.clone()),
+                ));
             }
             Procedure::Lambda { params, body, env } => {
                 let call_env = with_call_position(

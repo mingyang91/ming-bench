@@ -98,11 +98,19 @@ pub(super) struct WindTransferStep {
 }
 
 #[derive(Clone)]
+pub(super) enum CondAction {
+    ReturnTestValue,
+    EvalBody(Vec<Expr>),
+    ApplyRecipient { recipient: Expr },
+}
+
+#[derive(Clone)]
 pub(super) enum Frame {
     Sequence {
         remaining: Vec<Expr>,
         env: EnvRef,
     },
+    ProcedureBoundary,
     And {
         remaining: Vec<Expr>,
         env: EnvRef,
@@ -117,9 +125,13 @@ pub(super) enum Frame {
         env: EnvRef,
     },
     CondClause {
-        body: Vec<Expr>,
+        action: CondAction,
         remaining: Vec<Expr>,
         env: EnvRef,
+    },
+    CondArrow {
+        test_value: Value,
+        pos: Position,
     },
     ApplyHead {
         args: Vec<Expr>,
@@ -176,6 +188,9 @@ pub(super) enum Frame {
     },
     DynamicWindMarker {
         wind: Rc<DynamicWind>,
+    },
+    CallCcReturn {
+        yield_cont: ContinuationRef,
     },
     ContinuationTransfer {
         remaining: Vec<WindTransferStep>,
@@ -303,6 +318,9 @@ pub(super) enum Procedure {
         name: &'static str,
         func: BuiltinFn,
     },
+    Error {
+        name: &'static str,
+    },
     Raise {
         name: &'static str,
     },
@@ -393,6 +411,7 @@ impl fmt::Debug for Procedure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Builtin { name, .. } => write!(f, "#<builtin:{name}>"),
+            Self::Error { name } => write!(f, "#<builtin:{name}>"),
             Self::Raise { name } => write!(f, "#<builtin:{name}>"),
             Self::WithExceptionHandler { name } => write!(f, "#<builtin:{name}>"),
             Self::ContinuationCapture { name } => write!(f, "#<builtin:{name}>"),
@@ -421,9 +440,7 @@ impl Environment {
     pub(super) fn new(parent: Option<EnvRef>) -> EnvRef {
         Rc::new(Self {
             syntax_context: RefCell::new(
-                parent
-                    .as_ref()
-                    .and_then(|parent| parent.syntax_context()),
+                parent.as_ref().and_then(|parent| parent.syntax_context()),
             ),
             parent,
             bindings: RefCell::new(HashMap::new()),
@@ -598,6 +615,20 @@ pub(super) fn unpack_values(value: Value) -> Vec<Value> {
         Value::Values(values) => values,
         value => vec![value],
     }
+}
+
+pub(super) fn pack_values(values: impl IntoIterator<Item = Value>) -> Value {
+    let mut values = values.into_iter();
+    let Some(first) = values.next() else {
+        return Value::Values(Vec::new());
+    };
+    let Some(second) = values.next() else {
+        return first;
+    };
+
+    let mut packed = vec![first, second];
+    packed.extend(values);
+    Value::Values(packed)
 }
 
 #[derive(Clone, Copy)]
@@ -905,7 +936,14 @@ pub(super) fn list_from_values<I>(items: I) -> Value
 where
     I: IntoIterator<Item = Value>,
 {
-    let mut tail = empty_list();
+    list_from_values_with_tail(items, empty_list())
+}
+
+pub(super) fn list_from_values_with_tail<I>(items: I, tail: Value) -> Value
+where
+    I: IntoIterator<Item = Value>,
+{
+    let mut tail = tail;
     let mut items = items.into_iter().collect::<Vec<_>>();
     while let Some(head) = items.pop() {
         tail = Value::Pair(Rc::new(PairValue {

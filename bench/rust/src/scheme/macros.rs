@@ -328,11 +328,94 @@ fn match_macro_rule(
     };
 
     let mut bindings = HashMap::new();
-    if match_pattern_sequence(pattern_args, input_args, literals, &mut bindings) {
+    let matched = if split_dotted_list_items(pattern_args).is_some() {
+        match_pattern_sequence_at(
+            pattern_args,
+            MacroListInput::from_items(input_args, Position { line: 0, col: 0 }),
+            literals,
+            &mut bindings,
+        )
+        .is_some_and(MacroListInput::is_empty)
+    } else {
+        match_pattern_sequence(pattern_args, input_args, literals, &mut bindings)
+    };
+    if matched {
         Some(bindings)
     } else {
         None
     }
+}
+
+#[derive(Clone, Copy)]
+struct MacroListInput<'a> {
+    items: &'a [Expr],
+    tail: Option<&'a Expr>,
+    pos: Position,
+}
+
+impl<'a> MacroListInput<'a> {
+    fn from_items(items: &'a [Expr], pos: Position) -> Self {
+        match split_dotted_list_items(items) {
+            Some((prefix, tail)) => Self {
+                items: prefix,
+                tail: Some(tail),
+                pos,
+            },
+            None => Self {
+                items,
+                tail: None,
+                pos,
+            },
+        }
+    }
+
+    fn empty(pos: Position) -> Self {
+        Self {
+            items: &[],
+            tail: None,
+            pos,
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.items.is_empty() && self.tail.is_none()
+    }
+
+    fn split_first(self) -> Option<(&'a Expr, Self)> {
+        let (head, tail) = self.items.split_first()?;
+        Some((
+            head,
+            Self {
+                items: tail,
+                tail: self.tail,
+                pos: self.pos,
+            },
+        ))
+    }
+
+    fn as_expr(self) -> Expr {
+        match (self.items.is_empty(), self.tail) {
+            (true, Some(tail)) => tail.clone(),
+            (_, tail) => Expr::List {
+                items: rebuild_list_items(self.items, tail, self.pos),
+                pos: self.pos,
+            },
+        }
+    }
+}
+
+fn minimum_pattern_inputs(patterns: &[Expr]) -> usize {
+    let mut count = 0;
+    let mut index = 0;
+    while index < patterns.len() {
+        if index + 1 < patterns.len() && is_ellipsis(&patterns[index + 1]) {
+            index += 2;
+        } else {
+            count += 1;
+            index += 1;
+        }
+    }
+    count
 }
 
 fn match_pattern_sequence(
@@ -388,18 +471,64 @@ fn match_pattern_sequence(
     match_pattern_sequence(&patterns[1..], input_tail, literals, bindings)
 }
 
-fn minimum_pattern_inputs(patterns: &[Expr]) -> usize {
-    let mut count = 0;
-    let mut index = 0;
-    while index < patterns.len() {
-        if index + 1 < patterns.len() && is_ellipsis(&patterns[index + 1]) {
-            index += 2;
-        } else {
-            count += 1;
-            index += 1;
+fn match_pattern_sequence_at<'a>(
+    patterns: &[Expr],
+    inputs: MacroListInput<'a>,
+    literals: &HashSet<String>,
+    bindings: &mut HashMap<String, MacroBinding>,
+) -> Option<MacroListInput<'a>> {
+    if let Some((prefix, tail_pattern)) = split_dotted_list_items(patterns) {
+        let remaining = match_pattern_sequence_at(prefix, inputs, literals, bindings)?;
+        if match_single_pattern(tail_pattern, &remaining.as_expr(), literals, bindings) {
+            return Some(MacroListInput::empty(remaining.pos));
         }
+        return None;
     }
-    count
+
+    if patterns.is_empty() {
+        return Some(inputs);
+    }
+
+    if patterns.len() >= 2 && is_ellipsis(&patterns[1]) {
+        let min_rest = minimum_pattern_inputs(&patterns[2..]);
+        if inputs.items.len() < min_rest {
+            return None;
+        }
+
+        let max_repeat = inputs.items.len() - min_rest;
+        for repeat_count in 0..=max_repeat {
+            let mut candidate = bindings.clone();
+            if !match_repeated_pattern(
+                &patterns[0],
+                &inputs.items[..repeat_count],
+                literals,
+                &mut candidate,
+            ) {
+                continue;
+            }
+
+            let remaining = MacroListInput {
+                items: &inputs.items[repeat_count..],
+                tail: inputs.tail,
+                pos: inputs.pos,
+            };
+            if let Some(matched_remaining) =
+                match_pattern_sequence_at(&patterns[2..], remaining, literals, &mut candidate)
+            {
+                *bindings = candidate;
+                return Some(matched_remaining);
+            }
+        }
+
+        return None;
+    }
+
+    let (input_head, input_tail) = inputs.split_first()?;
+    if !match_single_pattern(&patterns[0], input_head, literals, bindings) {
+        return None;
+    }
+
+    match_pattern_sequence_at(&patterns[1..], input_tail, literals, bindings)
 }
 
 fn match_repeated_pattern(
@@ -462,11 +591,46 @@ fn match_single_pattern(
             ..
         } => match input {
             Expr::List {
+                items: input_items,
+                pos,
+            } if split_dotted_list_items(pattern_items).is_some() => match_pattern_sequence_at(
+                pattern_items,
+                MacroListInput::from_items(input_items, *pos),
+                literals,
+                bindings,
+            )
+            .is_some_and(MacroListInput::is_empty),
+            Expr::List {
+                items: input_items, ..
+            } if split_dotted_list_items(input_items).is_some() => false,
+            Expr::List {
                 items: input_items, ..
             } => match_pattern_sequence(pattern_items, input_items, literals, bindings),
             _ => false,
         },
     }
+}
+
+fn split_dotted_list_items(items: &[Expr]) -> Option<(&[Expr], &Expr)> {
+    let dot_index = items.iter().position(is_dot_symbol)?;
+    (dot_index > 0 && dot_index + 2 == items.len())
+        .then(|| (&items[..dot_index], &items[dot_index + 1]))
+}
+
+fn rebuild_list_items(items: &[Expr], tail: Option<&Expr>, pos: Position) -> Vec<Expr> {
+    let mut rebuilt = items.to_vec();
+    if let Some(tail) = tail {
+        rebuilt.push(Expr::Symbol {
+            name: ".".to_string(),
+            pos,
+        });
+        rebuilt.push(tail.clone());
+    }
+    rebuilt
+}
+
+fn is_dot_symbol(expr: &Expr) -> bool {
+    matches!(expr, Expr::Symbol { name, .. } if name == ".")
 }
 
 fn expand_macro_template(
