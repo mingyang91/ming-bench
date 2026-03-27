@@ -41,7 +41,7 @@ private[ming] object SyntaxTransformerRuntime:
   def evalExpr(expr: Expr, context: TransformerContext): TransformerValue =
     expr match
       case Expr.IntLit(_, _) | Expr.RationalLit(_, _, _) | Expr.InexactLit(_, _) | Expr.BoolLit(_, _) |
-          Expr.StringLit(_, _) | Expr.CharLit(_, _) =>
+          Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.VectorExpr(_, _) =>
         TransformerValue.Datum(ValueSemantics.quote(expr))
       case Expr.Symbol(name, pos) =>
         evalSymbol(name, pos, context)
@@ -169,7 +169,13 @@ private[ming] object SyntaxTransformerRuntime:
       case Value.EmptyList =>
         Expr.ListExpr(Nil, pos)
       case _: Value.PairVal =>
-        val items = ValueSemantics.toProperList("datum->syntax", value, pos).map(item => datumToSyntax(item, pos))
-        Expr.ListExpr(items, pos)
+        val listParts = ExprListSupport.parseValueList(value, pos, "datum->syntax")
+        ExprListSupport.buildExpr(
+          items = listParts.items.map(item => datumToSyntax(item, pos)),
+          tail = listParts.tail.map(tailValue => datumToSyntax(tailValue, pos)),
+          pos = pos
+        )
+      case Value.VectorVal(vector) =>
+        Expr.VectorExpr(vector.elements.map(element => datumToSyntax(element, pos)), pos)
       case other =>
         throw EvalError.at(pos, s"datum->syntax expected a datum, got ${ValueSemantics.typeName(other)}")

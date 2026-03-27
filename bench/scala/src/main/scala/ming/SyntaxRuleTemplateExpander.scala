@@ -25,6 +25,10 @@ private[ming] object SyntaxRuleTemplateExpander:
           Expr.ListExpr(List(Expr.Symbol("quote", quotePos), datum), pos),
           hygiene
         )
+      case Expr.VectorExpr(items, pos) =>
+        val (expandedItems, nextHygiene) =
+          expandTemplateItems(items, bindings, hygiene, repetitionIndex)
+        (Expr.VectorExpr(expandedItems, pos), nextHygiene)
       case Expr.ListExpr(items, pos) =>
         val (expandedItems, nextHygiene) =
           expandTemplateItems(items, bindings, hygiene, repetitionIndex)
@@ -136,6 +140,13 @@ private[ming] object SyntaxRuleTemplateExpander:
         bindings.repeated.get(symbol).map(_.length).toList
       case Expr.ListExpr(Expr.Symbol("quote", _) :: _ :: Nil, _) =>
         Nil
+      case Expr.VectorExpr(items, _) =>
+        items.zipWithIndex.flatMap {
+          case (item, index) if index > 0 && isEllipsis(items(index - 1)) =>
+            Nil
+          case (item, _) =>
+            collectRepeatedCounts(item, bindings)
+        }
       case Expr.ListExpr(items, _) =>
         items.zipWithIndex.flatMap {
           case (item, index) if index > 0 && isEllipsis(items(index - 1)) =>

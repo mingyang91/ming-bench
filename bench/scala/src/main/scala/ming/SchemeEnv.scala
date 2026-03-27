@@ -46,7 +46,9 @@ final private[ming] class Env private (
 private[ming] object Env:
 
   def topLevel(): Env =
-    new Env(parent = None, bindings = mutable.Map.empty, syntaxBindings = mutable.Map.empty)
+    val env = new Env(parent = None, bindings = mutable.Map.empty, syntaxBindings = mutable.Map.empty)
+    env.defineSyntax("quasiquote", BuiltinSyntaxes.quasiquote)
+    env
 
   def childOf(parent: Env): Env =
     new Env(parent = Some(parent), bindings = mutable.Map.empty, syntaxBindings = mutable.Map.empty)

@@ -189,11 +189,9 @@ private[ming] object ListBuiltins:
       case Nil =>
         Value.EmptyList
       case last :: Nil =>
-        ValueSemantics.toProperList(name, last, pos)
         last
       case _ =>
         val last = args.last
-        ValueSemantics.toProperList(name, last, pos)
         args.init.foldRight(last) { (listValue, acc) =>
           ValueSemantics.toProperList(name, listValue, pos).foldRight(acc) { (item, tail) =>
             Value.PairVal(item, tail)

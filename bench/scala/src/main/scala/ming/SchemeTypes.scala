@@ -11,6 +11,7 @@ private[ming] enum Expr:
   case CharLit(value: Char, pos: SourcePos)                            extends Expr
   case Symbol(name: String, pos: SourcePos)                            extends Expr
   case ListExpr(items: List[Expr], pos: SourcePos)                     extends Expr
+  case VectorExpr(items: List[Expr], pos: SourcePos)                   extends Expr
 
 sealed private[ming] trait Value
 

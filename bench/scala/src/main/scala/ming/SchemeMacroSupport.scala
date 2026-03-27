@@ -15,9 +15,12 @@ private[ming] object MacroSyntax:
     "lambda",
     "let",
     "or",
+    "quasiquote",
     "quote",
     "set!",
-    "syntax-rules"
+    "syntax-rules",
+    "unquote",
+    "unquote-splicing"
   )
 
   def isEllipsis(expr: Expr): Boolean =
@@ -43,6 +46,11 @@ private[ming] object MacroSyntax:
       case (Expr.CharLit(leftValue, _), Expr.CharLit(rightValue, _))       => leftValue == rightValue
       case (Expr.Symbol(leftName, _), Expr.Symbol(rightName, _))           => leftName == rightName
       case (Expr.ListExpr(leftItems, _), Expr.ListExpr(rightItems, _)) =>
+        leftItems.lengthCompare(rightItems.length) == 0 &&
+        leftItems.zip(rightItems).forall { case (leftItem, rightItem) =>
+          syntaxEquals(leftItem, rightItem)
+        }
+      case (Expr.VectorExpr(leftItems, _), Expr.VectorExpr(rightItems, _)) =>
         leftItems.lengthCompare(rightItems.length) == 0 &&
         leftItems.zip(rightItems).forall { case (leftItem, rightItem) =>
           syntaxEquals(leftItem, rightItem)

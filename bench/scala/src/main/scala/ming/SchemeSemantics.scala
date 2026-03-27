@@ -150,9 +150,12 @@ private[ming] object ValueSemantics:
       case Expr.CharLit(value, _) => Value.CharVal(value)
       case Expr.Symbol(name, _)   => Value.SymbolVal(name)
       case Expr.ListExpr(items, _) =>
-        items.foldRight[Value](Value.EmptyList) { (item, acc) =>
+        val listParts = ExprListSupport.parseItems(items, "quoted list")
+        listParts.items.foldRight[Value](listParts.tail.map(quote).getOrElse(Value.EmptyList)) { (item, acc) =>
           Value.PairVal(quote(item), acc)
         }
+      case Expr.VectorExpr(items, _) =>
+        Value.VectorVal(VectorInstance(items.map(quote).toArray))
 
   def listFrom(values: List[Value]): Value =
     values.foldRight[Value](Value.EmptyList) { (value, acc) =>

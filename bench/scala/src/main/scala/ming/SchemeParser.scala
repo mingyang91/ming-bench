@@ -25,10 +25,24 @@ private[ming] object SchemeParser:
         val syntaxPos    = current.position
         val (next, expr) = parseExpr(current.advance(2))
         (next, Expr.ListExpr(List(Expr.Symbol("syntax", syntaxPos), expr), syntaxPos))
+      case '#' if current.peekChar().contains('(') =>
+        parseVector(current.advance(2), current.position)
       case '(' =>
         parseList(current.advance(), current.position)
       case ')' =>
         fail(current, "unexpected ')'")
+      case '`' =>
+        val quasiquotePos = current.position
+        val (next, expr)  = parseExpr(current.advance())
+        (next, Expr.ListExpr(List(Expr.Symbol("quasiquote", quasiquotePos), expr), quasiquotePos))
+      case ',' if current.peekChar().contains('@') =>
+        val unquotePos   = current.position
+        val (next, expr) = parseExpr(current.advance(2))
+        (next, Expr.ListExpr(List(Expr.Symbol("unquote-splicing", unquotePos), expr), unquotePos))
+      case ',' =>
+        val unquotePos   = current.position
+        val (next, expr) = parseExpr(current.advance())
+        (next, Expr.ListExpr(List(Expr.Symbol("unquote", unquotePos), expr), unquotePos))
       case '\'' =>
         val quotePos     = current.position
         val (next, expr) = parseExpr(current.advance())
@@ -51,6 +65,18 @@ private[ming] object SchemeParser:
       case _ =>
         val (next, expr) = parseExpr(current)
         parseList(next, startPos, expr :: acc)
+
+  @tailrec
+  private def parseVector(cursor: Cursor, startPos: SourcePos, acc: List[Expr] = Nil): (Cursor, Expr) =
+    val current = skipIgnored(cursor)
+    if current.atEnd then fail(current, "unterminated vector")
+
+    current.currentChar match
+      case ')' =>
+        (current.advance(), Expr.VectorExpr(acc.reverse, startPos))
+      case _ =>
+        val (next, expr) = parseExpr(current)
+        parseVector(next, startPos, expr :: acc)
 
   private def parseString(cursor: Cursor): (Cursor, String) =
     @tailrec

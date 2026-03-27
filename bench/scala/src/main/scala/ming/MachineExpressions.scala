@@ -20,6 +20,8 @@ private[ming] object MachineExpressions:
         machine.setValue(Value.CharVal(value))
       case Expr.Symbol(name, pos) =>
         machine.setValue(env.lookup(name).getOrElse(throw EvalError.at(pos, s"unbound variable: $name")))
+      case vectorExpr @ Expr.VectorExpr(_, _) =>
+        machine.setValue(ValueSemantics.quote(vectorExpr))
       case Expr.ListExpr(items, pos) =>
         evalList(machine, items, env, pos)
 

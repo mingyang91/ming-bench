@@ -14,6 +14,8 @@ private[ming] object SyntaxPatternMatcher:
         None
       case Expr.Symbol(symbol, _) =>
         PatternBindings.empty.bindSingle(symbol, input)
+      case Expr.VectorExpr(patternItems, _) =>
+        matchVectorPattern(patternItems, input, literalNames)
       case Expr.ListExpr(patternItems, _) =>
         matchListPattern(patternItems, input, literalNames)
       case Expr.IntLit(value, _) =>
@@ -103,6 +105,17 @@ private[ming] object SyntaxPatternMatcher:
       case _ =>
         None
 
+  private def matchVectorPattern(
+    patternItems: List[Expr],
+    input: Expr,
+    literalNames: Set[String]
+  ): Option[PatternBindings] =
+    input match
+      case Expr.VectorExpr(inputItems, _) =>
+        matchSequence(patternItems, inputItems, literalNames)
+      case _ =>
+        None
+
   private def matchIntLiteral(value: Long, input: Expr): Option[PatternBindings] =
     input match
       case Expr.IntLit(other, _) if other == value =>
@@ -156,6 +169,10 @@ private[ming] object SyntaxPatternMatcher:
         Set.empty
       case Expr.Symbol(symbol, _) =>
         Set(symbol)
+      case Expr.VectorExpr(items, _) =>
+        items.foldLeft(Set.empty[String]) { (acc, item) =>
+          acc ++ repeatedPatternVariables(item, literalNames)
+        }
       case Expr.ListExpr(items, _) =>
         items.foldLeft(Set.empty[String]) { (acc, item) =>
           acc ++ repeatedPatternVariables(item, literalNames)
