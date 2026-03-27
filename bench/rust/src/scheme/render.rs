@@ -53,9 +53,7 @@ impl RenderContext {
             Value::Procedure(_)
             | Value::NativeProcedure(_)
             | Value::Builtin(_)
-            | Value::Continuation(_) => {
-                "#<procedure>".into()
-            }
+            | Value::Continuation(_) => "#<procedure>".into(),
             Value::Record(record) => render_record(record),
             Value::Uninitialized => "#<uninitialized>".into(),
             Value::Void => "#<void>".into(),

@@ -4,9 +4,12 @@ use std::rc::Rc;
 
 use super::continuation::{current_continuation_value, ContinuationRef, EvalResult};
 use super::number::{parse_number_string, Number};
+use super::value_ops::{
+    collect_list_items, is_empty_list, is_proper_list, list_from_vec, pair_parts, values_eq,
+    values_equal, values_eqv,
+};
 use super::{
-    collect_list_items, env_define, is_empty_list, is_proper_list, list_from_vec, pair_parts,
-    Builtin, BuiltinKind, EnvRef, Environment, EvalError, OutputRef, PairCell, Value,
+    env_define, Builtin, BuiltinKind, EnvRef, Environment, EvalError, OutputRef, PairCell, Value,
 };
 
 pub(super) fn default_env(output: OutputRef) -> EnvRef {
@@ -204,8 +207,8 @@ fn apply_builtin_without_context(
         BuiltinKind::Reverse => eval_reverse(args),
         BuiltinKind::Apply => unreachable!("apply requires the current continuation"),
         BuiltinKind::CallCc => unreachable!("call/cc requires the current continuation"),
-        BuiltinKind::EqPred => eval_eq_like("eq?", args, super::values_eq),
-        BuiltinKind::EqvPred => eval_eq_like("eqv?", args, super::values_eqv),
+        BuiltinKind::EqPred => eval_eq_like("eq?", args, values_eq),
+        BuiltinKind::EqvPred => eval_eq_like("eqv?", args, values_eqv),
         BuiltinKind::EqualPred => eval_equality("equal?", args),
         BuiltinKind::Map => unreachable!("map requires the current continuation"),
         BuiltinKind::ForEach => unreachable!("for-each requires the current continuation"),
@@ -688,7 +691,7 @@ where
 }
 
 fn eval_equality(name: &str, args: &[Value]) -> Result<Value, EvalError> {
-    eval_eq_like(name, args, super::values_equal)
+    eval_eq_like(name, args, values_equal)
 }
 
 fn eval_map(args: &[Value], continuation: &ContinuationRef) -> EvalResult<Value> {
@@ -725,7 +728,11 @@ fn eval_map(args: &[Value], continuation: &ContinuationRef) -> EvalResult<Value>
             .iter()
             .map(|list| list[index].clone())
             .collect::<Vec<_>>();
-        result.push(super::apply_callable(callable.clone(), &call_args, continuation)?);
+        result.push(super::apply_callable(
+            callable.clone(),
+            &call_args,
+            continuation,
+        )?);
     }
 
     Ok(list_from_vec(result))
@@ -1477,7 +1484,7 @@ fn eval_member(args: &[Value]) -> Result<Value, EvalError> {
             });
         };
 
-        if super::values_equal(needle, &car) {
+        if values_equal(needle, &car) {
             return Ok(current);
         }
 
@@ -1502,7 +1509,7 @@ fn eval_assoc(args: &[Value]) -> Result<Value, EvalError> {
 
     for entry in collect_list_items(alist)? {
         let entry_key = pair_head(&entry)?;
-        if super::values_equal(key, &entry_key) {
+        if values_equal(key, &entry_key) {
             return Ok(entry);
         }
     }
@@ -1521,7 +1528,7 @@ fn eval_assv(args: &[Value]) -> Result<Value, EvalError> {
 
     for entry in collect_list_items(alist)? {
         let entry_key = pair_head(&entry)?;
-        if super::values_eqv(key, &entry_key) {
+        if values_eqv(key, &entry_key) {
             return Ok(entry);
         }
     }

@@ -1,10 +1,42 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::macros::MacroEnvRef;
 use super::{BindingRef, EnvRef, EvalError, Expr, SourcePos, Value};
 
 pub(super) type ContinuationRef = Rc<Continuation>;
+pub(super) type DynamicWindFrameRef = Rc<DynamicWindFrame>;
 pub(super) type EvalResult<T> = Result<T, EvalSignal>;
+
+#[derive(Clone)]
+pub(super) struct CapturedContinuation {
+    pub(super) continuation: ContinuationRef,
+    pub(super) wind_stack: Vec<DynamicWindFrameRef>,
+}
+
+#[derive(Clone)]
+pub(super) struct DynamicWindFrame {
+    pub(super) before: Value,
+    pub(super) before_position: SourcePos,
+    pub(super) after: Value,
+    pub(super) after_position: SourcePos,
+}
+
+thread_local! {
+    static CURRENT_WIND_STACK: RefCell<Vec<DynamicWindFrameRef>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(super) struct WindStackGuard {
+    saved: Vec<DynamicWindFrameRef>,
+}
+
+impl Drop for WindStackGuard {
+    fn drop(&mut self) {
+        CURRENT_WIND_STACK.with(|stack| {
+            *stack.borrow_mut() = std::mem::take(&mut self.saved);
+        });
+    }
+}
 
 #[derive(Clone)]
 pub(super) enum Continuation {
@@ -38,12 +70,39 @@ pub(super) enum Continuation {
         head_position: SourcePos,
         next: ContinuationRef,
     },
+    DynamicWindEnter {
+        frame: DynamicWindFrameRef,
+        body: Value,
+        body_position: SourcePos,
+        next: ContinuationRef,
+    },
+    DynamicWind {
+        frame: DynamicWindFrameRef,
+        next: ContinuationRef,
+    },
+    DynamicWindExit {
+        return_value: Value,
+        next: ContinuationRef,
+    },
+    WindTransition {
+        saved_value: Value,
+        remaining_exits: Vec<DynamicWindFrameRef>,
+        remaining_entries: Vec<DynamicWindFrameRef>,
+        target: ContinuationRef,
+    },
+    WindTransitionEnter {
+        frame: DynamicWindFrameRef,
+        saved_value: Value,
+        remaining_entries: Vec<DynamicWindFrameRef>,
+        target: ContinuationRef,
+    },
 }
 
 pub(super) enum EvalSignal {
     Error(EvalError),
     Jump {
         continuation: ContinuationRef,
+        wind_stack: Vec<DynamicWindFrameRef>,
         value: Value,
     },
 }
@@ -60,9 +119,11 @@ impl EvalSignal {
             Self::Error(error) => Self::Error(error.with_position(position)),
             Self::Jump {
                 continuation,
+                wind_stack,
                 value,
             } => Self::Jump {
                 continuation,
+                wind_stack,
                 value,
             },
         }
@@ -73,15 +134,64 @@ pub(super) fn final_continuation() -> ContinuationRef {
     Rc::new(Continuation::Final)
 }
 
-pub(super) fn invoke_continuation(continuation: ContinuationRef, value: Value) -> EvalSignal {
+pub(super) fn reset_wind_stack() -> WindStackGuard {
+    let saved = CURRENT_WIND_STACK.with(|stack| std::mem::take(&mut *stack.borrow_mut()));
+    WindStackGuard { saved }
+}
+
+pub(super) fn current_wind_stack() -> Vec<DynamicWindFrameRef> {
+    CURRENT_WIND_STACK.with(|stack| stack.borrow().clone())
+}
+
+pub(super) fn push_wind_frame(frame: &DynamicWindFrameRef) {
+    CURRENT_WIND_STACK.with(|stack| {
+        stack.borrow_mut().push(Rc::clone(frame));
+    });
+}
+
+pub(super) fn pop_wind_frame(frame: &DynamicWindFrameRef) {
+    CURRENT_WIND_STACK.with(|stack| {
+        let popped = stack
+            .borrow_mut()
+            .pop()
+            .expect("dynamic-wind stack underflow");
+        assert!(
+            Rc::ptr_eq(&popped, frame),
+            "dynamic-wind stack mismatch while unwinding"
+        );
+    });
+}
+
+pub(super) fn make_dynamic_wind_frame(
+    before: Value,
+    before_position: SourcePos,
+    after: Value,
+    after_position: SourcePos,
+) -> DynamicWindFrameRef {
+    Rc::new(DynamicWindFrame {
+        before,
+        before_position,
+        after,
+        after_position,
+    })
+}
+
+pub(super) fn invoke_continuation(
+    continuation: Rc<CapturedContinuation>,
+    value: Value,
+) -> EvalSignal {
     EvalSignal::Jump {
-        continuation,
+        continuation: Rc::clone(&continuation.continuation),
+        wind_stack: continuation.wind_stack.clone(),
         value,
     }
 }
 
 pub(super) fn current_continuation_value(continuation: &ContinuationRef) -> Value {
-    Value::Continuation(Rc::clone(continuation))
+    Value::Continuation(Rc::new(CapturedContinuation {
+        continuation: Rc::clone(continuation),
+        wind_stack: current_wind_stack(),
+    }))
 }
 
 pub(super) fn sequence_continuation(
@@ -98,7 +208,11 @@ pub(super) fn sequence_continuation(
     })
 }
 
-pub(super) fn define_continuation(env: &EnvRef, name: String, next: &ContinuationRef) -> ContinuationRef {
+pub(super) fn define_continuation(
+    env: &EnvRef,
+    name: String,
+    next: &ContinuationRef,
+) -> ContinuationRef {
     Rc::new(Continuation::Define {
         env: Rc::clone(env),
         name,
@@ -126,4 +240,38 @@ pub(super) fn set_captured_continuation(
         binding: Rc::clone(binding),
         next: Rc::clone(next),
     })
+}
+
+pub(super) fn resume_continuation_jump(
+    continuation: ContinuationRef,
+    wind_stack: Vec<DynamicWindFrameRef>,
+    value: Value,
+) -> (ContinuationRef, Value) {
+    let current_stack = current_wind_stack();
+    let shared_depth = current_stack
+        .iter()
+        .zip(wind_stack.iter())
+        .take_while(|(lhs, rhs)| Rc::ptr_eq(lhs, rhs))
+        .count();
+
+    let remaining_exits = current_stack[shared_depth..].to_vec();
+    let remaining_entries = wind_stack[shared_depth..]
+        .iter()
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if remaining_exits.is_empty() && remaining_entries.is_empty() {
+        (continuation, value)
+    } else {
+        (
+            Rc::new(Continuation::WindTransition {
+                saved_value: value,
+                remaining_exits,
+                remaining_entries,
+                target: continuation,
+            }),
+            Value::Void,
+        )
+    }
 }

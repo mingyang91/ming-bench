@@ -1,15 +1,17 @@
 use std::rc::Rc;
 
 use super::continuation::{
-    define_continuation, invoke_continuation, sequence_continuation, set_captured_continuation,
-    set_symbol_continuation, ContinuationRef, EvalResult,
+    define_continuation, invoke_continuation, make_dynamic_wind_frame, pop_wind_frame,
+    push_wind_frame, sequence_continuation, set_captured_continuation, set_symbol_continuation,
+    Continuation, ContinuationRef, EvalResult,
 };
 use super::macros::{MacroEnvRef, MacroEnvironment};
+use super::value_ops::{list_from_vec, values_eqv};
 use super::{
-    env_define, env_lookup, env_set, eval_expr, eval_sequence, eval_target, list_from_vec,
-    make_procedure, run_expr_in_cont, single_clause_procedure, tail_borrowed_expr,
-    tail_borrowed_sequence, tail_owned_expr, values_eqv, EnvRef, Environment, EvalError,
-    EvalStep, Expr, OwnedExprRef, Procedure, ProcedureClause, Value,
+    env_define, env_lookup, env_set, eval_expr, eval_sequence, eval_target, make_procedure,
+    run_expr_in_cont, single_clause_procedure, tail_borrowed_expr, tail_borrowed_sequence,
+    tail_owned_expr, EnvRef, Environment, EvalError, EvalStep, Expr, OwnedExprRef, Procedure,
+    ProcedureClause, Value,
 };
 
 pub(super) fn eval_define(
@@ -272,14 +274,7 @@ pub(super) fn eval_owned_cond<'a>(
             return if body.is_empty() {
                 Ok(EvalStep::Value(Value::Void))
             } else {
-                eval_owned_nested_list_sequence(
-                    expr,
-                    clause_index,
-                    1,
-                    env,
-                    macro_env,
-                    continuation,
-                )
+                eval_owned_nested_list_sequence(expr, clause_index, 1, env, macro_env, continuation)
             };
         }
 
@@ -288,14 +283,7 @@ pub(super) fn eval_owned_cond<'a>(
             return if body.is_empty() {
                 Ok(EvalStep::Value(test_value))
             } else {
-                eval_owned_nested_list_sequence(
-                    expr,
-                    clause_index,
-                    1,
-                    env,
-                    macro_env,
-                    continuation,
-                )
+                eval_owned_nested_list_sequence(expr, clause_index, 1, env, macro_env, continuation)
             };
         }
     }
@@ -412,7 +400,12 @@ pub(super) fn eval_owned_letrec<'a>(
     } else {
         let mut values = Vec::with_capacity(bindings.len());
         for (_, value_expr) in &bindings {
-            values.push(eval_expr(value_expr, &let_env, &let_macro_env, continuation)?);
+            values.push(eval_expr(
+                value_expr,
+                &let_env,
+                &let_macro_env,
+                continuation,
+            )?);
         }
 
         for ((name, _), value) in bindings.iter().zip(values.into_iter()) {
@@ -470,14 +463,7 @@ pub(super) fn eval_owned_case<'a>(
             return if body.is_empty() {
                 Ok(EvalStep::Value(Value::Void))
             } else {
-                eval_owned_nested_list_sequence(
-                    expr,
-                    clause_index,
-                    1,
-                    env,
-                    macro_env,
-                    continuation,
-                )
+                eval_owned_nested_list_sequence(expr, clause_index, 1, env, macro_env, continuation)
             };
         }
 
@@ -693,11 +679,9 @@ pub(super) fn eval_set(
             if env_set(env, name, value) {
                 Ok(Value::Void)
             } else {
-                Err(
-                    EvalError::UnboundVariable { name: name.clone() }
-                        .with_position(*position)
-                        .into(),
-                )
+                Err(EvalError::UnboundVariable { name: name.clone() }
+                    .with_position(*position)
+                    .into())
             }
         }
         [Expr::CapturedSymbol(_, binding, _), value_expr] => {
@@ -796,9 +780,10 @@ pub(super) fn apply_callable_result<'a>(
 ) -> EvalResult<EvalStep<'a>> {
     match callable {
         Value::Procedure(procedure) => apply_procedure_result(&procedure, args).map_err(Into::into),
-        Value::NativeProcedure(procedure) => {
-            procedure.apply(args).map(EvalStep::Value).map_err(Into::into)
-        }
+        Value::NativeProcedure(procedure) => procedure
+            .apply(args)
+            .map(EvalStep::Value)
+            .map_err(Into::into),
         Value::Builtin(builtin) => builtin.apply(args, continuation).map(EvalStep::Value),
         Value::Continuation(continuation) => {
             let [value] = args else {
@@ -920,6 +905,62 @@ pub(super) fn eval_begin<'a>(
     _continuation: &ContinuationRef,
 ) -> EvalResult<EvalStep<'a>> {
     Ok(tail_borrowed_sequence(args, env, macro_env))
+}
+
+pub(super) fn eval_dynamic_wind(
+    args: &[Expr],
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+    continuation: &ContinuationRef,
+) -> EvalResult<Value> {
+    let [before_expr, body_expr, after_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "dynamic-wind".into(),
+            expected: "exactly 3 arguments".into(),
+            got: args.len(),
+        }
+        .into());
+    };
+
+    let before = eval_expr(before_expr, env, macro_env, continuation)?;
+    let body = eval_expr(body_expr, env, macro_env, continuation)?;
+    let after = eval_expr(after_expr, env, macro_env, continuation)?;
+    let frame = make_dynamic_wind_frame(
+        before.clone(),
+        before_expr.position(),
+        after,
+        after_expr.position(),
+    );
+    let enter_continuation = Rc::new(Continuation::DynamicWindEnter {
+        frame: Rc::clone(&frame),
+        body: body.clone(),
+        body_position: body_expr.position(),
+        next: Rc::clone(continuation),
+    });
+
+    apply_callable(before, &[], &enter_continuation)?;
+
+    push_wind_frame(&frame);
+    let body_value = apply_callable(
+        body,
+        &[],
+        &Rc::new(Continuation::DynamicWind {
+            frame: Rc::clone(&frame),
+            next: Rc::clone(continuation),
+        }),
+    )?;
+    pop_wind_frame(&frame);
+
+    apply_callable(
+        frame.after.clone(),
+        &[],
+        &Rc::new(Continuation::DynamicWindExit {
+            return_value: body_value.clone(),
+            next: Rc::clone(continuation),
+        }),
+    )?;
+
+    Ok(body_value)
 }
 
 pub(super) fn eval_cond<'a>(
@@ -1068,7 +1109,12 @@ pub(super) fn eval_letrec<'a>(
     } else {
         let mut values = Vec::with_capacity(bindings.len());
         for (_, value_expr) in &bindings {
-            values.push(eval_expr(value_expr, &let_env, &let_macro_env, continuation)?);
+            values.push(eval_expr(
+                value_expr,
+                &let_env,
+                &let_macro_env,
+                continuation,
+            )?);
         }
 
         for ((name, _), value) in bindings.iter().zip(values.into_iter()) {
@@ -1287,7 +1333,10 @@ fn parse_let_bindings(
             .into());
         };
 
-        parsed.push((name.clone(), eval_expr(value_expr, env, macro_env, continuation)?));
+        parsed.push((
+            name.clone(),
+            eval_expr(value_expr, env, macro_env, continuation)?,
+        ));
     }
 
     Ok(parsed)

@@ -7,20 +7,22 @@ mod parser;
 mod record;
 mod render;
 mod special_forms;
+mod value_ops;
 
+use continuation::{
+    final_continuation, pop_wind_frame, push_wind_frame, reset_wind_stack,
+    resume_continuation_jump, sequence_continuation, CapturedContinuation, Continuation,
+    ContinuationRef, EvalResult, EvalSignal,
+};
 pub use error::{EvalError, SourcePos};
 use macros::{MacroEnvRef, MacroEnvironment};
 use number::Number;
 use parser::Parser;
 use record::{define_record_type as eval_define_record_type, NativeProcedure, RecordRef};
 use render::{render_display_value, render_value};
-use continuation::{
-    final_continuation, sequence_continuation, Continuation, ContinuationRef, EvalResult,
-    EvalSignal,
-};
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 #[derive(Clone)]
@@ -67,7 +69,7 @@ enum Value {
     Procedure(Rc<Procedure>),
     NativeProcedure(Rc<NativeProcedure>),
     Builtin(Builtin),
-    Continuation(ContinuationRef),
+    Continuation(Rc<CapturedContinuation>),
     Record(RecordRef),
     Uninitialized,
     Void,
@@ -321,95 +323,6 @@ impl Value {
     }
 }
 
-fn empty_list() -> Value {
-    Value::List(Vec::new())
-}
-
-fn is_empty_list(value: &Value) -> bool {
-    matches!(value, Value::List(items) if items.is_empty())
-}
-
-fn pair_ptr(pair: &PairRef) -> usize {
-    Rc::as_ptr(pair) as usize
-}
-
-fn list_from_vec(items: Vec<Value>) -> Value {
-    let mut list = empty_list();
-    for item in items.into_iter().rev() {
-        list = Value::Pair(Rc::new(RefCell::new(PairCell {
-            car: item,
-            cdr: list,
-        })));
-    }
-    list
-}
-
-fn pair_parts(value: &Value) -> Option<(Value, Value)> {
-    match value {
-        Value::Pair(pair) => {
-            let pair = pair.borrow();
-            Some((pair.car.clone(), pair.cdr.clone()))
-        }
-        Value::List(items) if !items.is_empty() => Some((
-            items[0].clone(),
-            if items.len() == 1 {
-                empty_list()
-            } else {
-                Value::List(items[1..].to_vec())
-            },
-        )),
-        _ => None,
-    }
-}
-
-fn collect_list_items(value: &Value) -> Result<Vec<Value>, EvalError> {
-    let mut items = Vec::new();
-    let mut current = value.clone();
-    let mut seen_pairs = HashSet::new();
-
-    loop {
-        match current {
-            Value::List(rest) => {
-                items.extend(rest);
-                return Ok(items);
-            }
-            Value::Pair(pair) => {
-                if !seen_pairs.insert(pair_ptr(&pair)) {
-                    return Err(EvalError::CircularList);
-                }
-
-                let pair = pair.borrow();
-                items.push(pair.car.clone());
-                current = pair.cdr.clone();
-            }
-            other => {
-                return Err(EvalError::TypeMismatch {
-                    expected: "list",
-                    found: other.type_name().into(),
-                })
-            }
-        }
-    }
-}
-
-fn is_proper_list(value: &Value) -> bool {
-    let mut current = value.clone();
-    let mut seen_pairs = HashSet::new();
-
-    loop {
-        match current {
-            Value::List(_) => return true,
-            Value::Pair(pair) => {
-                if !seen_pairs.insert(pair_ptr(&pair)) {
-                    return false;
-                }
-                current = pair.borrow().cdr.clone();
-            }
-            _ => return false,
-        }
-    }
-}
-
 impl Builtin {
     fn new(kind: BuiltinKind, output: OutputRef) -> Self {
         Self { kind, output }
@@ -634,8 +547,8 @@ fn run_callable_in_cont(
     head_position: SourcePos,
     continuation: ContinuationRef,
 ) -> EvalResult<Value> {
-    let value =
-        apply_callable(callable, args, &continuation).map_err(|signal| signal.with_position(head_position))?;
+    let value = apply_callable(callable, args, &continuation)
+        .map_err(|signal| signal.with_position(head_position))?;
     continue_with(continuation, value)
 }
 
@@ -705,6 +618,95 @@ fn continue_with(mut continuation: ContinuationRef, mut value: Value) -> EvalRes
                     *head_position,
                     Rc::clone(next),
                 );
+            }
+            Continuation::DynamicWindEnter {
+                frame,
+                body,
+                body_position,
+                next,
+            } => {
+                push_wind_frame(frame);
+                return run_callable_in_cont(
+                    body.clone(),
+                    &[],
+                    *body_position,
+                    Rc::new(Continuation::DynamicWind {
+                        frame: Rc::clone(frame),
+                        next: Rc::clone(next),
+                    }),
+                );
+            }
+            Continuation::DynamicWind { frame, next } => {
+                pop_wind_frame(frame);
+                return run_callable_in_cont(
+                    frame.after.clone(),
+                    &[],
+                    frame.after_position,
+                    Rc::new(Continuation::DynamicWindExit {
+                        return_value: value,
+                        next: Rc::clone(next),
+                    }),
+                );
+            }
+            Continuation::DynamicWindExit { return_value, next } => {
+                value = return_value.clone();
+                continuation = Rc::clone(next);
+            }
+            Continuation::WindTransition {
+                saved_value,
+                remaining_exits,
+                remaining_entries,
+                target,
+            } => {
+                let mut remaining_exits = remaining_exits.clone();
+                let mut remaining_entries = remaining_entries.clone();
+
+                if let Some(frame) = remaining_exits.pop() {
+                    pop_wind_frame(&frame);
+                    return run_callable_in_cont(
+                        frame.after.clone(),
+                        &[],
+                        frame.after_position,
+                        Rc::new(Continuation::WindTransition {
+                            saved_value: saved_value.clone(),
+                            remaining_exits,
+                            remaining_entries,
+                            target: Rc::clone(target),
+                        }),
+                    );
+                }
+
+                if let Some(frame) = remaining_entries.pop() {
+                    return run_callable_in_cont(
+                        frame.before.clone(),
+                        &[],
+                        frame.before_position,
+                        Rc::new(Continuation::WindTransitionEnter {
+                            frame,
+                            saved_value: saved_value.clone(),
+                            remaining_entries,
+                            target: Rc::clone(target),
+                        }),
+                    );
+                }
+
+                value = saved_value.clone();
+                continuation = Rc::clone(target);
+            }
+            Continuation::WindTransitionEnter {
+                frame,
+                saved_value,
+                remaining_entries,
+                target,
+            } => {
+                push_wind_frame(frame);
+                value = Value::Void;
+                continuation = Rc::new(Continuation::WindTransition {
+                    saved_value: saved_value.clone(),
+                    remaining_exits: Vec::new(),
+                    remaining_entries: remaining_entries.clone(),
+                    target: Rc::clone(target),
+                });
             }
         }
     }
@@ -790,108 +792,6 @@ fn parse_required_param_names(items: &[Expr]) -> Result<Vec<String>, EvalError> 
     special_forms::parse_required_param_names(items)
 }
 
-fn values_eq(lhs: &Value, rhs: &Value) -> bool {
-    match (lhs, rhs) {
-        (Value::Number(lhs), Value::Number(rhs)) => lhs.equals(*rhs).unwrap_or(false),
-        (Value::Boolean(lhs), Value::Boolean(rhs)) => lhs == rhs,
-        (Value::String(lhs), Value::String(rhs)) => lhs == rhs,
-        (Value::String(lhs), Value::MutableString(rhs))
-        | (Value::MutableString(rhs), Value::String(lhs)) => {
-            lhs.chars().eq(rhs.borrow().iter().copied())
-        }
-        (Value::MutableString(lhs), Value::MutableString(rhs)) => *lhs.borrow() == *rhs.borrow(),
-        (Value::Symbol(lhs), Value::Symbol(rhs)) => lhs == rhs,
-        (Value::Char(lhs), Value::Char(rhs)) => lhs == rhs,
-        (Value::Pair(lhs), Value::Pair(rhs)) => Rc::ptr_eq(lhs, rhs),
-        (Value::Vector(lhs), Value::Vector(rhs)) => Rc::ptr_eq(lhs, rhs),
-        (Value::Continuation(lhs), Value::Continuation(rhs)) => Rc::ptr_eq(lhs, rhs),
-        (Value::List(lhs), Value::List(rhs)) => {
-            lhs.len() == rhs.len()
-                && lhs
-                    .iter()
-                    .zip(rhs.iter())
-                    .all(|(lhs, rhs)| values_eq(lhs, rhs))
-        }
-        (Value::Record(lhs), Value::Record(rhs)) => Rc::ptr_eq(lhs, rhs),
-        (Value::Uninitialized, Value::Uninitialized) => true,
-        (Value::Void, Value::Void) => true,
-        _ => false,
-    }
-}
-
-fn values_eqv(lhs: &Value, rhs: &Value) -> bool {
-    values_eq(lhs, rhs)
-}
-
-fn values_equal(lhs: &Value, rhs: &Value) -> bool {
-    fn values_equal_inner(
-        lhs: &Value,
-        rhs: &Value,
-        seen_pairs: &mut HashSet<(usize, usize)>,
-        seen_vectors: &mut HashSet<(usize, usize)>,
-    ) -> bool {
-        match (lhs, rhs) {
-            (Value::Number(lhs), Value::Number(rhs)) => lhs.equals(*rhs).unwrap_or(false),
-            (Value::Boolean(lhs), Value::Boolean(rhs)) => lhs == rhs,
-            (Value::String(lhs), Value::String(rhs)) => lhs == rhs,
-            (Value::String(lhs), Value::MutableString(rhs))
-            | (Value::MutableString(rhs), Value::String(lhs)) => {
-                lhs.chars().eq(rhs.borrow().iter().copied())
-            }
-            (Value::MutableString(lhs), Value::MutableString(rhs)) => {
-                *lhs.borrow() == *rhs.borrow()
-            }
-            (Value::Symbol(lhs), Value::Symbol(rhs)) => lhs == rhs,
-            (Value::Char(lhs), Value::Char(rhs)) => lhs == rhs,
-            (Value::Continuation(lhs), Value::Continuation(rhs)) => Rc::ptr_eq(lhs, rhs),
-            (Value::List(lhs), Value::List(rhs)) => {
-                lhs.len() == rhs.len()
-                    && lhs
-                        .iter()
-                        .zip(rhs.iter())
-                        .all(|(lhs, rhs)| values_equal_inner(lhs, rhs, seen_pairs, seen_vectors))
-            }
-            (Value::Vector(lhs), Value::Vector(rhs)) => {
-                let key = (Rc::as_ptr(lhs) as usize, Rc::as_ptr(rhs) as usize);
-                if !seen_vectors.insert(key) {
-                    return true;
-                }
-
-                let lhs = lhs.borrow();
-                let rhs = rhs.borrow();
-                lhs.len() == rhs.len()
-                    && lhs
-                        .iter()
-                        .zip(rhs.iter())
-                        .all(|(lhs, rhs)| values_equal_inner(lhs, rhs, seen_pairs, seen_vectors))
-            }
-            (Value::Record(lhs), Value::Record(rhs)) => Rc::ptr_eq(lhs, rhs),
-            (Value::Uninitialized, Value::Uninitialized) => true,
-            (Value::Void, Value::Void) => true,
-            _ => {
-                let Some((lhs_car, lhs_cdr)) = pair_parts(lhs) else {
-                    return false;
-                };
-                let Some((rhs_car, rhs_cdr)) = pair_parts(rhs) else {
-                    return false;
-                };
-
-                if let (Value::Pair(lhs_pair), Value::Pair(rhs_pair)) = (lhs, rhs) {
-                    let key = (pair_ptr(lhs_pair), pair_ptr(rhs_pair));
-                    if !seen_pairs.insert(key) {
-                        return true;
-                    }
-                }
-
-                values_equal_inner(&lhs_car, &rhs_car, seen_pairs, seen_vectors)
-                    && values_equal_inner(&lhs_cdr, &rhs_cdr, seen_pairs, seen_vectors)
-            }
-        }
-    }
-
-    values_equal_inner(lhs, rhs, &mut HashSet::new(), &mut HashSet::new())
-}
-
 fn env_define(env: &EnvRef, name: String, value: Value) {
     env.borrow_mut()
         .bindings
@@ -973,7 +873,9 @@ fn eval_target<'a>(
             EvalTarget::BorrowedSequence(exprs) => {
                 eval_sequence_step(exprs, &env, &macro_env, continuation)?
             }
-            EvalTarget::OwnedExpr(expr) => eval_owned_expr_step(expr, &env, &macro_env, continuation)?,
+            EvalTarget::OwnedExpr(expr) => {
+                eval_owned_expr_step(expr, &env, &macro_env, continuation)?
+            }
         };
 
         match step {
@@ -996,6 +898,7 @@ fn eval_program(exprs: &[Expr], output: OutputRef) -> Result<Value, EvalError> {
         return Err(EvalError::EmptyInput);
     }
 
+    let _wind_stack_guard = reset_wind_stack();
     let env = builtins::default_env(output);
     let macro_env = MacroEnvironment::new(None);
     let root = final_continuation();
@@ -1012,9 +915,10 @@ fn eval_program(exprs: &[Expr], output: OutputRef) -> Result<Value, EvalError> {
             Err(EvalSignal::Error(error)) => return Err(error),
             Err(EvalSignal::Jump {
                 continuation,
+                wind_stack,
                 value,
             }) => {
-                pending_resume = Some((continuation, value));
+                pending_resume = Some(resume_continuation_jump(continuation, wind_stack, value));
             }
         }
     }
@@ -1086,11 +990,9 @@ fn eval_expr_step<'a>(
                 EvalError::UnboundVariable { name: name.clone() }.with_position(*position)
             })?;
             if matches!(value, Value::Uninitialized) {
-                Err(
-                    EvalError::UninitializedBinding { name: name.clone() }
-                        .with_position(*position)
-                        .into(),
-                )
+                Err(EvalError::UninitializedBinding { name: name.clone() }
+                    .with_position(*position)
+                    .into())
             } else {
                 Ok(EvalStep::Value(value))
             }
@@ -1098,11 +1000,9 @@ fn eval_expr_step<'a>(
         Expr::CapturedSymbol(name, binding, position) => {
             let value = binding.borrow().clone();
             if matches!(value, Value::Uninitialized) {
-                Err(
-                    EvalError::UninitializedBinding { name: name.clone() }
-                        .with_position(*position)
-                        .into(),
-                )
+                Err(EvalError::UninitializedBinding { name: name.clone() }
+                    .with_position(*position)
+                    .into())
             } else {
                 Ok(EvalStep::Value(value))
             }
@@ -1130,11 +1030,9 @@ fn eval_owned_expr_step<'a>(
                 EvalError::UnboundVariable { name: name.clone() }.with_position(*position)
             })?;
             if matches!(value, Value::Uninitialized) {
-                Err(
-                    EvalError::UninitializedBinding { name: name.clone() }
-                        .with_position(*position)
-                        .into(),
-                )
+                Err(EvalError::UninitializedBinding { name: name.clone() }
+                    .with_position(*position)
+                    .into())
             } else {
                 Ok(EvalStep::Value(value))
             }
@@ -1142,24 +1040,17 @@ fn eval_owned_expr_step<'a>(
         Expr::CapturedSymbol(name, binding, position) => {
             let value = binding.borrow().clone();
             if matches!(value, Value::Uninitialized) {
-                Err(
-                    EvalError::UninitializedBinding { name: name.clone() }
-                        .with_position(*position)
-                        .into(),
-                )
+                Err(EvalError::UninitializedBinding { name: name.clone() }
+                    .with_position(*position)
+                    .into())
             } else {
                 Ok(EvalStep::Value(value))
             }
         }
-        Expr::List(items, position) => eval_owned_list_step(
-            expr,
-            items,
-            *position,
-            env,
-            macro_env,
-            continuation,
-        )
-        .map_err(|signal| signal.with_position(*position)),
+        Expr::List(items, position) => {
+            eval_owned_list_step(expr, items, *position, env, macro_env, continuation)
+                .map_err(|signal| signal.with_position(*position))
+        }
     }
 }
 
@@ -1230,6 +1121,11 @@ fn eval_borrowed_list_step<'a>(
             }
             "begin" => {
                 return special_forms::eval_begin(&items[1..], env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
+            }
+            "dynamic-wind" => {
+                return special_forms::eval_dynamic_wind(&items[1..], env, macro_env, continuation)
+                    .map(EvalStep::Value)
                     .map_err(|signal| signal.with_position(head_position))
             }
             "cond" => {
@@ -1358,6 +1254,11 @@ fn eval_owned_list_step<'a>(
                 return special_forms::eval_owned_begin(expr, env, macro_env, continuation)
                     .map_err(|signal| signal.with_position(head_position))
             }
+            "dynamic-wind" => {
+                return special_forms::eval_dynamic_wind(&items[1..], env, macro_env, continuation)
+                    .map(EvalStep::Value)
+                    .map_err(|signal| signal.with_position(head_position))
+            }
             "cond" => {
                 return special_forms::eval_owned_cond(expr, env, macro_env, continuation)
                     .map_err(|signal| signal.with_position(head_position))
@@ -1371,24 +1272,12 @@ fn eval_owned_list_step<'a>(
                     .map_err(|signal| signal.with_position(head_position))
             }
             "letrec" => {
-                return special_forms::eval_owned_letrec(
-                    expr,
-                    env,
-                    macro_env,
-                    false,
-                    continuation,
-                )
-                .map_err(|signal| signal.with_position(head_position))
+                return special_forms::eval_owned_letrec(expr, env, macro_env, false, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "letrec*" => {
-                return special_forms::eval_owned_letrec(
-                    expr,
-                    env,
-                    macro_env,
-                    true,
-                    continuation,
-                )
-                .map_err(|signal| signal.with_position(head_position))
+                return special_forms::eval_owned_letrec(expr, env, macro_env, true, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "case" => {
                 return special_forms::eval_owned_case(expr, env, macro_env, continuation)
