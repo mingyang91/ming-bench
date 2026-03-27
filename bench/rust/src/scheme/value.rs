@@ -18,6 +18,7 @@ pub enum Value {
         env: Rc<RefCell<Env>>,
     },
     Char(char),
+    Pair(Box<Value>, Box<Value>),
     Void,
 }
 
@@ -30,6 +31,7 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
+            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Void, Value::Void) => true,
             (Value::Lambda { .. }, Value::Lambda { .. }) => false,
             _ => false,
@@ -50,7 +52,13 @@ impl Value {
                     elems.iter().map(|v| v.to_display()).collect();
                 format!("({})", inner.join(" "))
             }
-            Value::Char(c) => format!("#\\{}", c),
+            Value::Char(c) => match c {
+                ' ' => "#\\space".into(),
+                '\n' => "#\\newline".into(),
+                '\t' => "#\\tab".into(),
+                _ => format!("#\\{}", c),
+            },
+            Value::Pair(a, b) => format!("({} . {})", a.to_display(), b.to_display()),
             Value::Lambda { .. } => "#<procedure>".into(),
             Value::Void => "".into(),
         }
@@ -66,6 +74,7 @@ impl Value {
                     elems.iter().map(|v| v.to_display_repr()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Pair(a, b) => format!("({} . {})", a.to_display_repr(), b.to_display_repr()),
             _ => self.to_display(),
         }
     }
