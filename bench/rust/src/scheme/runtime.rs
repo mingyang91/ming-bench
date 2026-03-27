@@ -82,6 +82,20 @@ pub(super) struct Continuation {
 }
 
 #[derive(Clone)]
+pub(super) struct DynamicWind {
+    pub(super) before: Value,
+    pub(super) after: Value,
+    pub(super) pos: Position,
+}
+
+#[derive(Clone)]
+pub(super) struct WindTransferStep {
+    pub(super) thunk: Value,
+    pub(super) pos: Position,
+    pub(super) active_winds: Vec<Rc<DynamicWind>>,
+}
+
+#[derive(Clone)]
 pub(super) enum Frame {
     Sequence {
         remaining: Vec<Expr>,
@@ -126,6 +140,24 @@ pub(super) enum Frame {
         name: String,
         pos: Position,
         env: EnvRef,
+    },
+    DynamicWindEnter {
+        wind: Rc<DynamicWind>,
+        body: Value,
+    },
+    DynamicWindBody {
+        wind: Rc<DynamicWind>,
+    },
+    DynamicWindFinish {
+        value: Value,
+    },
+    DynamicWindMarker {
+        wind: Rc<DynamicWind>,
+    },
+    ContinuationTransfer {
+        remaining: Vec<WindTransferStep>,
+        value: Value,
+        target: ContinuationRef,
     },
 }
 
@@ -238,6 +270,9 @@ pub(super) enum Procedure {
     ContinuationCapture {
         name: &'static str,
     },
+    DynamicWind {
+        name: &'static str,
+    },
     Continuation {
         cont: ContinuationRef,
     },
@@ -302,6 +337,7 @@ impl fmt::Debug for Procedure {
         match self {
             Self::Builtin { name, .. } => write!(f, "#<builtin:{name}>"),
             Self::ContinuationCapture { name } => write!(f, "#<builtin:{name}>"),
+            Self::DynamicWind { name } => write!(f, "#<builtin:{name}>"),
             Self::Continuation { .. } => f.write_str("#<continuation>"),
             Self::Lambda { .. } => f.write_str("#<lambda>"),
             Self::CaseLambda { .. } => f.write_str("#<case-lambda>"),
@@ -566,11 +602,9 @@ fn render_pair(
 
         match tail {
             Value::List(items) => {
-                rendered.extend(
-                    items.iter().map(|value| {
-                        render_value_with_state(value, mode, active_pairs, active_vectors)
-                    }),
-                );
+                rendered.extend(items.iter().map(|value| {
+                    render_value_with_state(value, mode, active_pairs, active_vectors)
+                }));
                 for id in nested_pair_ids {
                     active_pairs.remove(&id);
                 }
@@ -661,15 +695,16 @@ fn values_equal_with_state(
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::List(left), Value::List(right)) => {
             left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right.iter())
-                    .all(|(left, right)| {
-                        values_equal_with_state(left, right, seen_pairs, seen_vectors)
-                    })
+                && left.iter().zip(right.iter()).all(|(left, right)| {
+                    values_equal_with_state(left, right, seen_pairs, seen_vectors)
+                })
         }
-        (Value::List(left), other) => proper_list_equals_value(left, other, seen_pairs, seen_vectors),
-        (other, Value::List(right)) => proper_list_equals_value(right, other, seen_pairs, seen_vectors),
+        (Value::List(left), other) => {
+            proper_list_equals_value(left, other, seen_pairs, seen_vectors)
+        }
+        (other, Value::List(right)) => {
+            proper_list_equals_value(right, other, seen_pairs, seen_vectors)
+        }
         (Value::Pair(left), Value::Pair(right)) => {
             let key = (pair_id(left), pair_id(right));
             if !seen_pairs.insert(key) {
@@ -697,9 +732,12 @@ fn values_equal_with_state(
             let left_items = left.elements.borrow();
             let right_items = right.elements.borrow();
             left_items.len() == right_items.len()
-                && left_items.iter().zip(right_items.iter()).all(|(left, right)| {
-                    values_equal_with_state(left, right, seen_pairs, seen_vectors)
-                })
+                && left_items
+                    .iter()
+                    .zip(right_items.iter())
+                    .all(|(left, right)| {
+                        values_equal_with_state(left, right, seen_pairs, seen_vectors)
+                    })
         }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
@@ -777,6 +815,9 @@ fn vector_id(vector: &Rc<VectorValue>) -> usize {
     Rc::as_ptr(vector) as usize
 }
 
-pub(super) fn with_position<T>(result: Result<T, EvalError>, pos: Position) -> Result<T, EvalError> {
+pub(super) fn with_position<T>(
+    result: Result<T, EvalError>,
+    pos: Position,
+) -> Result<T, EvalError> {
     result.map_err(|error| error.with_position(pos.line, pos.col))
 }

@@ -63,6 +63,32 @@ pub(crate) fn apply_procedure(
                     pos: procedure_arg.pos,
                 }];
             }
+            Procedure::DynamicWind { name } => {
+                let [before_arg, body_arg, after_arg] = current_args.as_slice() else {
+                    return with_call_position(
+                        Err(EvalError::WrongArgCount {
+                            name,
+                            expected: "exactly 3",
+                            got: current_args.len(),
+                        }),
+                        call_pos,
+                    );
+                };
+
+                with_call_position(
+                    apply_procedure(before_arg.value.clone(), &[], output),
+                    call_pos,
+                )?;
+                let body_value = with_call_position(
+                    apply_procedure(body_arg.value.clone(), &[], output),
+                    call_pos,
+                )?;
+                with_call_position(
+                    apply_procedure(after_arg.value.clone(), &[], output),
+                    call_pos,
+                )?;
+                return Ok(body_value);
+            }
             Procedure::Continuation { .. } => {
                 let [value_arg] = current_args.as_slice() else {
                     return with_call_position(

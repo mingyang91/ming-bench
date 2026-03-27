@@ -1,8 +1,8 @@
-use super::{apply_procedure, exact_int, parse_index_arg, parse_index_bound, parse_length_arg};
 use super::super::{
     list_from_values, values_eq, values_equal, EvalError, EvaluatedArg, PairValue, Value,
     VectorValue,
 };
+use super::{apply_procedure, exact_int, parse_index_arg, parse_index_bound, parse_length_arg};
 use std::{cell::RefCell, collections::HashSet, rc::Rc};
 
 fn car_value(value: &Value) -> Option<Value> {
@@ -188,10 +188,7 @@ pub(super) fn apply_set_cdr(
     Ok(Value::Void)
 }
 
-pub(super) fn apply_null(
-    args: &[EvaluatedArg],
-    _output: &mut String,
-) -> Result<Value, EvalError> {
+pub(super) fn apply_null(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
     let [value] = args else {
         return Err(EvalError::WrongArgCount {
             name: "null?",
@@ -334,10 +331,7 @@ pub(super) fn apply_assv(args: &[EvaluatedArg], _output: &mut String) -> Result<
     Ok(Value::Bool(false))
 }
 
-pub(super) fn apply_assoc(
-    args: &[EvaluatedArg],
-    _output: &mut String,
-) -> Result<Value, EvalError> {
+pub(super) fn apply_assoc(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
     let [key, list] = args else {
         return Err(EvalError::WrongArgCount {
             name: "assoc",

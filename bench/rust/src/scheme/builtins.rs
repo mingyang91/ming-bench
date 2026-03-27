@@ -1,19 +1,20 @@
 mod procedure;
 mod sequence;
 
-pub(super) use self::procedure::{apply_procedure, quote_expr};
 use self::procedure::exact_int;
+pub(super) use self::procedure::{apply_procedure, quote_expr};
 use self::sequence::{
     apply_append, apply_assoc, apply_assv, apply_car, apply_cddr, apply_cdr, apply_cons,
-    apply_for_each, apply_length, apply_list, apply_list_pred, apply_list_ref,
-    apply_list_tail, apply_list_to_vector, apply_make_vector, apply_map, apply_member,
-    apply_null, apply_reverse, apply_set_car, apply_set_cdr, apply_vector, apply_vector_length,
-    apply_vector_pred, apply_vector_ref, apply_vector_set, apply_vector_to_list,
+    apply_for_each, apply_length, apply_list, apply_list_pred, apply_list_ref, apply_list_tail,
+    apply_list_to_vector, apply_make_vector, apply_map, apply_member, apply_null, apply_reverse,
+    apply_set_car, apply_set_cdr, apply_vector, apply_vector_length, apply_vector_pred,
+    apply_vector_ref, apply_vector_set, apply_vector_to_list,
 };
 use super::{
+    list_from_values,
     number::{parse_number_token, Number, Rational},
-    list_from_values, values_eq, values_equal, BuiltinFn, EnvRef, Environment, EvalError,
-    EvaluatedArg, Procedure, RecordType, RecordValue, SchemeString, Value,
+    values_eq, values_equal, BuiltinFn, EnvRef, Environment, EvalError, EvaluatedArg, Procedure,
+    RecordType, RecordValue, SchemeString, Value,
 };
 use std::{cell::RefCell, cmp::Ordering, rc::Rc};
 
@@ -25,6 +26,12 @@ pub(super) fn default_env() -> EnvRef {
             Value::Procedure(Rc::new(Procedure::ContinuationCapture { name })),
         );
     }
+    env.define(
+        "dynamic-wind",
+        Value::Procedure(Rc::new(Procedure::DynamicWind {
+            name: "dynamic-wind",
+        })),
+    );
     for (name, func) in [
         ("+", apply_add as BuiltinFn),
         ("-", apply_sub as BuiltinFn),

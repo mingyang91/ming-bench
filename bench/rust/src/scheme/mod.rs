@@ -236,6 +236,34 @@ fn apply_machine(
                 cont,
             })
         }
+        Procedure::DynamicWind { name } => {
+            let [before_arg, body_arg, after_arg] = args.as_slice() else {
+                return Err(EvalError::WrongArgCount {
+                    name,
+                    expected: "exactly 3",
+                    got: args.len(),
+                }
+                .with_position(pos.line, pos.col));
+            };
+
+            let wind = Rc::new(DynamicWind {
+                before: before_arg.value.clone(),
+                after: after_arg.value.clone(),
+                pos,
+            });
+
+            Ok(call_thunk_machine(
+                wind.before.clone(),
+                pos,
+                push_frame(
+                    Frame::DynamicWindEnter {
+                        wind,
+                        body: body_arg.value.clone(),
+                    },
+                    cont,
+                ),
+            ))
+        }
         Procedure::Continuation { cont: saved_cont } => {
             let [value_arg] = args.as_slice() else {
                 return Err(EvalError::WrongArgCount {
@@ -246,10 +274,11 @@ fn apply_machine(
                 .with_position(pos.line, pos.col));
             };
 
-            Ok(MachineState::Return {
-                value: value_arg.value.clone(),
-                cont: saved_cont.clone(),
-            })
+            Ok(schedule_continuation_jump_machine(
+                cont,
+                saved_cont.clone(),
+                value_arg.value.clone(),
+            ))
         }
         Procedure::Lambda { params, body, env } => {
             let call_env = with_position(
@@ -324,9 +353,15 @@ fn resume_machine(
 ) -> Result<MachineState, EvalError> {
     let next = continuation.next.clone();
     match &continuation.frame {
-        Frame::Sequence { remaining, env } => Ok(schedule_program_machine(remaining, env.clone(), next)),
-        Frame::And { remaining, env } => handle_and_value_machine(value, remaining, env.clone(), next),
-        Frame::Or { remaining, env } => handle_or_value_machine(value, remaining, env.clone(), next),
+        Frame::Sequence { remaining, env } => {
+            Ok(schedule_program_machine(remaining, env.clone(), next))
+        }
+        Frame::And { remaining, env } => {
+            handle_and_value_machine(value, remaining, env.clone(), next)
+        }
+        Frame::Or { remaining, env } => {
+            handle_or_value_machine(value, remaining, env.clone(), next)
+        }
         Frame::If {
             consequent,
             alternate,
@@ -366,7 +401,9 @@ fn resume_machine(
                 schedule_cond_machine(remaining, Position { line: 0, col: 0 }, env.clone(), next)
             }
         }
-        Frame::ApplyHead { args, env, pos } => Ok(schedule_call_machine(value, args, env.clone(), *pos, next)),
+        Frame::ApplyHead { args, env, pos } => {
+            Ok(schedule_call_machine(value, args, env.clone(), *pos, next))
+        }
         Frame::ApplyArgs {
             procedure,
             evaluated,
@@ -424,6 +461,36 @@ fn resume_machine(
                 cont: next,
             })
         }
+        Frame::DynamicWindEnter { wind, body } => Ok(call_thunk_machine(
+            body.clone(),
+            wind.pos,
+            push_frame(
+                Frame::DynamicWindBody { wind: wind.clone() },
+                push_frame(Frame::DynamicWindMarker { wind: wind.clone() }, next),
+            ),
+        )),
+        Frame::DynamicWindBody { wind } => Ok(call_thunk_machine(
+            wind.after.clone(),
+            wind.pos,
+            push_frame(
+                Frame::DynamicWindFinish { value },
+                skip_dynamic_wind_marker(&next, wind),
+            ),
+        )),
+        Frame::DynamicWindFinish { value: body_value } => Ok(MachineState::Return {
+            value: body_value.clone(),
+            cont: next,
+        }),
+        Frame::DynamicWindMarker { .. } => Ok(MachineState::Return { value, cont: next }),
+        Frame::ContinuationTransfer {
+            remaining,
+            value: transfer_value,
+            target,
+        } => Ok(schedule_wind_transfer_machine(
+            remaining.clone(),
+            transfer_value.clone(),
+            target.clone(),
+        )),
     }
 }
 
@@ -669,7 +736,9 @@ fn eval_let_machine(
                 env: closure_env.clone(),
             }));
             closure_env.define(name.clone(), procedure.clone());
-            Ok(schedule_call_machine(procedure, &values, env, head_pos, cont))
+            Ok(schedule_call_machine(
+                procedure, &values, env, head_pos, cont,
+            ))
         }
         [bindings_expr, body @ ..] => {
             if body.is_empty() {
@@ -699,7 +768,9 @@ fn eval_let_machine(
                 body: body.to_vec(),
                 env: procedure_env,
             }));
-            Ok(schedule_call_machine(procedure, &values, env, head_pos, cont))
+            Ok(schedule_call_machine(
+                procedure, &values, env, head_pos, cont,
+            ))
         }
         [] => Err(EvalError::WrongArgCount {
             name: "let",
@@ -728,7 +799,9 @@ fn eval_define_machine(
                 cont,
             ),
         }),
-        [Expr::List { items: signature, .. }, body @ ..] => {
+        [Expr::List {
+            items: signature, ..
+        }, body @ ..] => {
             if body.is_empty() {
                 return Err(EvalError::ParseError {
                     message: "define requires a function body".to_string(),
@@ -831,6 +904,114 @@ fn schedule_call_machine(
 
 fn push_frame(frame: Frame, next: ContinuationRef) -> ContinuationRef {
     Some(Rc::new(Continuation { frame, next }))
+}
+
+fn call_thunk_machine(procedure: Value, pos: Position, cont: ContinuationRef) -> MachineState {
+    MachineState::Apply {
+        procedure,
+        args: Vec::new(),
+        pos,
+        cont,
+    }
+}
+
+fn schedule_continuation_jump_machine(
+    current: ContinuationRef,
+    target: ContinuationRef,
+    value: Value,
+) -> MachineState {
+    let current_winds = collect_dynamic_winds(&current);
+    let target_winds = collect_dynamic_winds(&target);
+    let shared = current_winds
+        .iter()
+        .zip(target_winds.iter())
+        .take_while(|(left, right)| Rc::ptr_eq(left, right))
+        .count();
+
+    let mut active_winds = current_winds.clone();
+    let mut steps = Vec::new();
+
+    for wind in current_winds[shared..].iter().rev() {
+        let removed = active_winds.pop();
+        debug_assert!(matches!(removed, Some(ref current) if Rc::ptr_eq(current, wind)));
+        steps.push(WindTransferStep {
+            thunk: wind.after.clone(),
+            pos: wind.pos,
+            active_winds: active_winds.clone(),
+        });
+    }
+
+    for wind in &target_winds[shared..] {
+        steps.push(WindTransferStep {
+            thunk: wind.before.clone(),
+            pos: wind.pos,
+            active_winds: active_winds.clone(),
+        });
+        active_winds.push(wind.clone());
+    }
+
+    schedule_wind_transfer_machine(steps, value, target)
+}
+
+fn schedule_wind_transfer_machine(
+    steps: Vec<WindTransferStep>,
+    value: Value,
+    target: ContinuationRef,
+) -> MachineState {
+    let Some((step, remaining)) = steps.split_first() else {
+        return MachineState::Return {
+            value,
+            cont: target,
+        };
+    };
+
+    call_thunk_machine(
+        step.thunk.clone(),
+        step.pos,
+        push_frame(
+            Frame::ContinuationTransfer {
+                remaining: remaining.to_vec(),
+                value,
+                target,
+            },
+            build_wind_marker_chain(&step.active_winds, None),
+        ),
+    )
+}
+
+fn collect_dynamic_winds(cont: &ContinuationRef) -> Vec<Rc<DynamicWind>> {
+    let mut winds = Vec::new();
+    let mut current = cont.clone();
+    while let Some(continuation) = current {
+        if let Frame::DynamicWindMarker { wind } = &continuation.frame {
+            winds.push(wind.clone());
+        }
+        current = continuation.next.clone();
+    }
+    winds.reverse();
+    winds
+}
+
+fn build_wind_marker_chain(
+    winds: &[Rc<DynamicWind>],
+    mut base: ContinuationRef,
+) -> ContinuationRef {
+    for wind in winds {
+        base = push_frame(Frame::DynamicWindMarker { wind: wind.clone() }, base);
+    }
+    base
+}
+
+fn skip_dynamic_wind_marker(next: &ContinuationRef, wind: &Rc<DynamicWind>) -> ContinuationRef {
+    match next {
+        Some(continuation) => match &continuation.frame {
+            Frame::DynamicWindMarker { wind: marker } if Rc::ptr_eq(marker, wind) => {
+                continuation.next.clone()
+            }
+            _ => next.clone(),
+        },
+        None => None,
+    }
 }
 
 fn prepare_lambda_call_env_machine(
