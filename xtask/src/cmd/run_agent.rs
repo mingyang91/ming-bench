@@ -1469,16 +1469,32 @@ fn launch_opencode(
     output_file: &Path,
     max_turns: Option<u32>,
 ) -> Result<i32> {
-    // OpenCode has no structured token output — use turn-based fallback.
+    // OpenCode: use `opencode run` (non-interactive) with --format json for structured output.
     let turn_limit = max_turns.unwrap_or(SAFETY_MAX_TURNS);
     eprintln!("NOTE: OpenCode uses turn-based limit ({turn_limit} turns) — no token monitoring");
-    let script_cmd = format!(
-        "cd '{}' && echo '{}' | opencode",
-        workdir.display(),
-        prompt.replace('\'', "'\\''"),
-    );
-    let out_str = output_file.to_str().expect("output file path not utf8");
-    run_cmd("script", &["-qec", &script_cmd, out_str], workdir)
+
+    let out = fs::File::create(output_file).map_err(|e| Error::CommandFailed {
+        cmd: format!("create output file: {e}"),
+        exit_code: 1,
+    })?;
+
+    let status = std::process::Command::new("opencode")
+        .arg("run")
+        .arg(prompt)
+        .arg("--dir")
+        .arg(workdir)
+        .arg("--format")
+        .arg("json")
+        .current_dir(workdir)
+        .stdout(out.try_clone().expect("clone stdout file"))
+        .stderr(out)
+        .status()
+        .map_err(|e| Error::CommandFailed {
+            cmd: format!("opencode run: {e}"),
+            exit_code: 1,
+        })?;
+
+    Ok(status.code().unwrap_or(1))
 }
 
 fn tee_stdout_to_file(stdout: Option<std::process::ChildStdout>, out_path: &Path) {
@@ -1840,9 +1856,18 @@ fn capture_codex_session(output_file: &Path, target: &Path) {
 }
 
 fn copy_captured_session(found: &Path, target: &Path, label: &str) {
+    // Prefer hardlink (saves disk, preserves data if result dir is cleaned).
+    // Falls back to copy if hardlink fails (e.g., cross-filesystem).
+    match fs::hard_link(found, target) {
+        Ok(()) => {
+            println!("{label} session captured: {} (hardlink)", target.display());
+            return;
+        }
+        Err(_) => {}
+    }
     match fs::copy(found, target) {
-        Ok(_) => println!("{label} session captured: {}", target.display()),
-        Err(e) => eprintln!("WARNING: Failed to copy session: {e}"),
+        Ok(_) => println!("{label} session captured: {} (copy)", target.display()),
+        Err(e) => eprintln!("WARNING: Failed to capture session: {e}"),
     }
 }
 
